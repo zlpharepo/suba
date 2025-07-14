@@ -1,2 +1,2 @@
-# suba
+# SubA
 A subscriptions &amp; sing-box management
