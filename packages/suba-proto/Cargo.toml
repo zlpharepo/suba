@@ -1,0 +1,33 @@
+[package]
+name = "suba-proto"
+description = "Proxy protocol model, share-link codecs and wire conversions: the protocol core of SubA, usable on its own."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = ["std", "serde", "derive"]
+# `std` adds the std-only impls. Without it the crate is `no_std` + `alloc`.
+std = []
+# Serialisation of the model. Off, the crate carries no derive dependency.
+serde = ["dep:serde"]
+# Key derivation (a Reality public key from its private key). On by default; off, a build that has no
+# business holding key material does not carry the curve arithmetic.
+derive = ["dep:x25519-dalek"]
+
+[dependencies]
+# Pinned here rather than through the workspace on purpose: this crate is meant to be publishable on
+# its own, and it must be buildable with neither `std` nor `serde`.
+base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.11.0", default-features = false }
+serde = { version = "1.0.229", optional = true, default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+x25519-dalek = { version = "3.0.0", optional = true, default-features = false, features = ["static_secrets"] }
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "parse"
+harness = false

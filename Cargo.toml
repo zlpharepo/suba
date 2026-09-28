@@ -1,0 +1,46 @@
+[workspace]
+default-members = ["packages/suba"]
+members = ["packages/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ZLPHA"]
+license = "GPL-3.0"
+
+[workspace.dependencies]
+suba-core = { path = "packages/suba-core" }
+suba-server = { path = "packages/suba-server", default-features = false }
+suba-proto = { path = "packages/suba-proto" }
+suba-clash = { path = "packages/suba-clash" }
+suba-singbox = { path = "packages/suba-singbox" }
+
+argon2 = "0.6.0"
+axum = { version = "0.8.9", features = ["macros"] }
+axum-extra = { version = "0.12.6", features = ["typed-header"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+ed25519-dalek = { version = "3.0.0", features = ["pkcs8", "pem"] }
+garde = { version = "0.23.0", features = ["full"] }
+http = "1.5.0"
+http-serde = { version = "2.1.1" }
+jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+getrandom = { version = "0.4.3", features = ["std"] }
+reqwest = { version = "0.13.5" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.6"
+tower-http = { version = "0.7.1", features = ["trace", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.26.1", features = ["v7", "serde"] }
+url = { version = "2.5.8", features = ["serde"] }
+base64 = "0.23.1"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = true
+strip = true

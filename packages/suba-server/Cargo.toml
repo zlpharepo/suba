@@ -1,0 +1,34 @@
+[package]
+name = "suba-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = ["toml"]
+toml = ["dep:toml"]
+json = ["dep:serde_json"]
+
+[dependencies]
+suba-core = { workspace = true }
+
+argon2 = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+garde = { workspace = true }
+http = { workspace = true }
+http-serde = { workspace = true }
+jsonwebtoken = { workspace = true }
+getrandom = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true, optional = true }
+tower-http = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }

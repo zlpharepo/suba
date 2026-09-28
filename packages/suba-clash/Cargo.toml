@@ -1,0 +1,12 @@
+[package]
+name = "suba-clash"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+
+[dependencies]
+
+[dev-dependencies]

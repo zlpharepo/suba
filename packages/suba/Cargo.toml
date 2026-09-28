@@ -1,0 +1,25 @@
+[package]
+name = "suba"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+# `toml`/`json` pick the configuration file format and are mutually exclusive.
+# `clash`/`singbox` link the optional dialect crates; a converter-only build is
+# `--no-default-features --features toml`.
+default = ["toml", "clash", "singbox"]
+toml = ["suba-server/toml"]
+json = ["suba-server/json"]
+clash = ["dep:suba-clash"]
+singbox = ["dep:suba-singbox"]
+
+[dependencies]
+suba-core = { workspace = true }
+suba-server = { workspace = true }
+suba-clash = { workspace = true, optional = true }
+suba-singbox = { workspace = true, optional = true }
+
+clap = { version = "4.5.41", features = ["derive"] }
+tokio = { workspace = true }

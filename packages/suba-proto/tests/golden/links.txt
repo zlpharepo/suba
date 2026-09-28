@@ -1,0 +1,68 @@
+# Share links, in the shapes providers actually serve.
+#
+# Every line is parsed, written back, and parsed again; the two nodes must be equal and their
+# identities must match. Lines starting with # and blank lines are ignored.
+#
+# Credentials here are obvious placeholders on purpose: this file is committed.
+#
+# The section at the end is not hand-written: it is the complete node set two live airport
+# subscriptions served, rewritten value-by-value on the machine that held them — uuid, password, host,
+# sni, Reality key, short id, path and every name — so nothing but the shape is committed.
+hysteria2://letmein@example.com:443?obfs=salamander&obfs-password=obfspw&sni=www.apple.com&mport=1000-2000,3000&up=100&down=200#Tokyo
+# VLESS, Reality, WebSocket carriage.
+vless://11111111-2222-3333-4444-555555555555@example.com:443?security=reality&sni=www.apple.com&fp=chrome&pbk=PUBKEY&sid=ab12&spx=%2F&flow=xtls-rprx-vision&type=ws&path=%2Fws&host=cdn.example.com&ed=2048#Tokyo
+# VLESS, plain TLS, gRPC carriage, ALPN.
+vless://11111111-2222-3333-4444-555555555555@example.com:8443?security=tls&sni=example.com&alpn=h2,http%2F1.1&type=grpc&serviceName=proxy&mode=multi&authority=example.com#GRPC
+# VLESS with no TLS at all, and an IPv6 literal.
+vless://11111111-2222-3333-4444-555555555555@[2605:52c0:2:129::1]:8443?encryption=none#IPv6
+# VLESS with parameters this build does not model: they must survive.
+vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&sni=example.com&xhttp-extra=1&unknown=two#Extras
+# Trojan, plain.
+trojan://PASSWORD@example.com:443#Trojan
+# Trojan with a WebSocket carriage and an escaped password.
+trojan://P%40SSW0RD%2F%3D@example.com:443?sni=www.apple.com&type=ws&path=%2Fws&host=cdn.example.com&allowInsecure=1#TrojanWS
+# Trojan, gRPC.
+trojan://PASSWORD@example.com:443?sni=example.com&type=grpc&serviceName=proxy#TrojanGRPC
+# Trojan, HTTP/2 carriage.
+trojan://PASSWORD@example.com:443?sni=example.com&type=h2&host=cdn.example.com&path=%2Fh2#TrojanH2
+# Shadowsocks, SIP002, base64 credentials with a base64 address.
+ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@MTkyLjAuMi4xMDoxMDgw#SIP002
+# Shadowsocks, SIP002 with a plain address.
+ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@192.0.2.10:1080#Plain
+# Shadowsocks with the obfs plugin.
+ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@192.0.2.10:1080?plugin=obfs-local%3Bobfs%3Dhttp%3Bobfs-host%3Dcdn.example.com#Obfs
+# Shadowsocks, the older dialect: the whole payload is one base64 blob.
+ss://YWVzLTI1Ni1nY206UEFTU1dPUkRAMS4yLjMuNDo4NDQz#Legacy
+# Shadowsocks 2022.
+ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206S0VZ@192.0.2.10:8388#SS2022
+# A protocol this build does not model: kept whole, given back unchanged.
+snell://1.2.3.4:443?psk=PSK&version=4#Snell
+# Another unmodelled one, with an IPv6 literal.
+snell://[2605:52c0:2:129::1]:443?psk=PSK#Snell6
+vmess://eyJ2IjoiMiIsInBzIjoiR29sZGVuIiwiYWRkIjoiZ29sZGVuLmV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1IiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ3cyIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ==
+anytls://letmein@golden.example.com:443?sni=www.apple.com#GoldenAnyTLS
+tuic://11111111-2222-3333-4444-555555555555:letmein@golden.example.com:443?congestion_control=bbr&udp_relay_mode=native&sni=www.apple.com#GoldenTUIC
+ssr://Z29sZGVuLmV4YW1wbGUuY29tOjQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6aHR0cF9zaW1wbGU6YkdWMGJXVnBiZy8_b2Jmc3BhcmFtPVkyUnVMbVY0WVcxd2JHVXVZMjl0JnJlbWFya3M9UjI5c1pHVnVVMU5T
+socks5://doge:letmein@127.0.0.1:1080#LocalSocks
+http://doge:letmein@127.0.0.1:8080#LocalHttp
+trojan://letmein@golden.example.com:443?type=httpupgrade&path=%2Fup&host=cdn.example.com&sni=golden.example.com#GoldenUpgrade
+vless://11111111-1111-1111-1111-111111111111@golden.example.com:443?encryption=none&type=httpupgrade&path=%2Fvless-up#GoldenUpgradeVless
+vmess://eyJ2IjoiMiIsInBzIjoiR29sZGVuVm1lc3NVcGdyYWRlIiwiYWRkIjoiZ29sZGVuLmV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiMTExMTExMTEtMTExMS0xMTExLTExMTEtMTExMTExMTExMTExIiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJodHRwdXBncmFkZSIsImhvc3QiOiJjZG4uZXhhbXBsZS5jb20iLCJwYXRoIjoiL3VwIiwidGxzIjoidGxzIiwic25pIjoid3d3LmFwcGxlLmNvbSJ9
+
+# Real, sanitized: two live airport subscriptions, one base64-wrapped and one plain,
+# rewritten value-by-value on the machine that held them — uuid, password, host, sni,
+# Reality key, short id, path and every name. Nothing but the shape left that machine.
+vless://00000000-0000-4000-8000-000000000013@node01.example.com:443?security=reality&type=tcp&packetEncoding=xudp&sni=example.org&fp=chrome&flow=xtls-rprx-vision&sid=0000000000000000&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&encryption=none#%F0%9F%87%AF%F0%9F%87%B5%20Example%2001
+anytls://AAAAAAAAAAAAAAAAAAAAAAAA@node02.example.com:443?security=tls&type=tcp&packetEncoding=xudp&sni=example.org&fp=chrome&udp=1&packet_encoding=xudp#%F0%9F%87%BA%F0%9F%87%B8%20Example%2002
+anytls://00000000-0000-4000-8000-000000000013@192.0.2.3:443?security=tls&type=tcp&packetEncoding=none&sni=example.org&fp=firefox&udp=1#%F0%9F%87%B8%F0%9F%87%AC%20Example%2003
+anytls://00000000-0000-4000-8000-000000000013@192.0.2.4:443?security=tls&type=tcp&packetEncoding=none&sni=example.org&fp=firefox&udp=1#%F0%9F%87%A9%F0%9F%87%AA%20Example%2004
+anytls://00000000-0000-4000-8000-000000000013@192.0.2.5:443?security=tls&type=tcp&packetEncoding=none&sni=example.org&fp=firefox&udp=1#%F0%9F%87%AD%F0%9F%87%B0%20Example%2005
+anytls://00000000-0000-4000-8000-000000000013@192.0.2.6:443?security=tls&type=tcp&packetEncoding=none&sni=example.org&fp=firefox&udp=1#%F0%9F%87%AF%F0%9F%87%B5%20Example%2006
+anytls://00000000-0000-4000-8000-000000000013@node07.example.com:53011?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%BA%F0%9F%87%B8%20Example%2007
+anytls://00000000-0000-4000-8000-000000000013@node08.example.com:54008?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%B8%F0%9F%87%AC%20Example%2008
+anytls://00000000-0000-4000-8000-000000000013@node09.example.com:54001?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%A9%F0%9F%87%AA%20Example%2009
+anytls://00000000-0000-4000-8000-000000000013@node10.example.com:26027?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%AD%F0%9F%87%B0%20Example%2010
+anytls://00000000-0000-4000-8000-000000000013@node11.example.com:46026?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%AF%F0%9F%87%B5%20Example%2011
+anytls://00000000-0000-4000-8000-000000000013@node12.example.com:56101?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%BA%F0%9F%87%B8%20Example%2012
+anytls://00000000-0000-4000-8000-000000000013@node13.example.com:36033?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%B8%F0%9F%87%AC%20Example%2013
+anytls://00000000-0000-4000-8000-000000000013@node14.example.com:26099?security=tls&type=tcp&packetEncoding=none&sni=example.org&udp=1#%F0%9F%87%A9%F0%9F%87%AA%20Example%2014
