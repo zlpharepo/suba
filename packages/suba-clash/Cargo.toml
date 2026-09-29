@@ -8,5 +8,8 @@ license.workspace = true
 [features]
 
 [dependencies]
+suba-proto = { workspace = true }
+
+saphyr = { workspace = true }
 
 [dev-dependencies]
