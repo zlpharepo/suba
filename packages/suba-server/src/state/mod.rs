@@ -1,3 +1,4 @@
+mod collections;
 mod persisted;
 pub(crate) mod providers;
 mod scheduler;
@@ -11,9 +12,9 @@ use reqwest::Client;
 use crate::{config::ServerConfig, error::Error};
 
 use self::{
-    providers::ProviderStore, scheduler::Refresher, sessions::SessionStore, settings::SettingsStore,
+    collections::CollectionStore, providers::ProviderStore, scheduler::Refresher,
+    sessions::SessionStore, settings::SettingsStore,
 };
-
 /// Everything a request handler shares, behind a single reference count.
 ///
 /// Cloning is one atomic increment, so extractors can hand the state to async
@@ -28,6 +29,7 @@ struct Inner {
     settings: SettingsStore,
     /// Shared with the refresher, which outlives any single request.
     providers: Arc<ProviderStore>,
+    collections: CollectionStore,
     sessions: SessionStore,
 }
 
@@ -39,6 +41,7 @@ impl AppState {
             http: Client::builder().build()?,
             settings: SettingsStore::load(&config.config_dir)?,
             providers: Arc::new(ProviderStore::load(&config.config_dir, &config.data_dir)?),
+            collections: CollectionStore::load(&config.config_dir)?,
             sessions: SessionStore::load(&config.data_dir)?,
         })))
     }
@@ -69,6 +72,11 @@ impl AppState {
     /// The configured subscription-backed providers.
     pub(crate) fn providers(&self) -> &ProviderStore {
         &self.0.providers
+    }
+
+    /// The configured collections.
+    pub(crate) fn collections(&self) -> &CollectionStore {
+        &self.0.collections
     }
 
     /// The sessions currently allowed to authenticate.

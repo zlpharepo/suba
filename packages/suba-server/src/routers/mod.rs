@@ -1,4 +1,5 @@
 mod auth;
+mod collections;
 mod providers;
 mod system;
 
@@ -21,7 +22,8 @@ impl AppRouter {
         let api_router = Router::new()
             .nest("/system", system::route())
             .nest("/auth", auth::route())
-            .nest("/providers", providers::route());
+            .nest("/providers", providers::route())
+            .nest("/collections", collections::route());
 
         let not_found_service = not_found.into_service();
         let web_service = ServeDir::new(web_path)
