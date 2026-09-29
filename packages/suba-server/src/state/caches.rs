@@ -5,7 +5,7 @@ use std::{
 
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::config::ConfigError;
+use crate::{config::ConfigError, fs};
 
 /// File name prefix and suffix of a cached subscription, wrapped around the
 /// provider name.
@@ -46,11 +46,14 @@ impl CacheStore {
     /// A missing file is not an error: it simply means the provider has not
     /// been fetched yet.
     pub(crate) async fn content(&self, name: &str) -> Result<Option<String>, ConfigError> {
-        match tokio::fs::read_to_string(self.path(name)).await {
-            Ok(content) => Ok(Some(content)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        let dir = self.dir.clone();
+        let name = cache_name(name);
+
+        let content = tokio::task::spawn_blocking(move || fs::read_to_string(&dir, &name))
+            .await
+            .map_err(|error| ConfigError::Join(error.to_string()))??;
+
+        Ok(content)
     }
 
     /// Serialize writers of the same provider.
@@ -70,10 +73,11 @@ impl CacheStore {
 
     /// Store `content` for `name`, written atomically.
     pub(crate) async fn put(&self, name: &str, content: &str) -> Result<(), ConfigError> {
-        let destination = self.path(name);
+        let dir = self.dir.clone();
+        let name = cache_name(name);
         let payload = content.to_owned();
 
-        tokio::task::spawn_blocking(move || crate::fs::write_atomic(&destination, payload))
+        tokio::task::spawn_blocking(move || fs::write_atomic(&dir, &name, payload))
             .await
             .map_err(|error| ConfigError::Join(error.to_string()))??;
 
@@ -82,17 +86,20 @@ impl CacheStore {
 
     /// Forget the payload cached for `name`, if any.
     pub(crate) async fn remove(&self, name: &str) -> Result<(), ConfigError> {
-        match tokio::fs::remove_file(self.path(name)).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
+        let dir = self.dir.clone();
+        let name = cache_name(name);
 
-    fn path(&self, name: &str) -> PathBuf {
-        self.dir
-            .join(format!("{CACHE_PREFIX}{name}.{CACHE_EXTENSION}"))
+        tokio::task::spawn_blocking(move || fs::remove(&dir, &name))
+            .await
+            .map_err(|error| ConfigError::Join(error.to_string()))??;
+
+        Ok(())
     }
+}
+
+/// The file a provider's payload is cached in.
+fn cache_name(name: &str) -> String {
+    format!("{CACHE_PREFIX}{name}.{CACHE_EXTENSION}")
 }
 
 #[cfg(test)]

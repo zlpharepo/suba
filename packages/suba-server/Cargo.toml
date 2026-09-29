@@ -24,6 +24,7 @@ http-serde = { workspace = true }
 jsonwebtoken = { workspace = true }
 getrandom = { workspace = true }
 reqwest = { workspace = true }
+rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
 thiserror = { workspace = true }

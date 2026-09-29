@@ -31,9 +31,17 @@ pub(crate) const EXTENSION: &str = "toml";
 #[cfg(feature = "json")]
 pub(crate) const EXTENSION: &str = "json";
 
+/// The file name a document with `basename` is stored in.
+pub(crate) fn config_name(basename: &str) -> String {
+    format!("{basename}.{EXTENSION}")
+}
+
 /// The path of `basename` inside the configuration directory `base`.
+///
+/// For diagnostics and tests: the write itself goes through the directory
+/// handle in [`crate::fs`], which takes a name rather than a path.
 pub(crate) fn config_path(base: impl AsRef<Path>, basename: &str) -> PathBuf {
-    base.as_ref().join(format!("{basename}.{EXTENSION}"))
+    base.as_ref().join(config_name(basename))
 }
 
 /// Read a document from `content`, naming `path` if it cannot be read.

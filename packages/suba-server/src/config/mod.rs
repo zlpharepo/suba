@@ -5,10 +5,10 @@ mod key_pair;
 mod server;
 
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::path::{Path, PathBuf};
 
 pub use administrator::*;
-pub(crate) use codec::config_path;
+pub(crate) use codec::{config_name, config_path};
 pub use error::ConfigError;
 pub use key_pair::*;
 pub use server::{ListenAddr, ServerConfig};
@@ -36,15 +36,12 @@ pub(crate) fn read_config<T>(base: &str, basename: &str) -> Result<T, ConfigErro
 where
     T: for<'de> Deserialize<'de> + Default,
 {
-    let path = config_path(base, basename);
-    let content = match fs::read_to_string(&path) {
-        Ok(content) if !content.trim().is_empty() => content,
-        Ok(_) => return Ok(T::default()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(T::default()),
-        Err(error) => return Err(error.into()),
+    let content = match crate::fs::read_to_string(Path::new(base), &config_name(basename))? {
+        Some(content) if !content.trim().is_empty() => content,
+        _ => return Ok(T::default()),
     };
 
-    codec::decode(&content, &path)
+    codec::decode(&content, &config_path(base, basename))
 }
 
 /// Write a configuration file.
@@ -61,11 +58,14 @@ pub(crate) async fn write_config<T>(
 where
     T: Serialize,
 {
-    let destination = config_path(base, basename);
-    let content = codec::encode(value, &destination)?;
+    // The path is for the error text; the write itself is by name, inside the
+    // directory handle, so a name can never be a way out of it.
+    let path = config_path(base, basename);
+    let content = codec::encode(value, &path)?;
+    let name = config_name(basename);
+    let base = PathBuf::from(base);
 
-    let target = destination.clone();
-    tokio::task::spawn_blocking(move || crate::fs::write_atomic(&target, content.as_bytes()))
+    tokio::task::spawn_blocking(move || crate::fs::write_atomic(&base, &name, content.as_bytes()))
         .await
         .map_err(|error| ConfigError::Join(error.to_string()))??;
 
@@ -75,7 +75,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use std::{fs, path::PathBuf};
 
     fn test_path() -> PathBuf {
         std::env::temp_dir().join(format!("suba-config-{}", uuid::Uuid::now_v7()))
@@ -120,10 +120,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_config_is_returned_as_an_error() {
         let path = test_path();
-        tokio::fs::create_dir_all(&path).await.unwrap();
-        tokio::fs::write(config_path(&path, APP_CONFIG_BASENAME), "[broken")
-            .await
-            .unwrap();
+        crate::fs::ensure_dir(&path).unwrap();
+        fs::write(path.join(config_name(APP_CONFIG_BASENAME)), "[broken").unwrap();
 
         assert!(read_config::<AppConfig>(path.to_str().unwrap(), APP_CONFIG_BASENAME).is_err());
         tokio::fs::remove_dir_all(path).await.unwrap();
