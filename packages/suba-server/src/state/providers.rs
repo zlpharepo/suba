@@ -1,50 +1,120 @@
+//! The providers of the instance, and what they last served.
+//!
+//! Two things are kept for a provider, and they are kept in two places on
+//! purpose: its **definition**, which an operator writes and which lives in the
+//! configuration directory, and its **observation**, which the program derives
+//! and which lives in the data directory. The definition says where nodes come
+//! from; the observation says what arrived last time and when. They are not one
+//! document, so that neither has to be rewritten to repair the other.
+//!
+//! A refresh is the whole loop: read what is held, ask the provider — with the
+//! validators from what is held, when there is something to compare against —
+//! let [`decide`] work out what that means, and write what it asks for. The
+//! decision belongs to [`suba_core`]; this module is the part with a clock, a
+//! socket and a disk.
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
-use tokio::sync::watch;
+use suba_core::{decide, record_failure, Observation, RefreshPlan, RefreshStatus};
+use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{
-    config::ConfigError,
     error::Error,
     provider::{Provider, ProvidersConfig, PROVIDERS_BASENAME},
+    store::{FileStore, ObservationStore},
 };
 
-use super::{caches::CacheStore, persisted::Persisted};
+use super::persisted::Persisted;
 
-/// What a refresh stored, for reporting back to the caller.
+/// What a refresh did, for reporting back to the caller.
+///
+/// The payload itself is never part of this: it may carry credentials, and a
+/// caller that wants it asks for it, because that is a different question.
 #[derive(Debug, Clone)]
 pub(crate) struct Refreshed {
     pub(crate) name: String,
+    pub(crate) status: RefreshStatus,
+    /// The size of the payload held after the refresh.
     pub(crate) bytes: usize,
+    /// How many nodes that payload holds.
+    pub(crate) nodes: usize,
 }
 
-/// The subscription-backed providers of the instance.
-///
-/// The store owns both halves of a provider: its configuration, persisted
-/// beside the other configuration files, and the payload it last returned,
-/// cached in the data directory. Keeping them together is what lets a refresh
-/// be one operation instead of a dance between two stores.
+impl Refreshed {
+    fn from_plan(name: &str, plan: &RefreshPlan) -> Self {
+        Self {
+            name: name.to_owned(),
+            status: plan.status,
+            // Taken from the observation rather than from the payload report: a
+            // `304` carries no report, and what an operator wants to know is
+            // what is held now, not what arrived.
+            bytes: plan
+                .observation
+                .as_ref()
+                .map(|observation| observation.payload.len())
+                .unwrap_or_default(),
+            nodes: plan.len(),
+        }
+    }
+}
+
+impl std::fmt::Display for Refreshed {
+    /// Reported without the payload: a subscription may carry credentials, and
+    /// what happened, how big it is and how many nodes it holds are what an
+    /// operator needs to see.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{:?}, {} bytes, {} nodes",
+            self.status, self.bytes, self.nodes
+        )
+    }
+}
+
+/// The providers of the instance.
 pub(crate) struct ProviderStore {
+    /// The definitions, in the configuration directory.
     file: Persisted<ProvidersConfig>,
-    cache: CacheStore,
-    /// Where a [`Local`](crate::provider::Local) provider's relative
-    /// path is resolved from.
+    /// The observations, in the data directory.
+    observations: Arc<dyn ObservationStore>,
+    /// Where a [`Local`](crate::provider::Local) provider's relative path is
+    /// resolved from.
     config_dir: PathBuf,
-    /// Bumped on every configuration change, so background work can follow
-    /// the provider set instead of polling it.
+    /// Bumped on every configuration change, so background work can follow the
+    /// provider set instead of polling it.
     changes: watch::Sender<u64>,
+    /// One lock per provider, held across a whole refresh.
+    ///
+    /// Serializing a refresh against another refresh of *the same* provider is
+    /// what keeps the two from interleaving, which would let the slower one
+    /// write its older observation last. Different providers never wait for
+    /// each other.
+    writers: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 impl ProviderStore {
-    pub(crate) fn load(config_dir: &Path, data_dir: &Path) -> Result<Self, ConfigError> {
+    pub(crate) fn load(config_dir: &Path, data_dir: &Path) -> Result<Self, Error> {
+        let observations = FileStore::open(data_dir)?;
+
+        Self::with_observations(config_dir, Arc::new(observations))
+    }
+
+    fn with_observations(
+        config_dir: &Path,
+        observations: Arc<dyn ObservationStore>,
+    ) -> Result<Self, Error> {
         Ok(Self {
             file: Persisted::load(config_dir, PROVIDERS_BASENAME)?,
-            cache: CacheStore::load(data_dir),
+            observations,
             config_dir: config_dir.to_path_buf(),
             changes: watch::Sender::new(0),
+            writers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -73,9 +143,9 @@ impl ProviderStore {
 
     /// Every provider that takes part in automatic refreshing.
     ///
-    /// A provider that is disabled is left out, and so is one there is nothing
-    /// to poll for — an inline provider serves what the configuration already
-    /// holds, so a schedule for it would only ever re-read the same bytes.
+    /// A disabled provider is left out, and so is one there is nothing to poll
+    /// for: an inline provider serves what the definition already holds, so a
+    /// schedule for it would only ever re-read the same bytes.
     pub(crate) async fn refreshable(&self) -> Vec<(String, Provider)> {
         self.file
             .read(|config| {
@@ -89,74 +159,98 @@ impl ProviderStore {
             .await
     }
 
-    /// The payload last fetched for `name`, if it was ever fetched.
+    /// The payload last fetched for `name`, if there is one to serve.
+    ///
+    /// A provider that has never been fetched and one whose every fetch has
+    /// failed are the same answer here: neither has anything to serve.
     pub(crate) async fn content(&self, name: &str) -> Result<Option<String>, Error> {
-        Ok(self.cache.content(name).await?)
+        let Some(observation) = self.observation(name).await? else {
+            return Ok(None);
+        };
+
+        Ok(match observation.payload.is_empty() {
+            true => None,
+            false => Some(observation.payload),
+        })
     }
 
-    pub(crate) async fn insert(&self, name: &str, provider: Provider) -> Result<(), Error> {
-        // Validated before the lock is taken: an unusable filter is the
-        // caller's mistake, and the document it arrived in reads the same
-        // whether or not anything else is being written.
-        provider.filter()?;
-
+    /// Write a definition and what was read from it, then wake the subscribers.
+    ///
+    /// The two writes are one step as far as a subscriber is concerned: a worker
+    /// started by the change must find the observation already in place, or it
+    /// would go to the network for bytes this refresh is holding.
+    async fn save(
+        &self,
+        name: &str,
+        provider: Provider,
+        observation: Option<&Observation>,
+    ) -> Result<(), Error> {
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
         config.providers.insert(name.to_owned(), provider);
         locked.commit(config).await?;
+
+        match observation {
+            Some(observation) => self.write_observation(name, observation).await?,
+            None => self.remove_observation(name).await?,
+        }
+
         self.publish();
 
         Ok(())
     }
 
     pub(crate) async fn remove(&self, name: &str) -> Result<(), Error> {
+        let _guard = self.lock(name).await;
+
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
         config.providers.remove(name);
         locked.commit(config).await?;
+
         // The payload of a provider that no longer exists would only ever be
         // read by mistake.
-        self.cache.remove(name).await?;
+        self.remove_observation(name).await?;
         self.publish();
 
         Ok(())
     }
 
-    /// Download `provider` and adopt it as the provider stored under `name`.
+    /// Write `provider` as the definition stored under `name`, and adopt what it
+    /// just served.
     ///
-    /// The payload is read before anything is committed, so a provider that
-    /// cannot be read is never left behind half-configured. The payload is
-    /// staged before the configuration change is published: a worker started
-    /// by that change must find the content already cached, or it would read
-    /// it a second time straight away.
+    /// The payload is read before anything is written, so a definition that
+    /// cannot be read is never left behind half-configured: the operator hears
+    /// about the failure and keeps what they had.
     pub(crate) async fn upsert(
         &self,
         name: &str,
         provider: Provider,
         client: &Client,
     ) -> Result<Refreshed, Error> {
-        // Checked before the payload is read: a definition the store will
-        // refuse must not send a request, and a caller that made a mistake
-        // should hear about the mistake rather than about whatever the network
-        // said.
+        // Checked before the payload is read: a definition the store will refuse
+        // must not send a request, and a caller that made a mistake should hear
+        // about the mistake rather than about whatever the network said.
         provider.filter()?;
 
-        let content = provider.payload(client, &self.config_dir).await?;
-        self.store(name, &content).await?;
-        self.insert(name, provider).await?;
+        let _guard = self.lock(name).await;
 
-        Ok(Refreshed {
-            name: name.to_owned(),
-            bytes: content.len(),
-        })
+        // Nothing is asked conditionally here: whatever this hub held belonged
+        // to the definition being replaced.
+        let fetched = provider.fetch(client, &self.config_dir, None).await?;
+        let plan = decide(name, self.observation(name).await?.as_ref(), fetched, now());
+
+        self.save(name, provider, plan.observation.as_ref()).await?;
+
+        Ok(Refreshed::from_plan(name, &plan))
     }
 
-    /// Read the provider stored under `name` again and cache the result.
+    /// Read the provider stored under `name` again and keep the result.
     ///
     /// Writers of the same provider are serialized, so a refresh triggered by
     /// the API cannot race the scheduler.
     pub(crate) async fn refresh(&self, name: &str, client: &Client) -> Result<Refreshed, Error> {
-        let _guard = self.cache.lock(name).await;
+        let _guard = self.lock(name).await;
 
         let provider = self
             .get(name)
@@ -166,45 +260,112 @@ impl ProviderStore {
             return Err(Error::ProviderDisabled(name.to_owned()));
         }
 
-        let content = provider.payload(client, &self.config_dir).await?;
-        self.store(name, &content).await?;
+        let previous = self.observation(name).await?;
+        // The validators ask "is what I hold still current", so they are sent
+        // only when something is held: a `304` for a version this hub does not
+        // have would cost it the payload it asked for. `conditions` answers
+        // `None` for exactly that case.
+        let conditions = previous.as_ref().and_then(Observation::conditions);
 
-        Ok(Refreshed {
-            name: name.to_owned(),
-            bytes: content.len(),
-        })
+        let fetched = match provider.fetch(client, &self.config_dir, conditions).await {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                // The last good payload stays: it is worth more than nothing.
+                // What failed is recorded beside it, and only when it is news —
+                // a provider that is down for a day must not rewrite the same
+                // reason on every interval.
+                let reason = error.to_string();
+                if let Some(observation) = record_failure(previous.as_ref(), reason, now()) {
+                    self.write_observation(name, &observation).await?;
+                }
+
+                return Err(error.into());
+            }
+        };
+
+        let plan = decide(name, previous.as_ref(), fetched, now());
+        if let Some(observation) = plan.observation.as_ref() {
+            self.write_observation(name, observation).await?;
+        }
+
+        Ok(Refreshed::from_plan(name, &plan))
     }
 
-    /// Write `content` as the payload cached for `name`.
+    /// The exclusive writer for one provider.
+    async fn lock(&self, name: &str) -> OwnedMutexGuard<()> {
+        let writer = {
+            let mut writers = self
+                .writers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            Arc::clone(writers.entry(name.to_owned()).or_default())
+        };
+
+        writer.lock_owned().await
+    }
+
+    /// The observation held for `name`, read off the blocking pool.
     ///
-    /// The bytes are kept verbatim; interpreting them, such as converting a
-    /// subscription, is left to the consumer.
-    pub(crate) async fn store(&self, name: &str, content: &str) -> Result<(), Error> {
-        Ok(self.cache.put(name, content).await?)
+    /// The store is synchronous — it is file I/O — and this is the layer that
+    /// knows a request is waiting on it.
+    async fn observation(&self, name: &str) -> Result<Option<Observation>, Error> {
+        let store = Arc::clone(&self.observations);
+        let name = name.to_owned();
+
+        Ok(tokio::task::spawn_blocking(move || store.read(&name)).await??)
     }
+
+    async fn write_observation(&self, name: &str, observation: &Observation) -> Result<(), Error> {
+        let store = Arc::clone(&self.observations);
+        let name = name.to_owned();
+        let observation = observation.clone();
+
+        Ok(tokio::task::spawn_blocking(move || store.write(&name, &observation)).await??)
+    }
+
+    async fn remove_observation(&self, name: &str) -> Result<(), Error> {
+        let store = Arc::clone(&self.observations);
+        let name = name.to_owned();
+
+        Ok(tokio::task::spawn_blocking(move || store.remove(&name)).await??)
+    }
+}
+
+/// Seconds since the epoch.
+///
+/// Read once per refresh and passed into the decision, so one refresh is one
+/// moment: a clock read twice could disagree with itself about when the same
+/// refresh happened.
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
-    use crate::provider::{default_interval, Remote, SharedFields};
+    use crate::{
+        provider::{default_interval, Inline, Local, Remote, SharedFields},
+        store::{MemoryStore, StoreError},
+    };
+
+    const PAYLOAD: &str = "trojan://hunter2@example.com:443#Node\n";
 
     fn test_dir() -> PathBuf {
         std::env::temp_dir().join(format!("suba-providers-{}", uuid::Uuid::now_v7()))
     }
 
-    fn provider() -> Provider {
-        remote(false)
-    }
-
-    fn remote(disabled: bool) -> Provider {
+    fn remote() -> Provider {
         Provider::Remote(Remote {
-            shared: SharedFields {
-                disabled,
-                ..SharedFields::default()
-            },
+            shared: SharedFields::default(),
             url: "https://example.com/subscription".parse().unwrap(),
             headers: None,
             timeout: None,
@@ -212,8 +373,66 @@ mod tests {
         })
     }
 
+    fn disabled_remote() -> Provider {
+        Provider::Remote(Remote {
+            shared: SharedFields {
+                disabled: true,
+                ..SharedFields::default()
+            },
+            ..match remote() {
+                Provider::Remote(remote) => remote,
+                _ => unreachable!("the fixture is a remote provider"),
+            }
+        })
+    }
+
+    fn inline(payload: &str) -> Provider {
+        Provider::Inline(Inline {
+            shared: SharedFields::default(),
+            payload: payload.to_string(),
+        })
+    }
+
+    fn local(path: &str) -> Provider {
+        Provider::Local(Local {
+            shared: SharedFields::default(),
+            path: PathBuf::from(path),
+            interval: default_interval(),
+        })
+    }
+
     fn load(dir: &Path) -> ProviderStore {
-        ProviderStore::load(dir, dir).unwrap()
+        ProviderStore::with_observations(dir, Arc::new(MemoryStore::default())).unwrap()
+    }
+
+    /// A store that counts what is written to it, so that "nothing was written"
+    /// is something a test can see.
+    #[derive(Default)]
+    struct CountingStore {
+        inner: MemoryStore,
+        writes: AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ObservationStore for CountingStore {
+        fn read(&self, provider: &str) -> Result<Option<Observation>, StoreError> {
+            self.inner.read(provider)
+        }
+
+        fn write(&self, provider: &str, observation: &Observation) -> Result<(), StoreError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+
+            self.inner.write(provider, observation)
+        }
+
+        fn remove(&self, provider: &str) -> Result<(), StoreError> {
+            self.inner.remove(provider)
+        }
     }
 
     #[tokio::test]
@@ -222,7 +441,7 @@ mod tests {
         let store = load(&dir);
         assert!(store.list().await.is_empty());
 
-        store.insert("airport", provider()).await.unwrap();
+        store.save("airport", remote(), None).await.unwrap();
         assert!(store.get("airport").await.is_some());
 
         let reloaded = load(&dir);
@@ -239,15 +458,37 @@ mod tests {
     async fn removing_a_provider_forgets_its_payload() {
         let dir = test_dir();
         let store = load(&dir);
+        let client = Client::new();
 
-        store.insert("airport", provider()).await.unwrap();
-        store.store("airport", "proxies: []").await.unwrap();
-        assert_eq!(
-            store.content("airport").await.unwrap().as_deref(),
-            Some("proxies: []")
-        );
+        store
+            .upsert("airport", inline(PAYLOAD), &client)
+            .await
+            .unwrap();
+        assert!(store.content("airport").await.unwrap().is_some());
 
         store.remove("airport").await.unwrap();
+        assert_eq!(store.content("airport").await.unwrap(), None);
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// Writing a definition without reading it leaves nothing to serve: an
+    /// observation belongs to the definition it was read from.
+    #[tokio::test]
+    async fn a_definition_stored_without_a_fetch_serves_nothing() {
+        let dir = test_dir();
+        let store = load(&dir);
+
+        store
+            .upsert("airport", inline(PAYLOAD), &Client::new())
+            .await
+            .unwrap();
+        assert!(store.content("airport").await.unwrap().is_some());
+
+        store
+            .save("airport", inline("vless://x@example.com:443#Other\n"), None)
+            .await
+            .unwrap();
         assert_eq!(store.content("airport").await.unwrap(), None);
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
@@ -259,7 +500,7 @@ mod tests {
         let store = load(&dir);
         let mut changes = store.subscribe();
 
-        store.insert("airport", provider()).await.unwrap();
+        store.save("airport", remote(), None).await.unwrap();
         assert!(changes.changed().await.is_ok());
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
@@ -276,28 +517,24 @@ mod tests {
         let store = load(&dir);
         let client = Client::new();
 
-        let Provider::Remote(mut broken) = provider() else {
-            panic!("the fixture is a remote provider");
-        };
-        broken.shared.include = vec!["regex:(".to_string()];
+        let broken = Provider::Inline(Inline {
+            shared: SharedFields {
+                include: vec!["regex:(".to_string()],
+                ..SharedFields::default()
+            },
+            payload: PAYLOAD.to_string(),
+        });
 
         assert!(matches!(
-            store
-                .upsert("airport", Provider::Remote(broken), &client)
-                .await,
+            store.upsert("airport", broken, &client).await,
             Err(Error::Filter(_))
         ));
 
         // Nothing was stored, and nothing was published: a refused definition
         // does not half-exist.
         assert!(store.get("airport").await.is_none());
-        assert!(
-            matches!(store.content("airport").await, Ok(None)),
-            "a refused provider has no cached payload"
-        );
+        assert_eq!(store.content("airport").await.unwrap(), None);
 
-        // A refusal this early means nothing was ever created, so there is
-        // nothing to clean up and no directory to remove.
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
@@ -306,14 +543,17 @@ mod tests {
         let dir = test_dir();
         let store = load(&dir);
 
-        let Provider::Remote(mut filtered) = provider() else {
-            panic!("the fixture is a remote provider");
-        };
-        filtered.shared.include = vec!["US-01".to_string(), "keyword:LAX".to_string()];
-        filtered.shared.exclude = vec!["regex:-\\d+$".to_string()];
+        let filtered = Provider::Inline(Inline {
+            shared: SharedFields {
+                include: vec!["US-01".to_string(), "keyword:LAX".to_string()],
+                exclude: vec!["regex:-\\d+$".to_string()],
+                ..SharedFields::default()
+            },
+            payload: PAYLOAD.to_string(),
+        });
 
         store
-            .insert("airport", Provider::Remote(filtered))
+            .upsert("airport", filtered, &Client::new())
             .await
             .unwrap();
 
@@ -333,7 +573,10 @@ mod tests {
             Err(Error::ProviderNotFound(_))
         ));
 
-        store.insert("airport", remote(true)).await.unwrap();
+        store
+            .save("airport", disabled_remote(), None)
+            .await
+            .unwrap();
 
         assert!(matches!(
             store.refresh("airport", &client).await,
@@ -342,5 +585,138 @@ mod tests {
         assert!(store.refreshable().await.is_empty());
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// Storing a definition reads it, and what it read is held and reported.
+    #[tokio::test]
+    async fn a_stored_definition_holds_what_it_just_read() {
+        let dir = test_dir();
+        let store = load(&dir);
+        let client = Client::new();
+
+        let stored = store
+            .upsert("airport", inline(PAYLOAD), &client)
+            .await
+            .unwrap();
+
+        assert_eq!(stored.status, RefreshStatus::Fetched);
+        assert_eq!(stored.bytes, PAYLOAD.len());
+        assert_eq!(stored.nodes, 1);
+        assert_eq!(
+            store.content("airport").await.unwrap().as_deref(),
+            Some(PAYLOAD)
+        );
+
+        // The same bytes again are the same bytes: a refresh that read the
+        // payload it already holds says so rather than rewriting it.
+        let refreshed = store.refresh("airport", &client).await.unwrap();
+
+        assert_eq!(refreshed.status, RefreshStatus::Unchanged);
+        assert_eq!(refreshed.nodes, 1);
+        assert_eq!(refreshed.bytes, PAYLOAD.len());
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// Reading a file that did not change, twice, must be known to be the same
+    /// read.
+    ///
+    /// This is the wiring under the decision: a refresh that forgot what it held
+    /// would report every interval as a new payload and rewrite the same bytes
+    /// forever.
+    #[tokio::test]
+    async fn a_payload_that_did_not_change_is_reported_as_unchanged() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nodes.txt"), PAYLOAD).unwrap();
+
+        let store = load(&dir);
+        let client = Client::new();
+        store
+            .save("airport", local("nodes.txt"), None)
+            .await
+            .unwrap();
+
+        let first = store.refresh("airport", &client).await.unwrap();
+        let second = store.refresh("airport", &client).await.unwrap();
+
+        assert_eq!(first.status, RefreshStatus::Fetched);
+        assert_eq!(second.status, RefreshStatus::Unchanged);
+        assert_eq!(second.nodes, 1);
+
+        // A file that did change replaces what is held, nodes and all.
+        std::fs::write(
+            dir.join("nodes.txt"),
+            format!(
+                "{PAYLOAD}vless://11111111-2222-3333-4444-555555555555@example.com:443#Other\n"
+            ),
+        )
+        .unwrap();
+
+        let third = store.refresh("airport", &client).await.unwrap();
+
+        assert_eq!(third.status, RefreshStatus::Fetched);
+        assert_eq!(third.nodes, 2);
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// A refresh that fails keeps the payload it held, and records what went
+    /// wrong beside it.
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_payload_it_held() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nodes.txt"), PAYLOAD).unwrap();
+
+        let store = load(&dir);
+        let client = Client::new();
+        store
+            .save("airport", local("nodes.txt"), None)
+            .await
+            .unwrap();
+        store.refresh("airport", &client).await.unwrap();
+
+        std::fs::remove_file(dir.join("nodes.txt")).unwrap();
+
+        assert!(store.refresh("airport", &client).await.is_err());
+        assert_eq!(
+            store.content("airport").await.unwrap().as_deref(),
+            Some(PAYLOAD),
+            "the last good payload is worth more than nothing"
+        );
+
+        let observed = store.observation("airport").await.unwrap().unwrap();
+        assert!(observed.error.is_some(), "the failure is recorded");
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// The same failure twice is not two facts.
+    ///
+    /// A provider that is down for a day is checked on every interval, and
+    /// rewriting the same reason each time would churn the disk to say nothing.
+    #[tokio::test]
+    async fn a_failure_that_repeats_is_not_written_again() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let counting = Arc::new(CountingStore::default());
+        let store = ProviderStore::with_observations(&dir, counting.clone()).unwrap();
+        let client = Client::new();
+
+        store
+            .save("airport", local("absent.txt"), None)
+            .await
+            .unwrap();
+
+        assert!(store.refresh("airport", &client).await.is_err());
+        let writes = counting.writes();
+        assert_eq!(writes, 1, "the first failure is news");
+
+        assert!(store.refresh("airport", &client).await.is_err());
+        assert_eq!(counting.writes(), writes, "the second one is not");
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
     }
 }

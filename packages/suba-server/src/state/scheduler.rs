@@ -11,7 +11,7 @@ use tokio::{
 
 use crate::{error::Error, tracing};
 
-use super::providers::{ProviderStore, Refreshed};
+use super::providers::ProviderStore;
 
 /// Refreshes providers on their configured interval.
 ///
@@ -87,7 +87,9 @@ async fn worker(providers: Arc<ProviderStore>, http: Client, name: String, inter
         ticks.tick().await;
 
         match providers.refresh(&name, &http).await {
-            Ok(refreshed) => report(&refreshed),
+            Ok(refreshed) => {
+                tracing::debug!("Refreshed provider '{}': {}", refreshed.name, refreshed)
+            }
             // A provider that vanished or was disabled has nothing to
             // refresh; the next configuration change will replace this worker.
             Err(error @ (Error::ProviderNotFound(_) | Error::ProviderDisabled(_))) => {
@@ -99,15 +101,4 @@ async fn worker(providers: Arc<ProviderStore>, http: Client, name: String, inter
             }
         }
     }
-}
-
-/// Announce a refresh without ever logging the content.
-///
-/// A subscription may carry credentials, so only its size is reported.
-fn report(refreshed: &Refreshed) {
-    tracing::debug!(
-        "Refreshed provider '{}' ({} bytes)",
-        refreshed.name,
-        refreshed.bytes
-    );
 }

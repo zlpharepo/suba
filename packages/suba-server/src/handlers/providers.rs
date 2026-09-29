@@ -5,21 +5,42 @@ use axum::{
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use suba_core::RefreshStatus;
 
 use crate::{
     dto::{Authenticated, ErrorResponse, ResponseResult},
     error::Error,
     provider::Provider,
+    state::providers::Refreshed,
     tracing, AppState,
 };
 
-/// The outcome of fetching a subscription, without its contents.
+/// The outcome of reading a provider's subscription, without its contents.
 ///
-/// A subscription may carry credentials, so only its size is reported back.
+/// A subscription may carry credentials, so what is reported is how big it is
+/// and what it holds, never the bytes themselves. `status` says which of the
+/// three things happened — the payload arrived, it arrived unchanged, or the
+/// provider confirmed that what is held is current — because "nothing was
+/// written" and "nothing arrived" are different answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Refresh {
     pub name: String,
+    pub status: RefreshStatus,
+    /// The size of the payload held after the refresh.
     pub bytes: usize,
+    /// How many nodes it holds.
+    pub nodes: usize,
+}
+
+impl From<Refreshed> for Refresh {
+    fn from(refreshed: Refreshed) -> Self {
+        Self {
+            name: refreshed.name,
+            status: refreshed.status,
+            bytes: refreshed.bytes,
+            nodes: refreshed.nodes,
+        }
+    }
 }
 
 pub async fn index(_auth: Authenticated, State(state): State<AppState>) -> impl IntoResponse {
@@ -56,19 +77,9 @@ pub async fn insert(
         .providers()
         .upsert(&name, provider, state.http())
         .await?;
-    tracing::debug!(
-        "Stored provider '{}' ({} bytes)",
-        refreshed.name,
-        refreshed.bytes
-    );
+    tracing::debug!("Stored provider '{}': {}", refreshed.name, refreshed);
 
-    Ok((
-        StatusCode::CREATED,
-        Json(Refresh {
-            name: refreshed.name,
-            bytes: refreshed.bytes,
-        }),
-    ))
+    Ok((StatusCode::CREATED, Json(Refresh::from(refreshed))))
 }
 
 /// Re-download a provider and replace its cached contents.
@@ -81,16 +92,9 @@ pub async fn refresh(
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
     let refreshed = state.providers().refresh(&name, state.http()).await?;
-    tracing::debug!(
-        "Refreshed provider '{}' ({} bytes)",
-        refreshed.name,
-        refreshed.bytes
-    );
+    tracing::debug!("Refreshed provider '{}': {}", refreshed.name, refreshed);
 
-    Ok(Json(Refresh {
-        name: refreshed.name,
-        bytes: refreshed.bytes,
-    }))
+    Ok(Json(Refresh::from(refreshed)))
 }
 
 /// The payload last cached for a provider, exactly as it was fetched.

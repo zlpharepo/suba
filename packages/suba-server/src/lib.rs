@@ -7,6 +7,7 @@ pub mod password;
 pub mod provider;
 mod routers;
 mod state;
+mod store;
 pub mod tracing;
 
 pub(crate) use config::Claims;

@@ -7,7 +7,8 @@ license.workspace = true
 
 [dependencies]
 suba-proto = { workspace = true }
-base64 = { workspace = true }
+
 regex = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
-url = { workspace = true }

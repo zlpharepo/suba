@@ -705,6 +705,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
 ]
@@ -2681,11 +2682,11 @@ version = "0.1.0"
 name = "suba-core"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
  "regex",
+ "serde",
+ "sha2 0.11.0",
  "suba-proto",
  "thiserror 2.0.21",
- "url",
 ]
 
 [[package]]

@@ -8,8 +8,14 @@ use crate::provider::FetchError;
 pub enum Error {
     #[error("unauthorized")]
     Unauthorized,
+
+    /// The runtime observation store failed.
     #[error(transparent)]
-    Core(#[from] suba_core::Error),
+    Store(#[from] crate::store::StoreError),
+
+    /// A blocking store call could not be joined.
+    #[error(transparent)]
+    Join(#[from] tokio::task::JoinError),
 
     #[error("provider '{0}' not found")]
     ProviderNotFound(String),
@@ -74,10 +80,22 @@ impl IntoHttpError for Error {
                 status_code: StatusCode::UNAUTHORIZED,
                 message: "Unauthorized".to_string(),
             },
-            Error::Core(_) => HttpError {
-                status_code: StatusCode::BAD_REQUEST,
-                message: "Invalid request".to_string(),
-            },
+            Error::Store(error) => {
+                tracing::error!("store error: {error}");
+
+                HttpError {
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "Internal server error".to_string(),
+                }
+            }
+            Error::Join(error) => {
+                tracing::error!("background task error: {error}");
+
+                HttpError {
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "Internal server error".to_string(),
+                }
+            }
             Error::ProviderNotFound(name) => HttpError {
                 status_code: StatusCode::NOT_FOUND,
                 message: format!("Provider '{name}' not found"),
@@ -128,8 +146,10 @@ impl IntoHttpError for Error {
                 // file that cannot be read is the operator's, and no status a
                 // client can act on describes it better than a plain failure.
                 let (status_code, message) = match error {
-                    FetchError::Request(_) => (StatusCode::BAD_GATEWAY, "Upstream request failed"),
-                    FetchError::Read { .. } => {
+                    FetchError::Request { .. } => {
+                        (StatusCode::BAD_GATEWAY, "Upstream request failed")
+                    }
+                    FetchError::TooLarge { .. } | FetchError::Read { .. } => {
                         (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
                     }
                 };

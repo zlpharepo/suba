@@ -1,6 +1,5 @@
-mod caches;
 mod persisted;
-mod providers;
+pub(crate) mod providers;
 mod scheduler;
 mod sessions;
 mod settings;
@@ -105,7 +104,9 @@ mod tests {
         assert!(state.providers().list().await.is_empty());
         assert!(!state.sessions().contains(uuid::Uuid::now_v7()).await);
 
-        // Building the state is read-only, so it may not have created anything.
+        // Building the state creates the data directory and takes its lock, so
+        // it is not read-only: what it must not do is touch the instance's
+        // documents.
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }
