@@ -2640,10 +2640,7 @@ name = "suba"
 version = "0.1.0"
 dependencies = [
  "clap",
- "suba-clash",
- "suba-core",
  "suba-server",
- "suba-singbox",
  "tokio",
 ]
 
