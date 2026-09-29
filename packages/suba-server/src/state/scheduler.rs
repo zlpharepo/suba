@@ -49,9 +49,14 @@ impl Refresher {
             while workers.join_next().await.is_some() {}
 
             for (name, provider) in self.providers.refreshable().await {
+                // `refreshable` answers only providers that have an interval to
+                // follow, so this cannot skip one.
+                let Some(interval) = provider.interval() else {
+                    continue;
+                };
+
                 let providers = Arc::clone(&self.providers);
                 let http = self.http.clone();
-                let interval = provider.interval();
                 workers.spawn(async move {
                     worker(providers, http, name, interval).await;
                 });

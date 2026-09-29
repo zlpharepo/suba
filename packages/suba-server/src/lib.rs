@@ -4,6 +4,7 @@ mod error;
 pub mod fs;
 mod handlers;
 pub mod password;
+pub mod provider;
 mod routers;
 mod state;
 pub mod tracing;

@@ -7,9 +7,9 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::Provider,
     dto::{Authenticated, ErrorResponse, ResponseResult},
     error::Error,
+    provider::Provider,
     tracing, AppState,
 };
 

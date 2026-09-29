@@ -2,6 +2,7 @@ use axum::{extract::rejection::JsonRejection, http::StatusCode};
 use axum_extra::typed_header::TypedHeaderRejection;
 
 use crate::config::{ConfigError, KeyPairError};
+use crate::provider::FetchError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -40,6 +41,10 @@ pub enum Error {
 
     #[error(transparent)]
     Jwt(#[from] jsonwebtoken::errors::Error),
+
+    /// A provider did not produce a payload.
+    #[error(transparent)]
+    Fetch(#[from] FetchError),
 
     #[error(transparent)]
     Request(#[from] reqwest::Error),
@@ -106,6 +111,24 @@ impl IntoHttpError for Error {
                 status_code: StatusCode::UNAUTHORIZED,
                 message: "Unauthorized".to_string(),
             },
+            Error::Fetch(error) => {
+                // A remote provider that refused is upstream's fault; a local
+                // file that cannot be read is the operator's, and no status a
+                // client can act on describes it better than a plain failure.
+                let (status_code, message) = match error {
+                    FetchError::Request(_) => (StatusCode::BAD_GATEWAY, "Upstream request failed"),
+                    FetchError::Read { .. } => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                    }
+                };
+
+                tracing::warn!("provider fetch failed: {error}");
+
+                HttpError {
+                    status_code,
+                    message: message.to_string(),
+                }
+            }
             Error::Request(_) => HttpError {
                 status_code: StatusCode::BAD_GATEWAY,
                 message: "Upstream request failed".to_string(),

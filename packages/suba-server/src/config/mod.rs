@@ -2,21 +2,18 @@ mod administrator;
 mod codec;
 mod error;
 mod key_pair;
-pub mod provider;
 mod server;
 
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs};
+use std::fs;
 
 pub use administrator::*;
 pub(crate) use codec::config_path;
 pub use error::ConfigError;
 pub use key_pair::*;
-pub use provider::Provider;
 pub use server::{ListenAddr, ServerConfig};
 
 pub(crate) const APP_CONFIG_BASENAME: &str = "config";
-pub(crate) const PROVIDERS_BASENAME: &str = "providers";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -25,12 +22,6 @@ pub struct AppConfig {
     #[serde(rename = "ed25519")]
     pub key_pair: Option<KeyPair>,
     pub subscription_prefix: Option<SubscriptionConfig>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProvidersConfig {
-    #[serde(flatten)]
-    pub providers: HashMap<String, Provider>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,12 +85,8 @@ mod tests {
         read_config(path.to_str().unwrap(), APP_CONFIG_BASENAME).unwrap()
     }
 
-    fn load_providers(path: &Path) -> ProvidersConfig {
-        read_config(path.to_str().unwrap(), PROVIDERS_BASENAME).unwrap()
-    }
-
     #[tokio::test]
-    async fn app_and_provider_configs_use_separate_files() {
+    async fn an_app_config_round_trips() {
         let path = test_path();
         let app = AppConfig {
             subscription_prefix: Some(SubscriptionConfig {
@@ -107,17 +94,12 @@ mod tests {
             }),
             ..AppConfig::default()
         };
-        let providers = ProvidersConfig::default();
 
         write_config(path.to_str().unwrap(), APP_CONFIG_BASENAME, &app)
             .await
             .unwrap();
-        write_config(path.to_str().unwrap(), PROVIDERS_BASENAME, &providers)
-            .await
-            .unwrap();
 
         assert!(config_path(&path, APP_CONFIG_BASENAME).is_file());
-        assert!(config_path(&path, PROVIDERS_BASENAME).is_file());
         assert_eq!(
             load_app(&path)
                 .subscription_prefix
@@ -126,16 +108,13 @@ mod tests {
                 .as_deref(),
             Some("/s")
         );
-        assert!(load_providers(&path).providers.is_empty());
 
         tokio::fs::remove_dir_all(path).await.unwrap();
     }
 
     #[test]
-    fn missing_configs_load_as_defaults() {
-        let path = test_path();
-        assert!(load_app(&path).administrator.is_none());
-        assert!(load_providers(&path).providers.is_empty());
+    fn a_missing_config_loads_as_the_default() {
+        assert!(load_app(&test_path()).administrator.is_none());
     }
 
     #[tokio::test]
@@ -147,43 +126,6 @@ mod tests {
             .unwrap();
 
         assert!(read_config::<AppConfig>(path.to_str().unwrap(), APP_CONFIG_BASENAME).is_err());
-        tokio::fs::remove_dir_all(path).await.unwrap();
-    }
-
-    /// A provider with its optional fields left unset must survive a write and
-    /// a read in whichever format is compiled in.
-    ///
-    /// This is the round trip that used to fail under the JSON format:
-    /// `http_serde`'s option serializer writes `None` as `null`, and its own
-    /// deserializer then refuses that `null`, so what the store wrote it could
-    /// not read back. Skipping the absent field is the fix, and this test holds
-    /// it for every format.
-    #[tokio::test]
-    async fn a_provider_with_no_optional_fields_round_trips() {
-        use crate::config::provider::{default_interval, Http, SharedFields};
-
-        let path = test_path();
-        let mut config = ProvidersConfig::default();
-        config.providers.insert(
-            "airport".to_string(),
-            Provider::Http(Http {
-                shared: SharedFields { disabled: false },
-                url: "https://example.com/subscription".parse().unwrap(),
-                headers: None,
-                timeout: None,
-                interval: default_interval(),
-            }),
-        );
-
-        write_config(path.to_str().unwrap(), PROVIDERS_BASENAME, &config)
-            .await
-            .unwrap();
-
-        let reloaded = load_providers(&path);
-        let stored = reloaded.providers.get("airport").expect("the provider");
-
-        assert!(stored.is_none_of_the_optional_fields());
-
         tokio::fs::remove_dir_all(path).await.unwrap();
     }
 }

@@ -1,11 +1,15 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use reqwest::Client;
 use tokio::sync::watch;
 
 use crate::{
-    config::{ConfigError, Provider, ProvidersConfig, PROVIDERS_BASENAME},
+    config::ConfigError,
     error::Error,
+    provider::{Provider, ProvidersConfig, PROVIDERS_BASENAME},
 };
 
 use super::{caches::CacheStore, persisted::Persisted};
@@ -26,6 +30,9 @@ pub(crate) struct Refreshed {
 pub(crate) struct ProviderStore {
     file: Persisted<ProvidersConfig>,
     cache: CacheStore,
+    /// Where a [`Local`](crate::provider::Local) provider's relative
+    /// path is resolved from.
+    config_dir: PathBuf,
     /// Bumped on every configuration change, so background work can follow
     /// the provider set instead of polling it.
     changes: watch::Sender<u64>,
@@ -36,6 +43,7 @@ impl ProviderStore {
         Ok(Self {
             file: Persisted::load(config_dir, PROVIDERS_BASENAME)?,
             cache: CacheStore::load(data_dir),
+            config_dir: config_dir.to_path_buf(),
             changes: watch::Sender::new(0),
         })
     }
@@ -64,13 +72,17 @@ impl ProviderStore {
     }
 
     /// Every provider that takes part in automatic refreshing.
+    ///
+    /// A provider that is disabled is left out, and so is one there is nothing
+    /// to poll for — an inline provider serves what the configuration already
+    /// holds, so a schedule for it would only ever re-read the same bytes.
     pub(crate) async fn refreshable(&self) -> Vec<(String, Provider)> {
         self.file
             .read(|config| {
                 config
                     .providers
                     .iter()
-                    .filter(|(_, provider)| !provider.disabled())
+                    .filter(|(_, provider)| !provider.disabled() && provider.interval().is_some())
                     .map(|(name, provider)| (name.clone(), provider.clone()))
                     .collect()
             })
@@ -107,18 +119,18 @@ impl ProviderStore {
 
     /// Download `provider` and adopt it as the provider stored under `name`.
     ///
-    /// The download happens before anything is committed, so a provider that
-    /// cannot be fetched is never left behind half-configured. The payload is
+    /// The payload is read before anything is committed, so a provider that
+    /// cannot be read is never left behind half-configured. The payload is
     /// staged before the configuration change is published: a worker started
-    /// by that change must find the content already cached, or it would
-    /// download it a second time straight away.
+    /// by that change must find the content already cached, or it would read
+    /// it a second time straight away.
     pub(crate) async fn upsert(
         &self,
         name: &str,
         provider: Provider,
         client: &Client,
     ) -> Result<Refreshed, Error> {
-        let content = provider.fetch(client).await?;
+        let content = provider.payload(client, &self.config_dir).await?;
         self.store(name, &content).await?;
         self.insert(name, provider).await?;
 
@@ -128,7 +140,7 @@ impl ProviderStore {
         })
     }
 
-    /// Re-download the provider stored under `name` and cache the result.
+    /// Read the provider stored under `name` again and cache the result.
     ///
     /// Writers of the same provider are serialized, so a refresh triggered by
     /// the API cannot race the scheduler.
@@ -143,7 +155,7 @@ impl ProviderStore {
             return Err(Error::ProviderDisabled(name.to_owned()));
         }
 
-        let content = provider.fetch(client).await?;
+        let content = provider.payload(client, &self.config_dir).await?;
         self.store(name, &content).await?;
 
         Ok(Refreshed {
@@ -166,15 +178,22 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::provider::{default_interval, Http, SharedFields};
+    use crate::provider::{default_interval, Remote, SharedFields};
 
     fn test_dir() -> PathBuf {
         std::env::temp_dir().join(format!("suba-providers-{}", uuid::Uuid::now_v7()))
     }
 
     fn provider() -> Provider {
-        Provider::Http(Http {
-            shared: SharedFields { disabled: false },
+        remote(false)
+    }
+
+    fn remote(disabled: bool) -> Provider {
+        Provider::Remote(Remote {
+            shared: SharedFields {
+                disabled,
+                ..SharedFields::default()
+            },
             url: "https://example.com/subscription".parse().unwrap(),
             headers: None,
             timeout: None,
@@ -246,12 +265,7 @@ mod tests {
             Err(Error::ProviderNotFound(_))
         ));
 
-        let Provider::Http(mut disabled) = provider();
-        disabled.shared.disabled = true;
-        store
-            .insert("airport", Provider::Http(disabled))
-            .await
-            .unwrap();
+        store.insert("airport", remote(true)).await.unwrap();
 
         assert!(matches!(
             store.refresh("airport", &client).await,
