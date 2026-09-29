@@ -18,10 +18,12 @@
 //!   observed from a provider.
 //! * [`subscription`] — the container formats a provider serves.
 //! * [`index`] — every provider's nodes, merged into one view.
+//! * [`collection`] — a subscription assembled out of providers.
 //! * [`provider`] — what a fetch means for what is kept.
 //! * [`filter`] — which nodes survive.
 
 pub mod checksum;
+pub mod collection;
 pub mod filter;
 pub mod index;
 pub mod node;
@@ -32,6 +34,7 @@ pub mod subscription;
 /// The protocol model, under the name this crate refers to it by.
 pub use suba_proto as proto;
 
+pub use collection::{Collection, Resolved, View};
 pub use filter::{FilterError, NodeFilter, PatternReason};
 pub use index::{IndexEntry, NodeIndex, Source};
 pub use node::{NodeRecord, Provenance};
