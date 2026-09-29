@@ -217,12 +217,6 @@ pub fn decide(
                 };
             }
 
-            let ids: Vec<String> = parsed
-                .nodes
-                .iter()
-                .map(|record| record.id().to_string())
-                .collect();
-
             let mut observation = Observation {
                 payload,
                 etag,
@@ -235,7 +229,7 @@ pub fn decide(
             };
             // A node this hub has served before keeps the time it was first
             // seen; one it has not starts now.
-            observation.note_sightings(ids.iter().map(String::as_str), now);
+            observation.note_sightings(parsed.nodes.iter().map(NodeRecord::id), now);
 
             RefreshPlan {
                 status: RefreshStatus::Fetched,
@@ -423,7 +417,7 @@ mod tests {
     fn a_node_the_provider_no_longer_serves_keeps_the_time_it_was_first_seen() {
         let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
         let held = first.observation.unwrap();
-        let gone = held.remembered().next().unwrap().to_string();
+        let gone = held.remembered().next().unwrap();
 
         let plan = decide(
             "primary",
@@ -507,7 +501,7 @@ mod tests {
     fn the_sighting_a_node_keeps_is_the_first_time_this_hub_saw_it() {
         let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
         let held = first.observation.unwrap();
-        let id = held.remembered().next().unwrap().to_string();
+        let id = held.remembered().next().unwrap();
 
         // A later fetch of the same node: the payload is new, the sighting is
         // not.

@@ -11,9 +11,11 @@
 //! instance, is not stored: it is a node in [`Observation::sighting`] that the
 //! current payload does not mention.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+
+use crate::proto::NodeFingerprint;
 
 /// What a provider served, and what this hub knows about it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -65,8 +67,12 @@ pub struct Observation {
     /// The one fact the payload cannot be asked again. Bounded by the number of
     /// distinct nodes the provider has ever served, not by how often they were
     /// fetched.
+    ///
+    /// Keyed by identity rather than by a name or a position, so a node the
+    /// provider renamed is still the node this hub first saw: an identity
+    /// outlives every spelling of it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sighting: BTreeMap<String, i64>,
+    pub sighting: BTreeMap<NodeFingerprint, i64>,
 }
 
 impl Observation {
@@ -91,9 +97,9 @@ impl Observation {
     ///
     /// A node the provider has served before keeps the first time it was seen —
     /// that is what makes the fact worth storing.
-    pub fn note_sightings<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>, now: i64) {
+    pub fn note_sightings(&mut self, ids: impl IntoIterator<Item = NodeFingerprint>, now: i64) {
         for id in ids {
-            let seen = self.sighting.entry(id.to_string()).or_insert(now);
+            let seen = self.sighting.entry(id).or_insert(now);
 
             if now < *seen {
                 *seen = now;
@@ -101,9 +107,9 @@ impl Observation {
         }
     }
 
-    /// The ids this hub remembers seeing from this provider.
-    pub fn remembered(&self) -> impl Iterator<Item = &str> {
-        self.sighting.keys().map(String::as_str)
+    /// The identities this hub remembers seeing from this provider.
+    pub fn remembered(&self) -> impl Iterator<Item = NodeFingerprint> + '_ {
+        self.sighting.keys().copied()
     }
 
     /// How many of the remembered nodes the current payload does not mention.
@@ -111,12 +117,12 @@ impl Observation {
     /// An orphan is derived, never stored: it is a node that was served and is
     /// not served now. Counted rather than dropped, because a provider that has
     /// quietly shrunk is something an operator needs to see.
-    pub fn orphans<'a>(&'a self, served: impl IntoIterator<Item = &'a str>) -> usize {
-        let served: std::collections::HashSet<&str> = served.into_iter().collect();
+    pub fn orphans<'a>(&'a self, served: impl IntoIterator<Item = &'a NodeFingerprint>) -> usize {
+        let served: BTreeSet<&NodeFingerprint> = served.into_iter().collect();
 
         self.sighting
             .keys()
-            .filter(|id| !served.contains(id.as_str()))
+            .filter(|id| !served.contains(id))
             .count()
     }
 
@@ -127,7 +133,7 @@ impl Observation {
     /// it. That is what makes removing it from the payload reversible.
     pub fn merge_history(&mut self, previous: &Observation) {
         for (id, first_seen) in &previous.sighting {
-            let seen = self.sighting.entry(id.clone()).or_insert(*first_seen);
+            let seen = self.sighting.entry(*id).or_insert(*first_seen);
 
             if *first_seen < *seen {
                 *seen = *first_seen;
@@ -140,14 +146,20 @@ impl Observation {
 mod tests {
     use super::*;
 
-    fn observed(payload: &str, ids: &[(&str, i64)]) -> Observation {
+    /// A fingerprint with a shape of its own, for tests that care about
+    /// identities but not about which node they belong to.
+    fn id(spelling: char) -> NodeFingerprint {
+        NodeFingerprint::parse(&spelling.to_string().repeat(32)).expect("a fingerprint")
+    }
+
+    fn observed(payload: &str, ids: &[(NodeFingerprint, i64)]) -> Observation {
         let mut observation = Observation {
             payload: payload.to_string(),
             ..Observation::default()
         };
 
         for (id, seen) in ids {
-            observation.sighting.insert((*id).to_string(), *seen);
+            observation.sighting.insert(*id, *seen);
         }
 
         observation
@@ -177,50 +189,53 @@ mod tests {
 
     #[test]
     fn a_node_seen_again_keeps_the_first_time_it_was_seen() {
-        let mut observation = observed("payload", &[("abc", 1_000)]);
+        let mut observation = observed("payload", &[(id('a'), 1_000)]);
 
-        observation.note_sightings(["abc", "def"], 2_000);
+        observation.note_sightings([id('a'), id('b')], 2_000);
 
         assert_eq!(
-            observation.sighting["abc"], 1_000,
+            observation.sighting[&id('a')],
+            1_000,
             "the first sighting wins"
         );
-        assert_eq!(observation.sighting["def"], 2_000, "the new one is now");
+        assert_eq!(observation.sighting[&id('b')], 2_000, "the new one is now");
     }
 
     #[test]
     fn a_newer_time_never_overwrites_an_older_one() {
         let mut observation = Observation::default();
 
-        observation.note_sightings(["abc"], 2_000);
-        observation.note_sightings(["abc"], 1_000);
+        observation.note_sightings([id('a')], 2_000);
+        observation.note_sightings([id('a')], 1_000);
 
         assert_eq!(
-            observation.sighting["abc"], 1_000,
+            observation.sighting[&id('a')],
+            1_000,
             "the earliest time this hub has is the answer"
         );
     }
 
     #[test]
     fn history_survives_a_refresh_that_no_longer_mentions_the_node() {
-        let previous = observed("old", &[("gone", 1_000)]);
-        let mut fresh = observed("new", &[("here", 2_000)]);
+        let previous = observed("old", &[(id('a'), 1_000)]);
+        let mut fresh = observed("new", &[(id('b'), 2_000)]);
 
         fresh.merge_history(&previous);
 
-        assert_eq!(fresh.sighting["here"], 2_000);
+        assert_eq!(fresh.sighting[&id('b')], 2_000);
         assert_eq!(
-            fresh.sighting["gone"], 1_000,
+            fresh.sighting[&id('a')],
+            1_000,
             "a node the payload dropped is still remembered"
         );
     }
 
     #[test]
     fn an_orphan_is_a_remembered_node_the_payload_no_longer_serves() {
-        let observation = observed("payload", &[("served", 1_000), ("gone", 1_000)]);
+        let observation = observed("payload", &[(id('a'), 1_000), (id('b'), 1_000)]);
 
-        assert_eq!(observation.orphans(["served"]), 1);
-        assert_eq!(observation.orphans(["served", "gone"]), 0);
+        assert_eq!(observation.orphans([&id('a')]), 1);
+        assert_eq!(observation.orphans([&id('a'), &id('b')]), 0);
     }
 
     #[test]
