@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::IndexEntry;
 use crate::proto::{self, write_link, Kind};
-#[cfg(feature = "singbox")]
+#[cfg(any(feature = "singbox", feature = "clash"))]
 use crate::proto::{Client, Node};
 
 /// A document shape a collection can be served in.
@@ -41,6 +41,9 @@ pub enum Format {
     /// A sing-box configuration, with one outbound per node.
     #[cfg(feature = "singbox")]
     Singbox,
+    /// A clash configuration, with one proxy per node.
+    #[cfg(feature = "clash")]
+    Clash,
 }
 
 impl Format {
@@ -50,9 +53,13 @@ impl Format {
     /// is off is absent here, which is what makes "this build does not serve
     /// that" a fact rather than a runtime check somebody can forget to perform.
     pub fn all() -> &'static [Self] {
-        #[cfg(feature = "singbox")]
+        #[cfg(all(feature = "singbox", feature = "clash"))]
+        let formats: &'static [Self] = &[Self::Links, Self::Singbox, Self::Clash];
+        #[cfg(all(feature = "singbox", not(feature = "clash")))]
         let formats: &'static [Self] = &[Self::Links, Self::Singbox];
-        #[cfg(not(feature = "singbox"))]
+        #[cfg(all(feature = "clash", not(feature = "singbox")))]
+        let formats: &'static [Self] = &[Self::Links, Self::Clash];
+        #[cfg(not(any(feature = "singbox", feature = "clash")))]
         let formats: &'static [Self] = &[Self::Links];
 
         formats
@@ -64,6 +71,8 @@ impl Format {
             Self::Links => "links",
             #[cfg(feature = "singbox")]
             Self::Singbox => "singbox",
+            #[cfg(feature = "clash")]
+            Self::Clash => "clash",
         }
     }
 
@@ -86,6 +95,12 @@ impl Format {
                 format: self,
                 intents: &[RenderIntent::Client],
                 protocols: ProtocolSupport::Only(suba_singbox::PROTOCOLS),
+            },
+            #[cfg(feature = "clash")]
+            Self::Clash => FormatDescriptor {
+                format: self,
+                intents: &[RenderIntent::Client],
+                protocols: ProtocolSupport::Only(suba_clash::PROTOCOLS),
             },
         }
     }
@@ -113,6 +128,8 @@ impl Format {
             Self::Links => rendered.body = self.render_links(nodes, &mut rendered.skipped),
             #[cfg(feature = "singbox")]
             Self::Singbox => rendered.body = self.render_singbox(nodes, &mut rendered.skipped),
+            #[cfg(feature = "clash")]
+            Self::Clash => rendered.body = self.render_clash(nodes, &mut rendered.skipped),
         }
 
         Ok(rendered)
@@ -191,6 +208,55 @@ impl Format {
                     suba_singbox::Reason::Value { field, spelling } => SkipReason::Refused {
                         kind: proto::ErrorKind::InvalidValue,
                         reason: format!("{field}: {spelling} has no sing-box spelling"),
+                    },
+                },
+            });
+        }
+
+        body
+    }
+
+    /// A clash document, as the dialect writes it.
+    #[cfg(feature = "clash")]
+    fn render_clash(self, nodes: &[&IndexEntry], skipped: &mut Vec<Skipped>) -> String {
+        // What can be written at all: a node nobody serves has no content, so it
+        // is not the dialect's to refuse.
+        let writable: Vec<(&IndexEntry, &Node<Client>)> = nodes
+            .iter()
+            .filter_map(|entry| match entry.node.as_ref() {
+                Some(node) => Some((*entry, node)),
+                None => {
+                    skipped.push(orphan(entry));
+
+                    None
+                }
+            })
+            .collect();
+
+        let named: Vec<(&str, &Node<Client>)> = writable
+            .iter()
+            .map(|(entry, node)| (entry.name().unwrap_or_default(), *node))
+            .collect();
+
+        let (body, refused) = suba_clash::client_config(&named);
+
+        // A refusal names a position in what the dialect was given, which is the
+        // position in `writable`: orphans were taken out before it was called.
+        for refusal in refused {
+            let (entry, _) = writable[refusal.index];
+
+            skipped.push(Skipped {
+                id: entry.id,
+                name: entry.name().map(str::to_owned),
+                reason: match refusal.reason {
+                    suba_clash::Reason::Protocol(kind) => SkipReason::Protocol(kind),
+                    suba_clash::Reason::Transport(carriage) => SkipReason::Transport(carriage),
+                    // The dialect could not spell a value clash accepts; the field
+                    // and what the node said are the whole explanation, and
+                    // neither is a credential.
+                    suba_clash::Reason::Value { field, spelling } => SkipReason::Refused {
+                        kind: proto::ErrorKind::InvalidValue,
+                        reason: format!("{field}: {spelling} has no clash spelling"),
                     },
                 },
             });
@@ -578,9 +644,13 @@ mod tests {
     fn the_formats_this_build_has_are_the_compiled_ones() {
         let names: Vec<&str> = Format::all().iter().map(|format| format.as_str()).collect();
 
-        #[cfg(feature = "singbox")]
+        #[cfg(all(feature = "singbox", feature = "clash"))]
+        assert_eq!(names, ["links", "singbox", "clash"]);
+        #[cfg(all(feature = "singbox", not(feature = "clash")))]
         assert_eq!(names, ["links", "singbox"]);
-        #[cfg(not(feature = "singbox"))]
+        #[cfg(all(feature = "clash", not(feature = "singbox")))]
+        assert_eq!(names, ["links", "clash"]);
+        #[cfg(not(any(feature = "singbox", feature = "clash")))]
         assert_eq!(names, ["links"]);
     }
 
@@ -624,6 +694,54 @@ mod tests {
             Format::Singbox.render(&entries(&index), RenderIntent::Server),
             Err(RenderError::Intent {
                 format: Format::Singbox,
+                intent: RenderIntent::Server
+            })
+        ));
+    }
+
+    /// A clash document holds the proxies it can write and names the nodes it
+    /// cannot, from the dialect's own refusal.
+    #[cfg(feature = "clash")]
+    #[test]
+    fn a_clash_document_holds_the_proxies_it_can_write() {
+        let fixtures = vec![
+            "trojan://PASSWORD@example.com:443?sni=example.com#Trojan".to_string(),
+            "snell://1.2.3.4:443?psk=PSK&version=4#Snell".to_string(),
+        ];
+        let index = index(&fixtures);
+        let rendered = Format::Clash
+            .render(&entries(&index), RenderIntent::Client)
+            .expect("a client document");
+
+        assert!(
+            rendered.body.starts_with("---\nproxies:\n"),
+            "{}",
+            rendered.body
+        );
+        assert!(
+            rendered.body.contains("\n  - name: Trojan\n"),
+            "{}",
+            rendered.body
+        );
+        assert_eq!(rendered.skipped.len(), 1);
+        assert_eq!(rendered.skipped[0].name.as_deref(), Some("Snell"));
+        assert_eq!(
+            rendered.skipped[0].reason,
+            SkipReason::Protocol(Kind::Other)
+        );
+    }
+
+    /// A clash document describes a client, like the links do: a server document
+    /// is a different shape, and this build does not write it yet.
+    #[cfg(feature = "clash")]
+    #[test]
+    fn clash_does_not_write_a_server_document() {
+        let index = index(&links()[..1]);
+
+        assert!(matches!(
+            Format::Clash.render(&entries(&index), RenderIntent::Server),
+            Err(RenderError::Intent {
+                format: Format::Clash,
                 intent: RenderIntent::Server
             })
         ));

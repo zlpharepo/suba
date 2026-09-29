@@ -9,10 +9,12 @@ license.workspace = true
 # `toml`/`json` pick the configuration file format and are mutually exclusive.
 # `singbox` adds the sing-box document format: it links the dialect crate, and
 # the dialect is called from the format registry that the capability list reads.
+# `clash` adds the clash document format the same way.
 default = ["toml"]
 toml = ["suba-server/toml"]
 json = ["suba-server/json"]
 singbox = ["suba-server/singbox"]
+clash = ["suba-server/clash"]
 
 [dependencies]
 suba-server = { workspace = true }

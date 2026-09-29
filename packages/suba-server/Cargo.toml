@@ -10,6 +10,7 @@ default = ["toml"]
 toml = ["dep:toml"]
 json = []
 singbox = ["suba-core/singbox"]
+clash = ["suba-core/clash"]
 
 [dependencies]
 suba-core = { workspace = true }
