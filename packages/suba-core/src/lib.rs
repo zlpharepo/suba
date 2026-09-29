@@ -17,11 +17,13 @@
 //! * [`node`] / [`observation`] — what a hub adds: provenance, and what was
 //!   observed from a provider.
 //! * [`subscription`] — the container formats a provider serves.
+//! * [`index`] — every provider's nodes, merged into one view.
 //! * [`provider`] — what a fetch means for what is kept.
 //! * [`filter`] — which nodes survive.
 
 pub mod checksum;
 pub mod filter;
+pub mod index;
 pub mod node;
 pub mod observation;
 pub mod provider;
@@ -31,6 +33,7 @@ pub mod subscription;
 pub use suba_proto as proto;
 
 pub use filter::{FilterError, NodeFilter, PatternReason};
+pub use index::{IndexEntry, NodeIndex, Source};
 pub use node::{NodeRecord, Provenance};
 pub use observation::Observation;
 pub use provider::{decide, record_failure, Fetched, PayloadReport, RefreshPlan, RefreshStatus};
