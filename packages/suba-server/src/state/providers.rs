@@ -14,7 +14,7 @@
 //! socket and a disk.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -27,7 +27,7 @@ use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
 use crate::{
     error::Error,
     provider::{Provider, ProvidersConfig, PROVIDERS_BASENAME},
-    store::{FileStore, ObservationStore},
+    store::{FileStore, ObservationStore, StoreError},
 };
 
 use super::persisted::Persisted;
@@ -303,6 +303,32 @@ impl ProviderStore {
         };
 
         writer.lock_owned().await
+    }
+
+    /// Everything this hub holds, by provider name.
+    ///
+    /// One blocking call for all of them rather than a round trip per provider:
+    /// a caller that needs the whole picture — assembling a collection's node
+    /// view — would otherwise pay the pool's latency once per provider, for the
+    /// same kind of work each time.
+    pub(crate) async fn observations(&self) -> Result<BTreeMap<String, Observation>, Error> {
+        let names: Vec<String> = self.list().await.into_keys().collect();
+        let store = Arc::clone(&self.observations);
+
+        Ok(
+            tokio::task::spawn_blocking(move || -> Result<_, StoreError> {
+                let mut held = BTreeMap::new();
+
+                for name in names {
+                    if let Some(observation) = store.read(&name)? {
+                        held.insert(name, observation);
+                    }
+                }
+
+                Ok(held)
+            })
+            .await??,
+        )
     }
 
     /// The observation held for `name`, read off the blocking pool.

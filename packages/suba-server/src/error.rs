@@ -19,6 +19,8 @@ pub enum Error {
 
     #[error("provider '{0}' not found")]
     ProviderNotFound(String),
+    #[error("collection '{0}' not found")]
+    CollectionNotFound(String),
     #[error("provider '{0}' is disabled")]
     ProviderDisabled(String),
     #[error("provider '{0}' has no cached contents yet")]
@@ -99,6 +101,10 @@ impl IntoHttpError for Error {
             Error::ProviderNotFound(name) => HttpError {
                 status_code: StatusCode::NOT_FOUND,
                 message: format!("Provider '{name}' not found"),
+            },
+            Error::CollectionNotFound(name) => HttpError {
+                status_code: StatusCode::NOT_FOUND,
+                message: format!("Collection '{name}' not found"),
             },
             Error::ProviderDisabled(name) => HttpError {
                 status_code: StatusCode::CONFLICT,
