@@ -33,6 +33,14 @@ pub enum Error {
     #[error(transparent)]
     Validation(#[from] garde::Report),
 
+    /// A provider's node filter cannot be compiled.
+    ///
+    /// The text is the field path and a static reason — `include[1]: not a
+    /// valid regular expression` — so the client is told what to fix without
+    /// the pattern being quoted back at it.
+    #[error(transparent)]
+    Filter(#[from] suba_core::FilterError),
+
     #[error(transparent)]
     KeyPair(#[from] KeyPairError),
 
@@ -101,6 +109,10 @@ impl IntoHttpError for Error {
             Error::Validation(_) => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
                 message: "Invalid request".to_string(),
+            },
+            Error::Filter(error) => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: error.to_string(),
             },
             Error::KeyPair(_) => HttpError {
                 status_code: StatusCode::INTERNAL_SERVER_ERROR,

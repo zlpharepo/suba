@@ -95,6 +95,11 @@ impl ProviderStore {
     }
 
     pub(crate) async fn insert(&self, name: &str, provider: Provider) -> Result<(), Error> {
+        // Validated before the lock is taken: an unusable filter is the
+        // caller's mistake, and the document it arrived in reads the same
+        // whether or not anything else is being written.
+        provider.filter()?;
+
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
         config.providers.insert(name.to_owned(), provider);
@@ -130,6 +135,12 @@ impl ProviderStore {
         provider: Provider,
         client: &Client,
     ) -> Result<Refreshed, Error> {
+        // Checked before the payload is read: a definition the store will
+        // refuse must not send a request, and a caller that made a mistake
+        // should hear about the mistake rather than about whatever the network
+        // said.
+        provider.filter()?;
+
         let content = provider.payload(client, &self.config_dir).await?;
         self.store(name, &content).await?;
         self.insert(name, provider).await?;
@@ -250,6 +261,63 @@ mod tests {
 
         store.insert("airport", provider()).await.unwrap();
         assert!(changes.changed().await.is_ok());
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// A filter that cannot be compiled is refused where it is stored.
+    ///
+    /// Storing it would leave a provider whose definition says one thing and
+    /// whose behaviour does another; the operator would have no way to tell
+    /// which had happened.
+    #[tokio::test]
+    async fn a_provider_with_an_unusable_filter_is_refused() {
+        let dir = test_dir();
+        let store = load(&dir);
+        let client = Client::new();
+
+        let Provider::Remote(mut broken) = provider() else {
+            panic!("the fixture is a remote provider");
+        };
+        broken.shared.include = vec!["regex:(".to_string()];
+
+        assert!(matches!(
+            store
+                .upsert("airport", Provider::Remote(broken), &client)
+                .await,
+            Err(Error::Filter(_))
+        ));
+
+        // Nothing was stored, and nothing was published: a refused definition
+        // does not half-exist.
+        assert!(store.get("airport").await.is_none());
+        assert!(
+            matches!(store.content("airport").await, Ok(None)),
+            "a refused provider has no cached payload"
+        );
+
+        // A refusal this early means nothing was ever created, so there is
+        // nothing to clean up and no directory to remove.
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn a_provider_whose_filter_compiles_is_stored() {
+        let dir = test_dir();
+        let store = load(&dir);
+
+        let Provider::Remote(mut filtered) = provider() else {
+            panic!("the fixture is a remote provider");
+        };
+        filtered.shared.include = vec!["US-01".to_string(), "keyword:LAX".to_string()];
+        filtered.shared.exclude = vec!["regex:-\\d+$".to_string()];
+
+        store
+            .insert("airport", Provider::Remote(filtered))
+            .await
+            .unwrap();
+
+        assert!(store.get("airport").await.is_some());
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }

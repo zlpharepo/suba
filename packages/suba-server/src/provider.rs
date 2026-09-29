@@ -19,6 +19,7 @@ use std::{
 
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
+use suba_core::{FilterError, NodeFilter};
 
 /// Where a provider's nodes come from.
 ///
@@ -43,26 +44,37 @@ pub struct SharedFields {
     #[serde(default)]
     pub disabled: bool,
 
-    /// Nodes to keep, as regular expressions matched against a node's name.
+    /// Nodes to keep.
     ///
-    /// Empty means every node the provider serves. When both lists are set, a
-    /// node must match one of `include` and none of `exclude`.
-    ///
-    /// Not applied yet: node filtering is not implemented, so these are stored
-    /// and round-tripped, and a provider still serves every node it is given.
+    /// Each entry is a pattern read against a node's name: a bare value is the
+    /// whole name, `keyword:` is a literal substring, `regex:` is a regular
+    /// expression. Empty means every node the provider serves.
     ///
     /// Skipped when empty, so a provider that filters nothing has neither key
-    /// rather than an empty list — the same reason the optional fields above
-    /// are skipped.
+    /// rather than an empty list — the same reason the optional fields below
+    /// are skipped. See [`NodeFilter`] for the vocabulary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
 
-    /// Nodes to drop, as regular expressions matched against a node's name.
+    /// Nodes to drop, in the same vocabulary.
     ///
     /// Takes precedence over [`include`](Self::include): a node that matches
     /// both is dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+}
+
+impl SharedFields {
+    /// Compile the two lists into the decision they describe.
+    ///
+    /// Called whenever a provider definition is written, so a pattern that
+    /// cannot be used is refused at the point it is stored rather than
+    /// discovered by a filter that quietly does less than it says. What is
+    /// still missing is the other half: nothing has a node to match yet, so the
+    /// compiled filter decides no refresh outcome.
+    pub fn filter(&self) -> Result<NodeFilter, FilterError> {
+        NodeFilter::compile(&self.include, &self.exclude)
+    }
 }
 
 impl Provider {
@@ -105,6 +117,15 @@ impl Provider {
             // Nothing to read: the nodes are in the document the caller is
             // already holding.
             Self::Inline(inline) => Ok(inline.payload.clone()),
+        }
+    }
+
+    /// The node filter this definition asks for.
+    pub fn filter(&self) -> Result<NodeFilter, FilterError> {
+        match self {
+            Self::Remote(remote) => remote.shared.filter(),
+            Self::Local(local) => local.shared.filter(),
+            Self::Inline(inline) => inline.shared.filter(),
         }
     }
 

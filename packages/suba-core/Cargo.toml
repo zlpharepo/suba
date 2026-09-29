@@ -8,5 +8,6 @@ license.workspace = true
 [dependencies]
 suba-proto = { workspace = true }
 base64 = { workspace = true }
+regex = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
