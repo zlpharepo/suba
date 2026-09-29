@@ -5,13 +5,12 @@ use axum::{
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
-use suba_core::tracing;
 
 use crate::{
     config::Provider,
     dto::{Authenticated, ErrorResponse, ResponseResult},
     error::Error,
-    AppState,
+    tracing, AppState,
 };
 
 /// The outcome of fetching a subscription, without its contents.

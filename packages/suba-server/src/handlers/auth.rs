@@ -1,11 +1,10 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use garde::Validate;
 use serde::{Deserialize, Serialize};
-use suba_core::tracing;
 
 use crate::{
     dto::{Authenticated, ResponseResult, ValidatedJson},
-    AppState,
+    tracing, AppState,
 };
 
 #[derive(Debug, Deserialize, Serialize, Validate)]

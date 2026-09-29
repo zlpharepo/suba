@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use suba_core::tracing;
-use suba_server::{ServerConfig, SubaServer};
+use suba_server::{tracing, ServerConfig, SubaServer};
 
 #[derive(Parser)]
 #[command(author = "ZLPHA")]

@@ -1,10 +1,9 @@
 use std::path::Path;
 
-use suba_core::tracing;
-
 use crate::{
     config::{Administrator, AppConfig, ConfigError, KeyPair, APP_CONFIG_BASENAME},
     error::Error,
+    tracing,
 };
 
 use super::persisted::Persisted;

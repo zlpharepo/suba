@@ -8,7 +8,5 @@ license.workspace = true
 [dependencies]
 suba-proto = { workspace = true }
 base64 = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }

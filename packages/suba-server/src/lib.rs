@@ -5,8 +5,7 @@ mod handlers;
 pub mod password;
 mod routers;
 mod state;
-
-use suba_core::tracing;
+pub mod tracing;
 
 pub(crate) use config::Claims;
 pub use config::{ConfigError, ListenAddr, ServerConfig};

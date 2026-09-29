@@ -3,14 +3,13 @@
 use std::{sync::Arc, time::Duration};
 
 use reqwest::Client;
-use suba_core::tracing;
 use tokio::{
     sync::watch,
     task::JoinSet,
     time::{self, Instant},
 };
 
-use crate::error::Error;
+use crate::{error::Error, tracing};
 
 use super::providers::{ProviderStore, Refreshed};
 
