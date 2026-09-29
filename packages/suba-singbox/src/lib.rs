@@ -22,13 +22,28 @@
 
 use serde_json::{json, Map, Value};
 
+use suba_proto::protocol::vless::Flow;
 use suba_proto::{Client, Endpoint, Kind, Node, Outbound, TlsClient, Transport};
 
 /// The protocols this mapping can write.
 ///
 /// The capability list is built from this, and so is every refusal: one table,
 /// so what this crate says it can do and what it does cannot drift apart.
-pub const PROTOCOLS: &[Kind] = &[Kind::Trojan, Kind::Shadowsocks, Kind::Socks, Kind::Http];
+///
+/// ShadowsocksR is absent on purpose: sing-box deprecated its outbound, and a
+/// mapping onto something a released build may refuse to load is worse than
+/// saying so.
+pub const PROTOCOLS: &[Kind] = &[
+    Kind::Vless,
+    Kind::Trojan,
+    Kind::Shadowsocks,
+    Kind::Vmess,
+    Kind::Hysteria2,
+    Kind::Tuic,
+    Kind::AnyTls,
+    Kind::Socks,
+    Kind::Http,
+];
 
 /// A node the document does not contain, by its position in the input.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +61,14 @@ pub enum Reason {
     Protocol(Kind),
     /// How the node is carried has no representation.
     Transport(String),
+    /// A value sing-box has no spelling for.
+    Value {
+        /// Which field.
+        field: &'static str,
+        /// What the node said, as it said it. Never a credential: the values
+        /// this can be reached with are a flow, an encryption and a port list.
+        spelling: String,
+    },
 }
 
 /// One node as a sing-box outbound.
@@ -63,6 +86,38 @@ pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
     outbound.insert("server_port".to_string(), json!(node.endpoint.port.get()));
 
     match &node.protocol {
+        Outbound::Vless(client) => {
+            outbound.insert("type".to_string(), json!("vless"));
+            outbound.insert("uuid".to_string(), json!(client.id.expose().to_string()));
+
+            match client.flow {
+                Flow::None => {}
+                Flow::XtlsRprxVision => {
+                    outbound.insert("flow".to_string(), json!("xtls-rprx-vision"));
+                }
+                // sing-box carries Reality with Vision and nothing else; the
+                // older splice is not expressible.
+                other => {
+                    return Err(Reason::Value {
+                        field: "flow",
+                        spelling: other.to_string(),
+                    })
+                }
+            }
+
+            // VLESS is unencrypted by definition in sing-box: a link asking for
+            // anything but `none` cannot be carried there.
+            if let Some(encryption) = client
+                .encryption
+                .as_deref()
+                .filter(|encryption| !encryption.eq_ignore_ascii_case("none"))
+            {
+                return Err(Reason::Value {
+                    field: "encryption",
+                    spelling: encryption.to_string(),
+                });
+            }
+        }
         Outbound::Trojan(client) => {
             outbound.insert("type".to_string(), json!("trojan"));
             outbound.insert("password".to_string(), json!(client.password.as_str()));
@@ -78,6 +133,66 @@ pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
                 outbound.insert("plugin".to_string(), json!(plugin.name.as_ref()));
                 outbound.insert("plugin_opts".to_string(), json!(plugin.to_string()));
             }
+        }
+        Outbound::Vmess(client) => {
+            outbound.insert("type".to_string(), json!("vmess"));
+            outbound.insert("uuid".to_string(), json!(client.id.expose().to_string()));
+            outbound.insert("security".to_string(), json!(client.security.as_str()));
+            outbound.insert("alter_id".to_string(), json!(client.alter_id));
+        }
+        Outbound::Hysteria2(client) => {
+            outbound.insert("type".to_string(), json!("hysteria2"));
+            outbound.insert("password".to_string(), json!(client.password.as_str()));
+
+            if let Some(obfs) = &client.obfs {
+                outbound.insert(
+                    "obfs".to_string(),
+                    json!({
+                        "type": obfs.to_string(),
+                        "password": client
+                            .obfs_password
+                            .as_ref()
+                            .map(|password| password.as_str())
+                            .unwrap_or_default(),
+                    }),
+                );
+            }
+
+            if let Some(ports) = &client.ports {
+                outbound.insert("server_ports".to_string(), json!(server_ports(ports)?));
+            }
+            if let Some(hop_interval) = client.hop_interval {
+                outbound.insert(
+                    "hop_interval".to_string(),
+                    json!(format!("{hop_interval}s")),
+                );
+            }
+            if let Some(up) = client.up {
+                outbound.insert("up_mbps".to_string(), json!(up));
+            }
+            if let Some(down) = client.down {
+                outbound.insert("down_mbps".to_string(), json!(down));
+            }
+        }
+        Outbound::Tuic(client) => {
+            outbound.insert("type".to_string(), json!("tuic"));
+            outbound.insert("uuid".to_string(), json!(client.uuid.expose().to_string()));
+            outbound.insert("password".to_string(), json!(client.password.as_str()));
+            outbound.insert(
+                "congestion_control".to_string(),
+                json!(client.congestion_control.as_str()),
+            );
+
+            if let Some(mode) = client.udp_relay_mode {
+                outbound.insert("udp_relay_mode".to_string(), json!(mode.as_str()));
+            }
+            if client.zero_rtt_handshake {
+                outbound.insert("zero_rtt_handshake".to_string(), json!(true));
+            }
+        }
+        Outbound::AnyTls(client) => {
+            outbound.insert("type".to_string(), json!("anytls"));
+            outbound.insert("password".to_string(), json!(client.password.as_str()));
         }
         Outbound::Socks(client) => {
             outbound.insert("type".to_string(), json!("socks"));
@@ -108,15 +223,51 @@ pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
         other => return Err(Reason::Protocol(other.kind())),
     }
 
-    if let Some(tls) = node.tls.as_ref() {
-        outbound.insert("tls".to_string(), tls_of(tls, &node.endpoint));
+    // Xray's UDP-over-TCP encoding, which the model keeps whole because it does
+    // not model it. sing-box spells the same two values, so it is passed on when
+    // a link named one and left at sing-box's default when it did not.
+    //
+    // Only where sing-box has the field: writing it on an outbound that does not
+    // accept it makes the whole configuration unloadable, which the released
+    // binary points out as `unknown field "packet_encoding"`.
+    if matches!(node.protocol.kind(), Kind::Vless | Kind::Vmess) {
+        if let Some(encoding) = node.extra.get("packetEncoding") {
+            outbound.insert("packet_encoding".to_string(), json!(encoding));
+        }
     }
 
-    if let Some(carriage) = transport_of(&node.transport) {
-        outbound.insert("transport".to_string(), carriage?);
+    match node.tls.as_ref() {
+        Some(tls) => {
+            outbound.insert("tls".to_string(), tls_of(tls, &node.endpoint));
+        }
+        // A protocol that carries itself is TLS by construction: a link with no
+        // TLS parameters describes a node whose certificate check is left at the
+        // default, not a node without TLS.
+        None if carries_itself(node.protocol.kind()) => {
+            outbound.insert("tls".to_string(), json!({ "enabled": true }));
+        }
+        None => {}
+    }
+
+    // The carriage belongs to the protocols that are carried over something.
+    // Hysteria2, TUIC and AnyTLS run over QUIC by construction: a link that says
+    // `quic` is saying what the protocol already is, and sing-box has no carriage
+    // field for them.
+    if !carries_itself(node.protocol.kind()) {
+        if let Some(carriage) = transport_of(&node.transport) {
+            outbound.insert("transport".to_string(), carriage?);
+        }
     }
 
     Ok(Value::Object(outbound))
+}
+
+/// Whether the protocol carries itself, over QUIC and TLS by construction.
+///
+/// It is one property with two consequences: there is nothing to say about the
+/// carriage, and there is nothing to say about whether TLS is on.
+fn carries_itself(kind: Kind) -> bool {
+    matches!(kind, Kind::Hysteria2 | Kind::Tuic | Kind::AnyTls)
 }
 
 /// A client document: one outbound per node, in the order they are given.
@@ -168,6 +319,40 @@ fn unique_tag(name: &str, index: usize, taken: &mut Vec<String>) -> String {
     taken.push(tag.clone());
 
     tag
+}
+
+/// A port list, as sing-box spells it: a list of ranges, with `:` for a range
+/// where hysteria writes `-`.
+///
+/// A single port is written as a one-port range — `3000:3000` — because the
+/// released binary refuses `3000` with `bad port range`. The two spellings say
+/// the same thing; only one of them loads.
+fn server_ports(ports: &str) -> Result<Vec<String>, Reason> {
+    let mut written = Vec::new();
+
+    for segment in ports.split(',') {
+        let segment = segment.trim();
+        let spelled = match segment.split_once('-') {
+            Some((from, to)) if is_port(from) && is_port(to) => format!("{from}:{to}"),
+            None if is_port(segment) => format!("{segment}:{segment}"),
+            _ => {
+                return Err(Reason::Value {
+                    field: "ports",
+                    spelling: ports.to_string(),
+                })
+            }
+        };
+
+        written.push(spelled);
+    }
+
+    Ok(written)
+}
+
+fn is_port(text: &str) -> bool {
+    !text.is_empty()
+        && text.chars().all(|digit| digit.is_ascii_digit())
+        && text.parse::<u16>().is_ok()
 }
 
 /// The TLS block, when the node is wrapped in TLS.
@@ -386,12 +571,142 @@ mod tests {
     }
 
     #[test]
-    fn a_protocol_with_no_outbound_is_refused_by_name() {
-        let vless = node(
-            "vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none#IPv6",
+    fn a_vless_node_becomes_a_vless_outbound() {
+        let outbound = written(
+            "Tokyo",
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=reality&sni=www.apple.com&fp=chrome&pbk=PUBKEY&sid=ab12&spx=%2F&flow=xtls-rprx-vision&type=ws&path=%2Fws&host=cdn.example.com&ed=2048#Tokyo",
         );
 
-        assert_eq!(outbound("IPv6", &vless), Err(Reason::Protocol(Kind::Vless)));
+        assert_eq!(outbound["type"], json!("vless"));
+        assert_eq!(
+            outbound["uuid"],
+            json!("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(outbound["flow"], json!("xtls-rprx-vision"));
+        assert_eq!(outbound["tls"]["server_name"], json!("www.apple.com"));
+        assert_eq!(outbound["tls"]["reality"]["short_id"], json!("ab12"));
+        assert_eq!(
+            outbound["transport"],
+            json!({
+                "type": "ws",
+                "path": "/ws",
+                "headers": { "Host": "cdn.example.com" },
+                "max_early_data": 2048
+            })
+        );
+    }
+
+    /// The splice flow is not one sing-box carries: refusing beats writing a
+    /// node it cannot run.
+    #[test]
+    fn a_flow_sing_box_cannot_carry_is_refused() {
+        let direct = node(
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls&flow=xtls-rprx-direct#Direct",
+        );
+
+        assert_eq!(
+            outbound("Direct", &direct),
+            Err(Reason::Value {
+                field: "flow",
+                spelling: "xtls-rprx-direct".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_vmess_node_becomes_a_vmess_outbound() {
+        let outbound = written(
+            "Golden",
+            "vmess://eyJ2IjoiMiIsInBzIjoiR29sZGVuIiwiYWRkIjoiZ29sZGVuLmV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1IiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ3cyIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ==",
+        );
+
+        assert_eq!(outbound["type"], json!("vmess"));
+        assert_eq!(
+            outbound["uuid"],
+            json!("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(outbound["security"], json!("auto"));
+        assert_eq!(outbound["alter_id"], json!(0));
+    }
+
+    /// Hysteria spells a port range with a hyphen where sing-box uses a colon,
+    /// and spells the list as a list.
+    #[test]
+    fn a_hysteria2_node_becomes_a_hysteria2_outbound() {
+        let outbound = written(
+            "Tokyo",
+            "hysteria2://letmein@example.com:443?obfs=salamander&obfs-password=obfspw&sni=www.apple.com&mport=1000-2000,3000&up=100&down=200#Tokyo",
+        );
+
+        assert_eq!(outbound["type"], json!("hysteria2"));
+        assert_eq!(outbound["password"], json!("letmein"));
+        assert_eq!(
+            outbound["obfs"],
+            json!({ "type": "salamander", "password": "obfspw" })
+        );
+        assert_eq!(outbound["server_ports"], json!(["1000:2000", "3000:3000"]));
+        assert_eq!(outbound["up_mbps"], json!(100));
+        assert_eq!(outbound["down_mbps"], json!(200));
+        assert_eq!(outbound["tls"]["server_name"], json!("www.apple.com"));
+    }
+
+    #[test]
+    fn a_tuic_node_becomes_a_tuic_outbound() {
+        let outbound = written(
+            "GoldenTUIC",
+            "tuic://11111111-2222-3333-4444-555555555555:letmein@golden.example.com:443?congestion_control=bbr&udp_relay_mode=native&sni=www.apple.com#GoldenTUIC",
+        );
+
+        assert_eq!(outbound["type"], json!("tuic"));
+        assert_eq!(
+            outbound["uuid"],
+            json!("11111111-2222-3333-4444-555555555555")
+        );
+        assert_eq!(outbound["password"], json!("letmein"));
+        assert_eq!(outbound["congestion_control"], json!("bbr"));
+        assert_eq!(outbound["udp_relay_mode"], json!("native"));
+        assert_eq!(outbound["tls"]["server_name"], json!("www.apple.com"));
+    }
+
+    /// AnyTLS is TLS by construction, so a node without TLS parameters is still
+    /// a TLS node — not one the document leaves unverified and unexplained.
+    #[test]
+    fn an_anytls_node_becomes_an_anytls_outbound() {
+        let named = written(
+            "GoldenAnyTLS",
+            "anytls://letmein@golden.example.com:443?sni=www.apple.com#GoldenAnyTLS",
+        );
+
+        assert_eq!(named["type"], json!("anytls"));
+        assert_eq!(named["password"], json!("letmein"));
+        assert_eq!(named["tls"]["enabled"], json!(true));
+
+        let bare = node("anytls://letmein@golden.example.com:443");
+        // The parser fills TLS in for a protocol that is TLS by construction;
+        // clearing it is what a hand-built node without TLS material looks like.
+        let bare = Node { tls: None, ..bare };
+        let bare = outbound("bare", &bare).expect("an outbound");
+        assert_eq!(bare["tls"], json!({ "enabled": true }));
+    }
+
+    #[test]
+    fn a_protocol_with_no_outbound_is_refused_by_name() {
+        let ssr = node(
+            "ssr://Z29sZGVuLmV4YW1wbGUuY29tOjQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6aHR0cF9zaW1wbGU6YkdWMGJXVnBiZy8_b2Jmc3BhcmFtPSZyZW1hcmtzPVUxTlM",
+        );
+
+        assert_eq!(
+            outbound("SSR", &ssr),
+            Err(Reason::Protocol(Kind::ShadowsocksR)),
+            "sing-box deprecated its shadowsocksr outbound"
+        );
+
+        let snell = node("snell://1.2.3.4:443?psk=PSK&version=4#Snell");
+        assert_eq!(
+            outbound("Snell", &snell),
+            Err(Reason::Protocol(Kind::Other)),
+            "a protocol the model does not know has no outbound either"
+        );
     }
 
     #[test]
@@ -404,14 +719,26 @@ mod tests {
         );
     }
 
+    /// A protocol that runs over QUIC says so by being itself: the carriage is
+    /// not a field sing-box has for it, and the link's `quic` is not a refusal.
+    #[test]
+    fn a_protocol_that_carries_itself_needs_no_carriage() {
+        let hysteria2 = node("hysteria2://letmein@example.com:443?sni=www.apple.com#Tokyo");
+
+        let outbound = outbound("Tokyo", &hysteria2).expect("an outbound");
+
+        assert!(outbound.get("transport").is_none(), "{outbound}");
+        assert_eq!(outbound["tls"]["enabled"], json!(true));
+    }
+
     #[test]
     fn the_document_holds_the_nodes_that_can_be_written_and_names_the_rest() {
         let trojan = node("trojan://PASSWORD@example.com:443?sni=example.com#Trojan");
-        let vless = node(
-            "vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none#IPv6",
+        let ssr = node(
+            "ssr://Z29sZGVuLmV4YW1wbGUuY29tOjQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6aHR0cF9zaW1wbGU6YkdWMGJXVnBiZy8_b2Jmc3BhcmFtPSZyZW1hcmtzPVUxTlM",
         );
 
-        let (body, refused) = client_config(&[("Trojan", &trojan), ("IPv6", &vless)]);
+        let (body, refused) = client_config(&[("Trojan", &trojan), ("SSR", &ssr)]);
 
         let document: Value = serde_json::from_str(&body).expect("valid JSON");
         assert_eq!(document["outbounds"].as_array().unwrap().len(), 1);
@@ -420,7 +747,7 @@ mod tests {
             refused,
             [Refused {
                 index: 1,
-                reason: Reason::Protocol(Kind::Vless)
+                reason: Reason::Protocol(Kind::ShadowsocksR)
             }]
         );
     }
@@ -467,7 +794,14 @@ mod tests {
             "ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@192.0.2.10:1080#SIP002",
             "socks5://doge:letmein@127.0.0.1:1080#LocalSocks",
             "http://doge:letmein@127.0.0.1:8080#LocalHttp",
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none#IPv6",
+            "vmess://eyJ2IjoiMiIsInBzIjoiR29sZGVuIiwiYWRkIjoiZ29sZGVuLmV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1IiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ3cyIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ==",
+            "hysteria2://letmein@example.com:443?obfs=salamander&sni=www.apple.com#Tokyo",
+            "tuic://11111111-2222-3333-4444-555555555555:letmein@golden.example.com:443?congestion_control=bbr#GoldenTUIC",
+            "anytls://letmein@golden.example.com:443?sni=www.apple.com#GoldenAnyTLS",
         ];
+
+        let mut kinds = Vec::new();
 
         for fixture in fixtures {
             let node = node(fixture);
@@ -476,6 +810,37 @@ mod tests {
                 "{fixture} is not in the capability list"
             );
             assert!(outbound("tag", &node).is_ok(), "{fixture} was refused");
+            kinds.push(node.protocol.kind());
+        }
+
+        for kind in PROTOCOLS {
+            assert!(
+                kinds.contains(kind),
+                "{kind} is in the capability list with no fixture proving it"
+            );
+        }
+    }
+
+    /// Hysteria spells a port range with a hyphen, sing-box with a colon, and a
+    /// value that is neither is refused rather than passed on as something it is
+    /// not.
+    #[test]
+    fn a_port_list_is_translated_and_a_broken_one_is_refused() {
+        assert_eq!(
+            server_ports("1000-2000,3000").unwrap(),
+            ["1000:2000", "3000:3000"]
+        );
+        assert_eq!(server_ports("443").unwrap(), ["443:443"]);
+
+        for broken in ["", "1000-", "-2000", "1000:2000", "high", "70000"] {
+            assert_eq!(
+                server_ports(broken),
+                Err(Reason::Value {
+                    field: "ports",
+                    spelling: broken.to_string()
+                }),
+                "{broken} is not a port list"
+            );
         }
     }
 }

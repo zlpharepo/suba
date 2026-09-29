@@ -185,6 +185,13 @@ impl Format {
                 reason: match refusal.reason {
                     suba_singbox::Reason::Protocol(kind) => SkipReason::Protocol(kind),
                     suba_singbox::Reason::Transport(carriage) => SkipReason::Transport(carriage),
+                    // The dialect could not spell a value sing-box accepts; the
+                    // field and what the node said are the whole explanation, and
+                    // neither is a credential.
+                    suba_singbox::Reason::Value { field, spelling } => SkipReason::Refused {
+                        kind: proto::ErrorKind::InvalidValue,
+                        reason: format!("{field}: {spelling} has no sing-box spelling"),
+                    },
                 },
             });
         }
@@ -584,7 +591,7 @@ mod tests {
     fn a_document_holds_what_it_can_write_and_reports_what_it_cannot() {
         let fixtures = vec![
             "trojan://PASSWORD@example.com:443?sni=example.com#Trojan".to_string(),
-            "vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none#Vless"
+            "ssr://Z29sZGVuLmV4YW1wbGUuY29tOjQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6aHR0cF9zaW1wbGU6YkdWMGJXVnBiZy8_b2Jmc3BhcmFtPSZyZW1hcmtzPVUxTlM"
                 .to_string(),
         ];
         let index = index(&fixtures);
@@ -599,10 +606,10 @@ mod tests {
         assert_eq!(outbounds.len(), 1, "{} was not written", rendered.body);
         assert_eq!(outbounds[0]["tag"], serde_json::json!("Trojan"));
         assert_eq!(rendered.skipped.len(), 1);
-        assert_eq!(rendered.skipped[0].name.as_deref(), Some("Vless"));
+        assert_eq!(rendered.skipped[0].name.as_deref(), Some("SSR"));
         assert_eq!(
             rendered.skipped[0].reason,
-            SkipReason::Protocol(Kind::Vless)
+            SkipReason::Protocol(Kind::ShadowsocksR)
         );
     }
 
