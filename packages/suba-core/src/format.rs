@@ -28,7 +28,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::index::IndexEntry;
-use crate::proto::{self, write_link, Client, Kind, Node};
+use crate::proto::{self, write_link, Kind};
+#[cfg(feature = "singbox")]
+use crate::proto::{Client, Node};
 
 /// A document shape a collection can be served in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,6 +38,9 @@ use crate::proto::{self, write_link, Client, Kind, Node};
 pub enum Format {
     /// The share links themselves, one per line.
     Links,
+    /// A sing-box configuration, with one outbound per node.
+    #[cfg(feature = "singbox")]
+    Singbox,
 }
 
 impl Format {
@@ -44,14 +49,21 @@ impl Format {
     /// Compiled, not configured: a format whose dialect is behind a feature that
     /// is off is absent here, which is what makes "this build does not serve
     /// that" a fact rather than a runtime check somebody can forget to perform.
-    pub const fn all() -> &'static [Self] {
-        &[Self::Links]
+    pub fn all() -> &'static [Self] {
+        #[cfg(feature = "singbox")]
+        let formats: &'static [Self] = &[Self::Links, Self::Singbox];
+        #[cfg(not(feature = "singbox"))]
+        let formats: &'static [Self] = &[Self::Links];
+
+        formats
     }
 
     /// The name it is spelled with, in documents and in URLs.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Links => "links",
+            #[cfg(feature = "singbox")]
+            Self::Singbox => "singbox",
         }
     }
 
@@ -67,6 +79,14 @@ impl Format {
                 // reason.
                 protocols: ProtocolSupport::Everything,
             },
+            // The dialect's own table, so that what it says it can write and
+            // what it writes cannot drift apart.
+            #[cfg(feature = "singbox")]
+            Self::Singbox => FormatDescriptor {
+                format: self,
+                intents: &[RenderIntent::Client],
+                protocols: ProtocolSupport::Only(suba_singbox::PROTOCOLS),
+            },
         }
     }
 
@@ -80,8 +100,7 @@ impl Format {
         nodes: &[&IndexEntry],
         intent: RenderIntent,
     ) -> Result<Rendered, RenderError> {
-        let descriptor = self.descriptor();
-        if !descriptor.intents.contains(&intent) {
+        if !self.descriptor().intents.contains(&intent) {
             return Err(RenderError::Intent {
                 format: self,
                 intent,
@@ -90,36 +109,34 @@ impl Format {
 
         let mut rendered = Rendered::default();
 
+        match self {
+            Self::Links => rendered.body = self.render_links(nodes, &mut rendered.skipped),
+            #[cfg(feature = "singbox")]
+            Self::Singbox => rendered.body = self.render_singbox(nodes, &mut rendered.skipped),
+        }
+
+        Ok(rendered)
+    }
+
+    /// The links, one per line.
+    fn render_links(self, nodes: &[&IndexEntry], skipped: &mut Vec<Skipped>) -> String {
+        let mut body = String::new();
+
         for entry in nodes {
             let Some(node) = entry.node.as_ref() else {
-                // Nothing serves it any more, so there is no content to write
-                // into a document: `IndexEntry` keeps the identity and the
-                // history, deliberately not a copy of a payload that is gone.
-                rendered.skipped.push(Skipped {
-                    id: entry.id,
-                    name: None,
-                    reason: SkipReason::Orphan,
-                });
+                skipped.push(orphan(entry));
 
                 continue;
             };
 
-            if let Some(reason) = descriptor.refuses(node.protocol.kind()) {
-                rendered.skipped.push(Skipped {
-                    id: entry.id,
-                    name: entry.name().map(str::to_owned),
-                    reason,
-                });
-
-                continue;
-            }
-
-            match self.write(node, intent) {
-                Ok(line) => rendered.body.push_str(&line),
-                // The descriptor said this node could be written and the writer
-                // disagreed. Rare, and never silently dropped: the node is left
-                // out with what the model said about it.
-                Err(error) => rendered.skipped.push(Skipped {
+            match write_link(node) {
+                Ok(link) => {
+                    body.push_str(&link);
+                    body.push('\n');
+                }
+                // Never silently dropped: the node is left out with what the
+                // model said about it.
+                Err(error) => skipped.push(Skipped {
                     id: entry.id,
                     name: entry.name().map(str::to_owned),
                     reason: SkipReason::Refused {
@@ -130,16 +147,60 @@ impl Format {
             }
         }
 
-        Ok(rendered)
+        body
     }
 
-    /// One node, as a line of this format's document.
-    fn write(self, node: &Node<Client>, intent: RenderIntent) -> Result<String, proto::Error> {
-        let _ = intent;
+    /// A sing-box configuration, as the dialect writes it.
+    #[cfg(feature = "singbox")]
+    fn render_singbox(self, nodes: &[&IndexEntry], skipped: &mut Vec<Skipped>) -> String {
+        // What can be written at all: a node nobody serves has no content, so it
+        // is not the dialect's to refuse.
+        let writable: Vec<(&IndexEntry, &Node<Client>)> = nodes
+            .iter()
+            .filter_map(|entry| match entry.node.as_ref() {
+                Some(node) => Some((*entry, node)),
+                None => {
+                    skipped.push(orphan(entry));
 
-        match self {
-            Self::Links => Ok(format!("{}\n", write_link(node)?)),
+                    None
+                }
+            })
+            .collect();
+
+        let named: Vec<(&str, &Node<Client>)> = writable
+            .iter()
+            .map(|(entry, node)| (entry.name().unwrap_or_default(), *node))
+            .collect();
+
+        let (body, refused) = suba_singbox::client_config(&named);
+
+        // A refusal names a position in what the dialect was given, which is the
+        // position in `writable`: orphans were taken out before it was called.
+        for refusal in refused {
+            let (entry, _) = writable[refusal.index];
+
+            skipped.push(Skipped {
+                id: entry.id,
+                name: entry.name().map(str::to_owned),
+                reason: match refusal.reason {
+                    suba_singbox::Reason::Protocol(kind) => SkipReason::Protocol(kind),
+                    suba_singbox::Reason::Transport(carriage) => SkipReason::Transport(carriage),
+                },
+            });
         }
+
+        body
+    }
+}
+
+/// A node no document can contain: nothing serves it any more, so there is no
+/// content to write into one. `IndexEntry` keeps the identity and the history,
+/// deliberately not a copy of a payload that is gone.
+fn orphan(entry: &IndexEntry) -> Skipped {
+    Skipped {
+        id: entry.id,
+        name: None,
+        reason: SkipReason::Orphan,
     }
 }
 
@@ -246,6 +307,8 @@ pub struct Skipped {
 pub enum SkipReason {
     /// The format has no representation for this protocol.
     Protocol(Kind),
+    /// The format has no representation for how the node is carried.
+    Transport(String),
     /// Nothing serves it any more, so there is no content to write.
     Orphan,
     /// The model refused to write it, with a typed kind and the model's own
@@ -499,6 +562,64 @@ mod tests {
 
         assert!(rendered.body.is_empty());
         assert!(rendered.skipped.is_empty());
+    }
+
+    /// The feature decides the capability list: a format whose dialect is not
+    /// compiled in is not a format at all, and a client that reads the list
+    /// never asks for one this build cannot answer.
+    #[test]
+    fn the_formats_this_build_has_are_the_compiled_ones() {
+        let names: Vec<&str> = Format::all().iter().map(|format| format.as_str()).collect();
+
+        #[cfg(feature = "singbox")]
+        assert_eq!(names, ["links", "singbox"]);
+        #[cfg(not(feature = "singbox"))]
+        assert_eq!(names, ["links"]);
+    }
+
+    /// A node the dialect has no outbound for is left out of the document and
+    /// named, and the nodes it can write are all there.
+    #[cfg(feature = "singbox")]
+    #[test]
+    fn a_document_holds_what_it_can_write_and_reports_what_it_cannot() {
+        let fixtures = vec![
+            "trojan://PASSWORD@example.com:443?sni=example.com#Trojan".to_string(),
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none#Vless"
+                .to_string(),
+        ];
+        let index = index(&fixtures);
+        let rendered = Format::Singbox
+            .render(&entries(&index), RenderIntent::Client)
+            .expect("a client document");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&rendered.body).expect("a JSON document");
+        let outbounds = document["outbounds"].as_array().expect("outbounds");
+
+        assert_eq!(outbounds.len(), 1, "{} was not written", rendered.body);
+        assert_eq!(outbounds[0]["tag"], serde_json::json!("Trojan"));
+        assert_eq!(rendered.skipped.len(), 1);
+        assert_eq!(rendered.skipped[0].name.as_deref(), Some("Vless"));
+        assert_eq!(
+            rendered.skipped[0].reason,
+            SkipReason::Protocol(Kind::Vless)
+        );
+    }
+
+    /// A sing-box document describes a client, like the links do: a server
+    /// document is a different shape, and this build does not write it yet.
+    #[cfg(feature = "singbox")]
+    #[test]
+    fn sing_box_does_not_write_a_server_document() {
+        let index = index(&links()[..1]);
+
+        assert!(matches!(
+            Format::Singbox.render(&entries(&index), RenderIntent::Server),
+            Err(RenderError::Intent {
+                format: Format::Singbox,
+                intent: RenderIntent::Server
+            })
+        ));
     }
 
     /// The name in the document is the node's own name, not the provider's name

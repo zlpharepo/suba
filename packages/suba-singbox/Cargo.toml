@@ -8,5 +8,7 @@ license.workspace = true
 [features]
 
 [dependencies]
+suba-proto = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]

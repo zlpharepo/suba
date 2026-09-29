@@ -5,8 +5,12 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+singbox = ["dep:suba-singbox"]
+
 [dependencies]
 suba-proto = { workspace = true }
+suba-singbox = { workspace = true, optional = true }
 
 regex = { workspace = true }
 serde = { workspace = true }

@@ -9,6 +9,7 @@ license.workspace = true
 default = ["toml"]
 toml = ["dep:toml"]
 json = []
+singbox = ["suba-core/singbox"]
 
 [dependencies]
 suba-core = { workspace = true }

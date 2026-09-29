@@ -2687,6 +2687,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "suba-proto",
+ "suba-singbox",
  "thiserror 2.0.21",
 ]
 
@@ -2734,6 +2735,10 @@ dependencies = [
 [[package]]
 name = "suba-singbox"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "suba-proto",
+]
 
 [[package]]
 name = "subtle"

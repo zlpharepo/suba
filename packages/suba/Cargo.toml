@@ -7,12 +7,12 @@ license.workspace = true
 
 [features]
 # `toml`/`json` pick the configuration file format and are mutually exclusive.
-# The `clash`/`singbox` dialects are not wired yet, so there is no feature for
-# them: a flag that links a crate nothing calls compiles a build that behaves
-# exactly like one without it.
+# `singbox` adds the sing-box document format: it links the dialect crate, and
+# the dialect is called from the format registry that the capability list reads.
 default = ["toml"]
 toml = ["suba-server/toml"]
 json = ["suba-server/json"]
+singbox = ["suba-server/singbox"]
 
 [dependencies]
 suba-server = { workspace = true }
