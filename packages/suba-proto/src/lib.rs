@@ -76,6 +76,7 @@ mod prelude;
 mod serde_str;
 
 pub mod addr;
+pub mod base64;
 pub mod convert;
 pub mod error;
 pub mod identity;
@@ -90,6 +91,9 @@ pub mod transport;
 pub mod uuid;
 
 pub use addr::{Endpoint, Host, Port};
+pub use base64::{
+    decode as decode_base64, decode_to_string as decode_base64_to_string, encode as encode_base64,
+};
 pub use convert::ListenerMaterial;
 pub use error::{Error, ErrorKind, Result};
 pub use identity::NodeFingerprint;

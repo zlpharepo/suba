@@ -342,25 +342,7 @@ fn legacy_payload<'a>(link: &'a Link<'_>) -> &'a str {
 
 /// Base64, in whichever alphabet the provider used, with or without padding.
 fn decode_credentials(input: &str) -> Result<String> {
-    let input = input.trim();
-
-    for engine in [
-        &general_purpose::STANDARD_NO_PAD,
-        &general_purpose::STANDARD,
-        &general_purpose::URL_SAFE_NO_PAD,
-        &general_purpose::URL_SAFE,
-    ] {
-        if let Ok(bytes) = engine.decode(input) {
-            if let Ok(text) = String::from_utf8(bytes) {
-                return Ok(text);
-            }
-        }
-    }
-
-    Err(Error::new(
-        ErrorKind::InvalidBase64,
-        "the credentials are not base64",
-    ))
+    crate::base64::decode_to_string(input.trim().as_bytes())
 }
 
 impl crate::identity::private::Sealed for Client {}
