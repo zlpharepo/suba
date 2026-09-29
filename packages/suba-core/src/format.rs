@@ -1,0 +1,541 @@
+//! The formats a collection can be served in, and what each of them can say.
+//!
+//! A format is a **document shape**, not a step in a pipeline. Rendering is a
+//! pure function of the nodes and the direction the caller asked for, so the
+//! same node set can be handed out as links, as a clash document, as a sing-box
+//! configuration — and the caller is the one who knows which of those the
+//! client on the other end understands.
+//!
+//! Two things are deliberate here:
+//!
+//! * **The direction is asked for, never assumed.** A node can be written as
+//!   something a client dials or as something a server runs, and the two are not
+//!   the same document; a default would silently hand out the wrong one. A
+//!   format that cannot write the direction asked for refuses, rather than
+//!   producing its other one.
+//! * **What cannot be written is reported, not dropped.** A node a format has no
+//!   representation for is left out *with a reason*, per node, and a caller can
+//!   learn what a format will refuse **before** rendering, from its
+//!   [`FormatDescriptor`]. A subscription that quietly serves fewer nodes than
+//!   it should is worse than one that says which ones it could not serve.
+//!
+//! A format whose dialect is not compiled into this build is not a
+//! [`Format`] at all: [`Format::all`] is the truth about what this build serves,
+//! and a request naming anything else cannot be parsed into one.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::index::IndexEntry;
+use crate::proto::{self, write_link, Client, Kind, Node};
+
+/// A document shape a collection can be served in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Format {
+    /// The share links themselves, one per line.
+    Links,
+}
+
+impl Format {
+    /// Every format this build can serve.
+    ///
+    /// Compiled, not configured: a format whose dialect is behind a feature that
+    /// is off is absent here, which is what makes "this build does not serve
+    /// that" a fact rather than a runtime check somebody can forget to perform.
+    pub const fn all() -> &'static [Self] {
+        &[Self::Links]
+    }
+
+    /// The name it is spelled with, in documents and in URLs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Links => "links",
+        }
+    }
+
+    /// What it can express, before anything is rendered.
+    pub const fn descriptor(self) -> FormatDescriptor {
+        match self {
+            Self::Links => FormatDescriptor {
+                format: self,
+                intents: &[RenderIntent::Client],
+                // A link is what the model is parsed *from*: whatever a provider
+                // served, the model holds enough to write it back. A protocol
+                // whose link form is unknown is kept whole for exactly this
+                // reason.
+                protocols: ProtocolSupport::Everything,
+            },
+        }
+    }
+
+    /// Write `nodes` as this format.
+    ///
+    /// The nodes are the resolved ones, in the order they are to appear;
+    /// anything this format cannot write is left out and reported in
+    /// [`Rendered::skipped`], with one reason per node.
+    pub fn render(
+        self,
+        nodes: &[&IndexEntry],
+        intent: RenderIntent,
+    ) -> Result<Rendered, RenderError> {
+        let descriptor = self.descriptor();
+        if !descriptor.intents.contains(&intent) {
+            return Err(RenderError::Intent {
+                format: self,
+                intent,
+            });
+        }
+
+        let mut rendered = Rendered::default();
+
+        for entry in nodes {
+            let Some(node) = entry.node.as_ref() else {
+                // Nothing serves it any more, so there is no content to write
+                // into a document: `IndexEntry` keeps the identity and the
+                // history, deliberately not a copy of a payload that is gone.
+                rendered.skipped.push(Skipped {
+                    id: entry.id,
+                    name: None,
+                    reason: SkipReason::Orphan,
+                });
+
+                continue;
+            };
+
+            if let Some(reason) = descriptor.refuses(node.protocol.kind()) {
+                rendered.skipped.push(Skipped {
+                    id: entry.id,
+                    name: entry.name().map(str::to_owned),
+                    reason,
+                });
+
+                continue;
+            }
+
+            match self.write(node, intent) {
+                Ok(line) => rendered.body.push_str(&line),
+                // The descriptor said this node could be written and the writer
+                // disagreed. Rare, and never silently dropped: the node is left
+                // out with what the model said about it.
+                Err(error) => rendered.skipped.push(Skipped {
+                    id: entry.id,
+                    name: entry.name().map(str::to_owned),
+                    reason: SkipReason::Refused {
+                        kind: error.kind(),
+                        reason: error.to_string(),
+                    },
+                }),
+            }
+        }
+
+        Ok(rendered)
+    }
+
+    /// One node, as a line of this format's document.
+    fn write(self, node: &Node<Client>, intent: RenderIntent) -> Result<String, proto::Error> {
+        let _ = intent;
+
+        match self {
+            Self::Links => Ok(format!("{}\n", write_link(node)?)),
+        }
+    }
+}
+
+impl fmt::Display for Format {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Which way round a document is written.
+///
+/// Asked for by the caller, never defaulted: the two directions are different
+/// documents, and only the caller knows which one the other end can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RenderIntent {
+    /// A document a client subscribes to: the nodes as that client dials them.
+    Client,
+    /// A document a server runs: the same nodes as what it serves.
+    Server,
+}
+
+impl RenderIntent {
+    /// The name it is spelled with, in documents and in URLs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
+
+impl fmt::Display for RenderIntent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a format can express, before anything is rendered.
+///
+/// The point of asking first: a caller can tell an operator which nodes will be
+/// left out *before* a document is produced, instead of comparing what was asked
+/// for against what came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatDescriptor {
+    pub format: Format,
+    /// The directions this format can write.
+    pub intents: &'static [RenderIntent],
+    /// The protocols it can express.
+    pub protocols: ProtocolSupport,
+}
+
+impl FormatDescriptor {
+    /// Why this format cannot write a node of this kind, if it cannot.
+    pub fn refuses(&self, kind: Kind) -> Option<SkipReason> {
+        match self.protocols.expresses(kind) {
+            true => None,
+            false => Some(SkipReason::Protocol(kind)),
+        }
+    }
+}
+
+/// Which protocols a format has a representation for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolSupport {
+    /// Every protocol the model knows — including one it does not model, which
+    /// it can still hand back as it arrived.
+    Everything,
+    /// These, and no others.
+    Only(&'static [Kind]),
+}
+
+impl ProtocolSupport {
+    pub fn expresses(&self, kind: Kind) -> bool {
+        match self {
+            Self::Everything => true,
+            Self::Only(kinds) => kinds.contains(&kind),
+        }
+    }
+}
+
+/// A document, and what had to be left out of it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rendered {
+    /// The document.
+    pub body: String,
+    /// The nodes it does not contain, each with the reason.
+    pub skipped: Vec<Skipped>,
+}
+
+/// A node a document does not contain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    /// Which node, by identity.
+    pub id: crate::proto::NodeFingerprint,
+    /// What it would have been called, when that is known.
+    pub name: Option<String>,
+    /// Why it is not there.
+    pub reason: SkipReason,
+}
+
+/// Why a node is not in a document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The format has no representation for this protocol.
+    Protocol(Kind),
+    /// Nothing serves it any more, so there is no content to write.
+    Orphan,
+    /// The model refused to write it, with a typed kind and the model's own
+    /// static explanation — never a value from the node.
+    Refused {
+        kind: proto::ErrorKind,
+        reason: String,
+    },
+}
+
+/// A document this format does not write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RenderError {
+    /// The direction asked for is not one this format can produce.
+    #[error("`{format}` does not write a {intent} document")]
+    Intent {
+        format: Format,
+        intent: RenderIntent,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::NodeIndex;
+    use crate::observation::Observation;
+    use crate::subscription;
+
+    /// The shapes providers actually serve, from the protocol crate's own
+    /// fixture file.
+    ///
+    /// One list, held by both crates: a shape this renderer cannot write is a
+    /// shape that crate cannot write either, and there is no second copy to
+    /// drift from it.
+    fn links() -> Vec<String> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../suba-proto/tests/golden/links.txt");
+        let fixtures = std::fs::read_to_string(&path).expect("the protocol crate's fixtures");
+
+        fixtures
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn payload(links: &[String]) -> String {
+        links.iter().map(|link| format!("{link}\n")).collect()
+    }
+
+    fn observation(links: &[String]) -> Observation {
+        Observation {
+            payload: payload(links),
+            checked_at: Some(1_700_000_000),
+            ..Observation::default()
+        }
+    }
+
+    fn index(links: &[String]) -> NodeIndex {
+        NodeIndex::from_observations([("airport", &observation(links))])
+    }
+
+    fn entries(index: &NodeIndex) -> Vec<&IndexEntry> {
+        index.served().collect()
+    }
+
+    #[test]
+    fn every_link_survives_the_round_trip_through_the_model() {
+        let fixtures = links();
+        let index = index(&fixtures);
+        let nodes = entries(&index);
+
+        let rendered = Format::Links
+            .render(&nodes, RenderIntent::Client)
+            .expect("a client document");
+
+        assert!(
+            rendered.skipped.is_empty(),
+            "links can write what links were parsed from: {:?}",
+            rendered.skipped
+        );
+
+        // The index orders nodes by when they were first seen, not by the order a
+        // payload listed them, and two fixtures that differ only in something the
+        // identity ignores are one node — so the document is compared against the
+        // shapes the fixtures can become, not line by line.
+        let mut written: Vec<&str> = rendered.body.lines().collect();
+        let mut expected: Vec<String> = Vec::new();
+        let mut identities = std::collections::BTreeSet::new();
+
+        for link in &fixtures {
+            let node = proto::parse_link(link).expect("the fixture parses");
+            let line = proto::write_link(&node).expect("the fixture is writable");
+
+            // What comes out is a subscription a client can use, not text that
+            // merely looks like one: parsed back, it is the same node.
+            let read_back = proto::parse_link(&line).expect("the written link parses");
+            assert_eq!(read_back.id(), node.id(), "{link} became {line}");
+            assert_eq!(read_back, node, "{link} became {line}");
+
+            identities.insert(node.id());
+            if !expected.contains(&line) {
+                expected.push(line);
+            }
+        }
+
+        assert_eq!(
+            written.len(),
+            nodes.len(),
+            "every node in the index is one line of the document"
+        );
+        assert_eq!(
+            nodes.len(),
+            identities.len(),
+            "the index holds one node per identity"
+        );
+
+        written.sort_unstable();
+        expected.sort_unstable();
+
+        for line in &written {
+            assert!(
+                expected.iter().any(|expected| expected == line),
+                "the document wrote something no fixture could have: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_document_is_one_link_per_line() {
+        let index = index(&links()[..2]);
+        let rendered = Format::Links
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+
+        assert!(
+            rendered.body.ends_with('\n'),
+            "a subscription ends its lines"
+        );
+        assert_eq!(rendered.body.lines().count(), 2);
+        assert_eq!(rendered.body.matches('\n').count(), 2);
+    }
+
+    /// A node nothing serves has no content, so no document can contain it.
+    #[test]
+    fn a_node_nobody_serves_is_left_out_with_its_reason() {
+        let fixtures = links();
+        let kept = proto::parse_link(&fixtures[0]).expect("the fixture parses");
+        let dropped = proto::parse_link(&fixtures[2]).expect("the fixture parses");
+
+        // A node the provider has served and dropped: the sighting keeps it, the
+        // payload does not.
+        let held = Observation {
+            payload: payload(&fixtures[..1]),
+            checked_at: Some(1_700_000_000),
+            sighting: [(kept.id(), 1_700_000_000), (dropped.id(), 1_700_000_000)]
+                .into_iter()
+                .collect(),
+            ..Observation::default()
+        };
+
+        let index = NodeIndex::from_observations([("airport", &held)]);
+        let all: Vec<&IndexEntry> = index.entries().iter().collect();
+        let rendered = Format::Links
+            .render(&all, RenderIntent::Client)
+            .expect("a client document");
+
+        assert_eq!(rendered.body.lines().count(), 1);
+        assert_eq!(rendered.skipped.len(), 1);
+        assert_eq!(rendered.skipped[0].id, dropped.id());
+        assert_eq!(rendered.skipped[0].name, None);
+        assert_eq!(rendered.skipped[0].reason, SkipReason::Orphan);
+    }
+
+    /// Links describe a client. A server document is a different shape, and one
+    /// this format does not have.
+    #[test]
+    fn the_direction_that_was_asked_for_is_the_one_written() {
+        let index = index(&links()[..1]);
+
+        assert!(matches!(
+            Format::Links.render(&entries(&index), RenderIntent::Server),
+            Err(RenderError::Intent {
+                format: Format::Links,
+                intent: RenderIntent::Server
+            })
+        ));
+        assert!(Format::Links
+            .render(&entries(&index), RenderIntent::Client)
+            .is_ok());
+    }
+
+    #[test]
+    fn every_format_this_build_serves_answers_for_itself() {
+        assert!(!Format::all().is_empty());
+
+        for format in Format::all() {
+            let descriptor = format.descriptor();
+            assert_eq!(descriptor.format, *format);
+            assert!(
+                !descriptor.intents.is_empty(),
+                "{format} writes no direction"
+            );
+
+            // The name it is spelled with and the name it serializes as are one
+            // name: a client that reads the capability list and asks for what it
+            // saw must be asking for this.
+            let spelled = serde_json::to_value(format).unwrap();
+            assert_eq!(
+                spelled,
+                serde_json::Value::String(format.as_str().to_string())
+            );
+
+            let parsed: Format = serde_json::from_value(spelled).unwrap();
+            assert_eq!(parsed, *format);
+        }
+    }
+
+    #[test]
+    fn a_format_that_cannot_write_a_protocol_says_which_one() {
+        let everything = Format::Links.descriptor();
+        for link in links() {
+            let node = proto::parse_link(&link).expect("the fixture parses");
+            assert_eq!(
+                everything.refuses(node.protocol.kind()),
+                None,
+                "links cannot write {link}"
+            );
+        }
+
+        let picky = FormatDescriptor {
+            format: Format::Links,
+            intents: &[RenderIntent::Client],
+            protocols: ProtocolSupport::Only(&[Kind::Trojan]),
+        };
+
+        assert_eq!(
+            picky.refuses(Kind::Vless),
+            Some(SkipReason::Protocol(Kind::Vless))
+        );
+        assert_eq!(picky.refuses(Kind::Trojan), None);
+    }
+
+    #[test]
+    fn an_empty_collection_renders_an_empty_document() {
+        let index = index(&Vec::new());
+        let rendered = Format::Links
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+
+        assert!(rendered.body.is_empty());
+        assert!(rendered.skipped.is_empty());
+    }
+
+    /// The name in the document is the node's own name, not the provider's name
+    /// for the provider.
+    #[test]
+    fn a_node_is_written_under_the_name_it_is_served_with() {
+        let fixture = links()
+            .into_iter()
+            .find(|link| link.contains('#'))
+            .expect("a named fixture");
+        let node = proto::parse_link(&fixture).expect("the fixture parses");
+        assert!(!node.name.as_str().is_empty(), "the fixture is named");
+
+        let index = index(&[fixture]);
+        let rendered = Format::Links
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+
+        let written = proto::parse_link(rendered.body.trim_end()).expect("the line parses");
+        assert_eq!(written.name, node.name);
+    }
+
+    /// The subscription parser and the renderer agree on what a node is.
+    #[test]
+    fn what_the_subscription_parser_reads_is_what_the_renderer_writes() {
+        let fixtures = links();
+        let parsed = subscription::parse(payload(&fixtures).as_bytes(), "airport", 1_700_000_000);
+
+        let index = index(&fixtures);
+        let rendered = Format::Links
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+
+        assert_eq!(
+            rendered.body.lines().count(),
+            parsed.nodes.len(),
+            "the same payload is the same number of nodes either way"
+        );
+    }
+}

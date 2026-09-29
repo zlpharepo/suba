@@ -19,12 +19,14 @@
 //! * [`subscription`] — the container formats a provider serves.
 //! * [`index`] — every provider's nodes, merged into one view.
 //! * [`collection`] — a subscription assembled out of providers.
+//! * [`format`] — the documents a collection can be served as.
 //! * [`provider`] — what a fetch means for what is kept.
 //! * [`filter`] — which nodes survive.
 
 pub mod checksum;
 pub mod collection;
 pub mod filter;
+pub mod format;
 pub mod index;
 pub mod node;
 pub mod observation;
@@ -36,6 +38,10 @@ pub use suba_proto as proto;
 
 pub use collection::{Collection, Resolved, View};
 pub use filter::{FilterError, NodeFilter, PatternReason};
+pub use format::{
+    Format, FormatDescriptor, ProtocolSupport, RenderError, RenderIntent, Rendered, SkipReason,
+    Skipped,
+};
 pub use index::{IndexEntry, NodeIndex, Source};
 pub use node::{NodeRecord, Provenance};
 pub use observation::Observation;

@@ -2684,6 +2684,7 @@ version = "0.1.0"
 dependencies = [
  "regex",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "suba-proto",
  "thiserror 2.0.21",
