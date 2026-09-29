@@ -1,29 +1,19 @@
 mod administrator;
+mod codec;
 mod error;
 mod key_pair;
 pub mod provider;
 mod server;
 
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, fs};
 
 pub use administrator::*;
+pub(crate) use codec::config_path;
 pub use error::ConfigError;
 pub use key_pair::*;
 pub use provider::Provider;
 pub use server::{ListenAddr, ServerConfig};
-
-#[cfg(not(any(feature = "toml", feature = "json")))]
-compile_error!("Enable exactly one configuration format feature: toml or json");
-
-#[cfg(all(feature = "toml", not(feature = "json")))]
-const CONFIG_EXTENSION: &str = "toml";
-#[cfg(feature = "json")]
-const CONFIG_EXTENSION: &str = "json";
 
 pub(crate) const APP_CONFIG_BASENAME: &str = "config";
 pub(crate) const PROVIDERS_BASENAME: &str = "providers";
@@ -49,11 +39,6 @@ pub struct SubscriptionConfig {
     pub prefix: Option<String>,
 }
 
-/// The path of `basename` inside the configuration directory `base`.
-pub(crate) fn config_path(base: impl AsRef<Path>, basename: &str) -> PathBuf {
-    base.as_ref().join(format!("{basename}.{CONFIG_EXTENSION}"))
-}
-
 /// Read a configuration file, falling back to [`Default`] when it is missing or
 /// empty.
 pub(crate) fn read_config<T>(base: &str, basename: &str) -> Result<T, ConfigError>
@@ -68,19 +53,15 @@ where
         Err(error) => return Err(error.into()),
     };
 
-    #[cfg(feature = "toml")]
-    let value = toml::from_str(&content).map_err(|error| ConfigError::decode(&path, error))?;
-    #[cfg(feature = "json")]
-    let value =
-        serde_json::from_str(&content).map_err(|error| ConfigError::decode(&path, error))?;
-
-    Ok(value)
+    codec::decode(&content, &path)
 }
 
-/// Write a configuration file atomically.
+/// Write a configuration file.
 ///
-/// The value is written beside the destination and renamed into place, so a
-/// concurrent reader can never observe a partially written file.
+/// The write is atomic and durable: it goes through [`crate::fs::write_atomic`],
+/// which writes a sibling temp file, fsyncs it, renames it over the destination
+/// and fsyncs the directory. A reader never observes a partial file, and the
+/// rename survives a crash between the write and the next start.
 pub(crate) async fn write_config<T>(
     base: &str,
     basename: &str,
@@ -90,42 +71,12 @@ where
     T: Serialize,
 {
     let destination = config_path(base, basename);
-    tokio::fs::create_dir_all(base).await?;
+    let content = codec::encode(value, &destination)?;
 
-    #[cfg(all(feature = "toml", not(feature = "json")))]
-    let content =
-        toml::to_string_pretty(value).map_err(|error| ConfigError::encode(&destination, error))?;
-    #[cfg(feature = "json")]
-    let content = serde_json::to_string_pretty(value)
-        .map_err(|error| ConfigError::encode(&destination, error))?;
-
-    let temporary =
-        destination.with_extension(format!("{CONFIG_EXTENSION}.{}.tmp", uuid::Uuid::now_v7()));
-    if let Err(error) = write_atomically(&temporary, &destination, content.as_bytes()).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(error);
-    }
-
-    Ok(())
-}
-
-async fn write_atomically(
-    temporary: &Path,
-    destination: &Path,
-    content: &[u8],
-) -> Result<(), ConfigError> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temporary)
-        .await?;
-    file.write_all(content).await?;
-    file.sync_all().await?;
-    drop(file);
-
-    tokio::fs::rename(temporary, destination).await?;
+    let target = destination.clone();
+    tokio::task::spawn_blocking(move || crate::fs::write_atomic(&target, content.as_bytes()))
+        .await
+        .map_err(|error| ConfigError::Join(error.to_string()))??;
 
     Ok(())
 }
@@ -133,6 +84,7 @@ async fn write_atomically(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     fn test_path() -> PathBuf {
         std::env::temp_dir().join(format!("suba-config-{}", uuid::Uuid::now_v7()))

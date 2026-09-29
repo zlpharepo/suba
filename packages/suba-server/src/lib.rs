@@ -1,6 +1,7 @@
 mod config;
 mod dto;
 mod error;
+pub mod fs;
 mod handlers;
 pub mod password;
 mod routers;

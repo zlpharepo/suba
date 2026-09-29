@@ -25,6 +25,10 @@ pub enum ConfigError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// The blocking write task could not be joined.
+    #[error("the configuration writer stopped unexpectedly: {0}")]
+    Join(String),
 }
 
 impl ConfigError {

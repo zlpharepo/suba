@@ -71,14 +71,11 @@ impl CacheStore {
     /// Store `content` for `name`, written atomically.
     pub(crate) async fn put(&self, name: &str, content: &str) -> Result<(), ConfigError> {
         let destination = self.path(name);
-        tokio::fs::create_dir_all(&self.dir).await?;
+        let payload = content.to_owned();
 
-        let temporary =
-            destination.with_extension(format!("{CACHE_EXTENSION}.{}.tmp", uuid::Uuid::now_v7()));
-        if let Err(error) = write_atomically(&temporary, &destination, content.as_bytes()).await {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err(error);
-        }
+        tokio::task::spawn_blocking(move || crate::fs::write_atomic(&destination, payload))
+            .await
+            .map_err(|error| ConfigError::Join(error.to_string()))??;
 
         Ok(())
     }
@@ -96,27 +93,6 @@ impl CacheStore {
         self.dir
             .join(format!("{CACHE_PREFIX}{name}.{CACHE_EXTENSION}"))
     }
-}
-
-async fn write_atomically(
-    temporary: &Path,
-    destination: &Path,
-    content: &[u8],
-) -> Result<(), ConfigError> {
-    use tokio::io::AsyncWriteExt;
-
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(temporary)
-        .await?;
-    file.write_all(content).await?;
-    file.sync_all().await?;
-    drop(file);
-
-    tokio::fs::rename(temporary, destination).await?;
-
-    Ok(())
 }
 
 #[cfg(test)]
