@@ -149,4 +149,41 @@ mod tests {
         assert!(read_config::<AppConfig>(path.to_str().unwrap(), APP_CONFIG_BASENAME).is_err());
         tokio::fs::remove_dir_all(path).await.unwrap();
     }
+
+    /// A provider with its optional fields left unset must survive a write and
+    /// a read in whichever format is compiled in.
+    ///
+    /// This is the round trip that used to fail under the JSON format:
+    /// `http_serde`'s option serializer writes `None` as `null`, and its own
+    /// deserializer then refuses that `null`, so what the store wrote it could
+    /// not read back. Skipping the absent field is the fix, and this test holds
+    /// it for every format.
+    #[tokio::test]
+    async fn a_provider_with_no_optional_fields_round_trips() {
+        use crate::config::provider::{default_interval, Http, SharedFields};
+
+        let path = test_path();
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "airport".to_string(),
+            Provider::Http(Http {
+                shared: SharedFields { disabled: false },
+                url: "https://example.com/subscription".parse().unwrap(),
+                headers: None,
+                timeout: None,
+                interval: default_interval(),
+            }),
+        );
+
+        write_config(path.to_str().unwrap(), PROVIDERS_BASENAME, &config)
+            .await
+            .unwrap();
+
+        let reloaded = load_providers(&path);
+        let stored = reloaded.providers.get("airport").expect("the provider");
+
+        assert!(stored.is_none_of_the_optional_fields());
+
+        tokio::fs::remove_dir_all(path).await.unwrap();
+    }
 }
