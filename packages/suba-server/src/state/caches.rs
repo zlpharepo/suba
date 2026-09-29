@@ -9,10 +9,10 @@ use crate::config::ConfigError;
 
 /// File name prefix and suffix of a cached subscription, wrapped around the
 /// provider name.
-const CACHE_PREFIX: &str = "proxy-provider-";
+const CACHE_PREFIX: &str = "provider-";
 const CACHE_EXTENSION: &str = "cache";
 
-/// The raw payloads of proxy providers, mirrored to the data directory.
+/// The raw payloads of providers, mirrored to the data directory.
 ///
 /// The bytes are kept verbatim: parsing is the job of whatever consumes the
 /// subscription next, so an upstream format the server does not understand is

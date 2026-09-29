@@ -4,7 +4,7 @@ use reqwest::Client;
 use tokio::sync::watch;
 
 use crate::{
-    config::{ConfigError, ProxyProvider, ProxyProvidersConfig, PROXY_PROVIDERS_BASENAME},
+    config::{ConfigError, Provider, ProvidersConfig, PROVIDERS_BASENAME},
     error::Error,
 };
 
@@ -17,14 +17,14 @@ pub(crate) struct Refreshed {
     pub(crate) bytes: usize,
 }
 
-/// The subscription-backed proxy providers of the instance.
+/// The subscription-backed providers of the instance.
 ///
 /// The store owns both halves of a provider: its configuration, persisted
 /// beside the other configuration files, and the payload it last returned,
 /// cached in the data directory. Keeping them together is what lets a refresh
 /// be one operation instead of a dance between two stores.
 pub(crate) struct ProviderStore {
-    file: Persisted<ProxyProvidersConfig>,
+    file: Persisted<ProvidersConfig>,
     cache: CacheStore,
     /// Bumped on every configuration change, so background work can follow
     /// the provider set instead of polling it.
@@ -34,7 +34,7 @@ pub(crate) struct ProviderStore {
 impl ProviderStore {
     pub(crate) fn load(config_dir: &Path, data_dir: &Path) -> Result<Self, ConfigError> {
         Ok(Self {
-            file: Persisted::load(config_dir, PROXY_PROVIDERS_BASENAME)?,
+            file: Persisted::load(config_dir, PROVIDERS_BASENAME)?,
             cache: CacheStore::load(data_dir),
             changes: watch::Sender::new(0),
         })
@@ -53,18 +53,18 @@ impl ProviderStore {
         self.changes.send_modify(|generation| *generation += 1);
     }
 
-    pub(crate) async fn list(&self) -> HashMap<String, ProxyProvider> {
+    pub(crate) async fn list(&self) -> HashMap<String, Provider> {
         self.file.read(|config| config.providers.clone()).await
     }
 
-    pub(crate) async fn get(&self, name: &str) -> Option<ProxyProvider> {
+    pub(crate) async fn get(&self, name: &str) -> Option<Provider> {
         self.file
             .read(|config| config.providers.get(name).cloned())
             .await
     }
 
     /// Every provider that takes part in automatic refreshing.
-    pub(crate) async fn refreshable(&self) -> Vec<(String, ProxyProvider)> {
+    pub(crate) async fn refreshable(&self) -> Vec<(String, Provider)> {
         self.file
             .read(|config| {
                 config
@@ -82,7 +82,7 @@ impl ProviderStore {
         Ok(self.cache.content(name).await?)
     }
 
-    pub(crate) async fn insert(&self, name: &str, provider: ProxyProvider) -> Result<(), Error> {
+    pub(crate) async fn insert(&self, name: &str, provider: Provider) -> Result<(), Error> {
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
         config.providers.insert(name.to_owned(), provider);
@@ -115,7 +115,7 @@ impl ProviderStore {
     pub(crate) async fn upsert(
         &self,
         name: &str,
-        provider: ProxyProvider,
+        provider: Provider,
         client: &Client,
     ) -> Result<Refreshed, Error> {
         let content = provider.fetch(client).await?;
@@ -166,14 +166,14 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::proxy_provider::{default_interval, Http, SharedFields};
+    use crate::config::provider::{default_interval, Http, SharedFields};
 
     fn test_dir() -> PathBuf {
         std::env::temp_dir().join(format!("suba-providers-{}", uuid::Uuid::now_v7()))
     }
 
-    fn provider() -> ProxyProvider {
-        ProxyProvider::Http(Http {
+    fn provider() -> Provider {
+        Provider::Http(Http {
             shared: SharedFields { disabled: false },
             url: "https://example.com/subscription".parse().unwrap(),
             headers: None,
@@ -246,10 +246,10 @@ mod tests {
             Err(Error::ProviderNotFound(_))
         ));
 
-        let ProxyProvider::Http(mut disabled) = provider();
+        let Provider::Http(mut disabled) = provider();
         disabled.shared.disabled = true;
         store
-            .insert("airport", ProxyProvider::Http(disabled))
+            .insert("airport", Provider::Http(disabled))
             .await
             .unwrap();
 

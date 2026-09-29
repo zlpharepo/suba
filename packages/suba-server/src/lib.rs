@@ -29,7 +29,7 @@ impl SubaServer {
     pub async fn serve(self) -> Result<(), Error> {
         let router = routers::AppRouter::route(self.state.web_dir()).with_state(self.state.clone());
 
-        // Proxy providers start refreshing as soon as the server does, so a
+        // Providers start refreshing as soon as the server does, so a
         // restart does not leave subscriptions stale until their next tick.
         tokio::spawn(self.state.refresher().run());
 

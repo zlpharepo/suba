@@ -67,7 +67,7 @@ impl AppState {
         &self.0.settings
     }
 
-    /// The configured subscription-backed proxy providers.
+    /// The configured subscription-backed providers.
     pub(crate) fn providers(&self) -> &ProviderStore {
         &self.0.providers
     }

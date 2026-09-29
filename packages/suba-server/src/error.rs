@@ -10,11 +10,11 @@ pub enum Error {
     #[error(transparent)]
     Core(#[from] suba_core::Error),
 
-    #[error("proxy provider '{0}' not found")]
+    #[error("provider '{0}' not found")]
     ProviderNotFound(String),
-    #[error("proxy provider '{0}' is disabled")]
+    #[error("provider '{0}' is disabled")]
     ProviderDisabled(String),
-    #[error("proxy provider '{0}' has no cached contents yet")]
+    #[error("provider '{0}' has no cached contents yet")]
     ProviderNotCached(String),
 
     #[error(transparent)]
@@ -67,15 +67,15 @@ impl IntoHttpError for Error {
             },
             Error::ProviderNotFound(name) => HttpError {
                 status_code: StatusCode::NOT_FOUND,
-                message: format!("Proxy provider '{name}' not found"),
+                message: format!("Provider '{name}' not found"),
             },
             Error::ProviderDisabled(name) => HttpError {
                 status_code: StatusCode::CONFLICT,
-                message: format!("Proxy provider '{name}' is disabled"),
+                message: format!("Provider '{name}' is disabled"),
             },
             Error::ProviderNotCached(name) => HttpError {
                 status_code: StatusCode::NOT_FOUND,
-                message: format!("Proxy provider '{name}' has no cached contents yet"),
+                message: format!("Provider '{name}' has no cached contents yet"),
             },
             Error::Io(_) => HttpError {
                 status_code: StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,7 +1,7 @@
 mod administrator;
 mod error;
 mod key_pair;
-pub mod proxy_provider;
+pub mod provider;
 mod server;
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use std::{
 pub use administrator::*;
 pub use error::ConfigError;
 pub use key_pair::*;
-pub use proxy_provider::ProxyProvider;
+pub use provider::Provider;
 pub use server::{ListenAddr, ServerConfig};
 
 #[cfg(not(any(feature = "toml", feature = "json")))]
@@ -26,7 +26,7 @@ const CONFIG_EXTENSION: &str = "toml";
 const CONFIG_EXTENSION: &str = "json";
 
 pub(crate) const APP_CONFIG_BASENAME: &str = "config";
-pub(crate) const PROXY_PROVIDERS_BASENAME: &str = "proxy-providers";
+pub(crate) const PROVIDERS_BASENAME: &str = "providers";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -38,9 +38,9 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ProxyProvidersConfig {
+pub struct ProvidersConfig {
     #[serde(flatten)]
-    pub providers: HashMap<String, ProxyProvider>,
+    pub providers: HashMap<String, Provider>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,8 +142,8 @@ mod tests {
         read_config(path.to_str().unwrap(), APP_CONFIG_BASENAME).unwrap()
     }
 
-    fn load_providers(path: &Path) -> ProxyProvidersConfig {
-        read_config(path.to_str().unwrap(), PROXY_PROVIDERS_BASENAME).unwrap()
+    fn load_providers(path: &Path) -> ProvidersConfig {
+        read_config(path.to_str().unwrap(), PROVIDERS_BASENAME).unwrap()
     }
 
     #[tokio::test]
@@ -155,17 +155,17 @@ mod tests {
             }),
             ..AppConfig::default()
         };
-        let providers = ProxyProvidersConfig::default();
+        let providers = ProvidersConfig::default();
 
         write_config(path.to_str().unwrap(), APP_CONFIG_BASENAME, &app)
             .await
             .unwrap();
-        write_config(path.to_str().unwrap(), PROXY_PROVIDERS_BASENAME, &providers)
+        write_config(path.to_str().unwrap(), PROVIDERS_BASENAME, &providers)
             .await
             .unwrap();
 
         assert!(config_path(&path, APP_CONFIG_BASENAME).is_file());
-        assert!(config_path(&path, PROXY_PROVIDERS_BASENAME).is_file());
+        assert!(config_path(&path, PROVIDERS_BASENAME).is_file());
         assert_eq!(
             load_app(&path)
                 .subscription_prefix

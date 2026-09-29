@@ -1,5 +1,5 @@
 mod auth;
-mod proxy_providers;
+mod providers;
 mod system;
 
 use std::path::Path;
@@ -21,7 +21,7 @@ impl AppRouter {
         let api_router = Router::new()
             .nest("/system", system::route())
             .nest("/auth", auth::route())
-            .nest("/proxy-providers", proxy_providers::route());
+            .nest("/providers", providers::route());
 
         let not_found_service = not_found.into_service();
         let web_service = ServeDir::new(web_path)

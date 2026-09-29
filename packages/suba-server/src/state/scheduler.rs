@@ -1,4 +1,4 @@
-//! Background refreshing of proxy provider subscriptions.
+//! Background refreshing of provider subscriptions.
 
 use std::{sync::Arc, time::Duration};
 
@@ -14,7 +14,7 @@ use crate::error::Error;
 
 use super::providers::{ProviderStore, Refreshed};
 
-/// Refreshes proxy providers on their configured interval.
+/// Refreshes providers on their configured interval.
 ///
 /// A provider carries its own interval, so there is no single clock to drive:
 /// the refresher owns one worker per enabled provider instead. A configuration
@@ -87,11 +87,11 @@ async fn worker(providers: Arc<ProviderStore>, http: Client, name: String, inter
             // A provider that vanished or was disabled has nothing to
             // refresh; the next configuration change will replace this worker.
             Err(error @ (Error::ProviderNotFound(_) | Error::ProviderDisabled(_))) => {
-                tracing::debug!("Stopping refresher for proxy provider '{name}': {error}");
+                tracing::debug!("Stopping refresher for provider '{name}': {error}");
                 return;
             }
             Err(error) => {
-                tracing::warn!("Failed to refresh proxy provider '{name}': {error}");
+                tracing::warn!("Failed to refresh provider '{name}': {error}");
             }
         }
     }
@@ -102,7 +102,7 @@ async fn worker(providers: Arc<ProviderStore>, http: Client, name: String, inter
 /// A subscription may carry credentials, so only its size is reported.
 fn report(refreshed: &Refreshed) {
     tracing::debug!(
-        "Refreshed proxy provider '{}' ({} bytes)",
+        "Refreshed provider '{}' ({} bytes)",
         refreshed.name,
         refreshed.bytes
     );

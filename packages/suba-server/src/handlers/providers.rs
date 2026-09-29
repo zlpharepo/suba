@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use suba_core::tracing;
 
 use crate::{
-    config::ProxyProvider,
+    config::Provider,
     dto::{Authenticated, ErrorResponse, ResponseResult},
     error::Error,
     AppState,
@@ -40,7 +40,7 @@ pub async fn get(
         (
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
-                message: format!("Proxy provider '{}' not found", name),
+                message: format!("Provider '{}' not found", name),
             }),
         )
             .into_response()
@@ -51,14 +51,14 @@ pub async fn insert(
     _auth: Authenticated,
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Json(provider): Json<ProxyProvider>,
+    Json(provider): Json<Provider>,
 ) -> ResponseResult<impl IntoResponse> {
     let refreshed = state
         .providers()
         .upsert(&name, provider, state.http())
         .await?;
     tracing::debug!(
-        "Stored proxy provider '{}' ({} bytes)",
+        "Stored provider '{}' ({} bytes)",
         refreshed.name,
         refreshed.bytes
     );
@@ -83,7 +83,7 @@ pub async fn refresh(
 ) -> ResponseResult<impl IntoResponse> {
     let refreshed = state.providers().refresh(&name, state.http()).await?;
     tracing::debug!(
-        "Refreshed proxy provider '{}' ({} bytes)",
+        "Refreshed provider '{}' ({} bytes)",
         refreshed.name,
         refreshed.bytes
     );

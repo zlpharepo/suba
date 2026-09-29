@@ -1,3 +1,3 @@
 pub mod auth;
-pub mod proxy_providers;
+pub mod providers;
 pub mod system;

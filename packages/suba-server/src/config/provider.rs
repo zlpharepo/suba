@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum ProxyProvider {
+pub enum Provider {
     Http(Http),
 }
 
@@ -15,7 +15,7 @@ pub struct SharedFields {
     pub disabled: bool,
 }
 
-impl ProxyProvider {
+impl Provider {
     /// Whether the provider is excluded from automatic refreshing.
     pub fn disabled(&self) -> bool {
         match self {
