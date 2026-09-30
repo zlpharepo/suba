@@ -170,50 +170,13 @@ impl Format {
     /// A sing-box configuration, as the dialect writes it.
     #[cfg(feature = "singbox")]
     fn render_singbox(self, nodes: &[&IndexEntry], skipped: &mut Vec<Skipped>) -> String {
-        // What can be written at all: a node nobody serves has no content, so it
-        // is not the dialect's to refuse.
-        let writable: Vec<(&IndexEntry, &Node<Client>)> = nodes
-            .iter()
-            .filter_map(|entry| match entry.node.as_ref() {
-                Some(node) => Some((*entry, node)),
-                None => {
-                    skipped.push(orphan(entry));
+        let (outbounds, refused) = outbounds(nodes);
+        skipped.extend(refused);
 
-                    None
-                }
-            })
-            .collect();
-
-        let named: Vec<(&str, &Node<Client>)> = writable
-            .iter()
-            .map(|(entry, node)| (entry.name().unwrap_or_default(), *node))
-            .collect();
-
-        let (body, refused) = suba_singbox::client_config(&named);
-
-        // A refusal names a position in what the dialect was given, which is the
-        // position in `writable`: orphans were taken out before it was called.
-        for refusal in refused {
-            let (entry, _) = writable[refusal.index];
-
-            skipped.push(Skipped {
-                id: entry.id,
-                name: entry.name().map(str::to_owned),
-                reason: match refusal.reason {
-                    suba_singbox::Reason::Protocol(kind) => SkipReason::Protocol(kind),
-                    suba_singbox::Reason::Transport(carriage) => SkipReason::Transport(carriage),
-                    // The dialect could not spell a value sing-box accepts; the
-                    // field and what the node said are the whole explanation, and
-                    // neither is a credential.
-                    suba_singbox::Reason::Value { field, spelling } => SkipReason::Refused {
-                        kind: proto::ErrorKind::InvalidValue,
-                        reason: format!("{field}: {spelling} has no sing-box spelling"),
-                    },
-                },
-            });
-        }
-
-        body
+        // The values are built here, so a failure would be this crate's bug
+        // rather than something a caller could act on.
+        serde_json::to_string(&serde_json::json!({ "outbounds": outbounds }))
+            .expect("the document this crate built")
     }
 
     /// A clash document, as the dialect writes it.
@@ -276,7 +239,81 @@ fn orphan(entry: &IndexEntry) -> Skipped {
         reason: SkipReason::Orphan,
     }
 }
+/// The outbounds a set of nodes contributes to a configuration this host runs.
+///
+/// The same walk a rendered sing-box document takes, stopping one step earlier:
+/// the values, not the document, because a caller puts them beside the fragments
+/// a user wrote rather than serving them. What the dialect refuses is reported
+/// against the entry it came from, so an assembly can say what it did not carry
+/// instead of quietly carrying less.
+#[cfg(feature = "singbox")]
+pub fn outbounds(entries: &[&IndexEntry]) -> (Vec<serde_json::Value>, Vec<Skipped>) {
+    let mut skipped = Vec::new();
+    let writable = writable(entries, &mut skipped);
 
+    let named: Vec<(&str, &Node<Client>)> = writable
+        .iter()
+        .map(|(entry, node)| (entry.name().unwrap_or_default(), *node))
+        .collect();
+
+    let (outbounds, refused) = suba_singbox::outbounds(&named);
+    refusals(&writable, refused, &mut skipped);
+
+    (outbounds, skipped)
+}
+
+/// The entries a document can hold at all.
+///
+/// A node nobody serves any more has no content, so leaving it out is a fact
+/// about the index rather than something a dialect decided.
+#[cfg(feature = "singbox")]
+fn writable<'a>(
+    entries: &[&'a IndexEntry],
+    skipped: &mut Vec<Skipped>,
+) -> Vec<(&'a IndexEntry, &'a Node<Client>)> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry.node.as_ref() {
+            Some(node) => Some((*entry, node)),
+            None => {
+                skipped.push(orphan(entry));
+
+                None
+            }
+        })
+        .collect()
+}
+
+/// Which entry each refusal came from.
+///
+/// A dialect reports a position in what it was given, which is the position in
+/// `writable`: the orphans were taken out before it was called.
+#[cfg(feature = "singbox")]
+fn refusals(
+    writable: &[(&IndexEntry, &Node<Client>)],
+    refused: Vec<suba_singbox::Refused>,
+    skipped: &mut Vec<Skipped>,
+) {
+    for refusal in refused {
+        let (entry, _) = writable[refusal.index];
+
+        skipped.push(Skipped {
+            id: entry.id,
+            name: entry.name().map(str::to_owned),
+            reason: match refusal.reason {
+                suba_singbox::Reason::Protocol(kind) => SkipReason::Protocol(kind),
+                suba_singbox::Reason::Transport(carriage) => SkipReason::Transport(carriage),
+                // The dialect could not spell a value sing-box accepts; the
+                // field and what the node said are the whole explanation, and
+                // neither is a credential.
+                suba_singbox::Reason::Value { field, spelling } => SkipReason::Refused {
+                    kind: proto::ErrorKind::InvalidValue,
+                    reason: format!("{field}: {spelling} has no sing-box spelling"),
+                },
+            },
+        });
+    }
+}
 impl fmt::Display for Format {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -447,6 +484,62 @@ mod tests {
 
     fn entries(index: &NodeIndex) -> Vec<&IndexEntry> {
         index.served().collect()
+    }
+
+    /// The other half of the same walk: the values an assembly merges, rather
+    /// than a document someone is served.
+    #[cfg(feature = "singbox")]
+    #[test]
+    fn the_same_walk_gives_the_values_an_assembly_merges() {
+        let fixtures = links();
+        let index = index(&fixtures);
+        let nodes = entries(&index);
+
+        let (outbounds, skipped) = crate::outbounds(&nodes);
+
+        assert!(!outbounds.is_empty());
+        assert!(
+            outbounds
+                .iter()
+                .all(|outbound| outbound["tag"].as_str().is_some_and(|tag| !tag.is_empty())),
+            "every outbound an assembly merges is named: {outbounds:?}"
+        );
+
+        // One walk, two callers: the document is these values under one key.
+        let rendered = Format::Singbox
+            .render(&nodes, RenderIntent::Client)
+            .expect("a client document");
+        let document: serde_json::Value = serde_json::from_str(&rendered.body).expect("valid JSON");
+
+        assert_eq!(document["outbounds"], serde_json::Value::Array(outbounds));
+        assert_eq!(rendered.skipped.len(), skipped.len());
+    }
+
+    /// A node the dialect cannot write is reported against the entry it came
+    /// from, because an assembly has to say what it did not carry.
+    #[cfg(feature = "singbox")]
+    #[test]
+    fn a_refused_node_is_reported_against_its_entry() {
+        let fixtures = vec![
+            "trojan://PASSWORD@example.com:443?sni=example.com#Trojan".to_string(),
+            "ssr://Z29sZGVuLmV4YW1wbGUuY29tOjQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6aHR0cF9zaW1wbGU6YkdWMGJXVnBiZy8_b2Jmc3BhcmFtPSZyZW1hcmtzPVUxTlM".to_string(),
+        ];
+        let index = index(&fixtures);
+        let nodes = entries(&index);
+
+        let (outbounds, skipped) = crate::outbounds(&nodes);
+
+        assert_eq!(outbounds.len(), 1);
+        assert_eq!(outbounds[0]["tag"], serde_json::json!("Trojan"));
+        assert_eq!(skipped.len(), 1);
+        assert!(
+            nodes.iter().any(|entry| entry.id == skipped[0].id),
+            "the refusal names an entry that was given"
+        );
+        assert!(matches!(
+            skipped[0].reason,
+            SkipReason::Protocol(Kind::ShadowsocksR)
+        ));
     }
 
     #[test]

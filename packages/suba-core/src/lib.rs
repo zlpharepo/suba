@@ -38,6 +38,8 @@ pub use suba_proto as proto;
 
 pub use collection::{Collection, Resolved, View};
 pub use filter::{FilterError, NodeFilter, PatternReason};
+#[cfg(feature = "singbox")]
+pub use format::outbounds;
 pub use format::{
     Format, FormatDescriptor, ProtocolSupport, RenderError, RenderIntent, Rendered, SkipReason,
     Skipped,

@@ -29,4 +29,4 @@ pub mod schema;
 mod render;
 
 #[cfg(feature = "render")]
-pub use render::{client_config, outbound, Reason, Refused, PROTOCOLS};
+pub use render::{outbound, outbounds, Reason, Refused, PROTOCOLS};

@@ -257,11 +257,55 @@ fn merge(written: Option<Value>, generated: &[Value]) -> Result<Vec<Value>, Unfi
     Ok(entries)
 }
 
+/// A tag a document names, and where.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Tag {
+    /// The name, as the document spells it.
+    pub tag: String,
+    /// Which namespace it is in.
+    pub space: Space,
+    /// What the entry says it is, when it says.
+    pub kind: Option<String>,
+    /// Where it is written, so a caller can point at it.
+    pub path: String,
+}
+
+/// The namespaces tags live in.
+///
+/// Outbounds and endpoints share one — the core refuses two entries with the
+/// same tag as `duplicate outbound/endpoint tag` — and inbounds have their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Space {
+    Outbound,
+    Inbound,
+}
+
+/// Every tag a document names, in the order the checks see them.
+///
+/// This is what a form needs and the schema cannot give (R6.3): which tags exist
+/// *now*. Reading them from the same walk the checks use means the list and the
+/// checks cannot disagree about a document.
+pub fn tags(config: &Value) -> Result<Vec<Tag>, Unfit> {
+    let links = scan(config)?;
+
+    Ok(links
+        .named
+        .into_iter()
+        .map(|named| Tag {
+            tag: named.tag.to_string(),
+            space: named.space,
+            kind: named.kind,
+            path: named.path,
+        })
+        .collect())
+}
+
 /// What the document says about tags, gathered in one pass.
 struct Links<'a> {
-    /// Tags in the namespace outbounds and endpoints share, in document order,
-    /// with the path each is written at.
-    named: Vec<(&'a str, String)>,
+    /// Tags in the namespaces this build knows, in document order, with the path
+    /// each is written at.
+    named: Vec<Named<'a>>,
     /// The same tags, for looking one up.
     outbound: BTreeSet<&'a str>,
     /// Tags of inbounds.
@@ -270,6 +314,13 @@ struct Links<'a> {
     references: Vec<Reference<'a>>,
     /// tag -> the group it names, with the paths of the members it lists.
     groups: BTreeMap<&'a str, Group<'a>>,
+}
+
+struct Named<'a> {
+    tag: &'a str,
+    space: Space,
+    kind: Option<String>,
+    path: String,
 }
 
 struct Group<'a> {
@@ -309,13 +360,25 @@ fn scan(config: &Value) -> Result<Links<'_>, Unfit> {
                 continue;
             };
             links.outbound.insert(tag);
-            links.named.push((tag, format!("{section}[{index}].{TAG}")));
+            links.named.push(Named {
+                tag,
+                space: Space::Outbound,
+                kind: kind_of(entry),
+                path: format!("{section}[{index}].{TAG}"),
+            });
         }
     }
-    for entry in entries(config, INBOUNDS)? {
-        if let Some(tag) = tag_of(entry) {
-            links.inbound.insert(tag);
-        }
+    for (index, entry) in entries(config, INBOUNDS)?.into_iter().enumerate() {
+        let Some(tag) = tag_of(entry) else {
+            continue;
+        };
+        links.inbound.insert(tag);
+        links.named.push(Named {
+            tag,
+            space: Space::Inbound,
+            kind: kind_of(entry),
+            path: format!("{INBOUNDS}[{index}].{TAG}"),
+        });
     }
 
     for (index, entry) in entries(config, OUTBOUNDS)?.into_iter().enumerate() {
@@ -470,11 +533,15 @@ fn rules<'a>(links: &mut Links<'a>, config: &'a Value, section: &str) -> Result<
 fn repeated(links: &Links<'_>) -> Result<(), Unfit> {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
 
-    for (tag, path) in &links.named {
-        if !seen.insert(tag) {
+    for named in links
+        .named
+        .iter()
+        .filter(|named| named.space == Space::Outbound)
+    {
+        if !seen.insert(named.tag) {
             return Err(Unfit::Tag {
-                path: path.clone(),
-                tag: tag.to_string(),
+                path: named.path.clone(),
+                tag: named.tag.to_string(),
                 fault: Fault::Duplicate,
             });
         }
@@ -594,6 +661,11 @@ fn tag_of(entry: &Value) -> Option<&str> {
         .get(TAG)
         .and_then(Value::as_str)
         .filter(|tag| !tag.is_empty())
+}
+
+/// What an entry says it is, if it says.
+fn kind_of(entry: &Value) -> Option<String> {
+    entry.get(TYPE).and_then(Value::as_str).map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -992,6 +1064,44 @@ mod tests {
                 path: "outbounds[0].outbounds[0]".to_string(),
                 reason: "a member is named by its tag",
             })
+        );
+    }
+
+    #[test]
+    fn the_tags_a_document_names_are_listed_with_where_they_are() {
+        let fragments = written(&[
+            ("inbounds", r#"[{"type":"socks","tag":"in"}]"#),
+            (
+                "outbounds",
+                r#"[{"type":"direct","tag":"direct"},{"type":"selector","tag":"s","outbounds":["direct"]}]"#,
+            ),
+        ]);
+
+        let assembled = assemble(&fragments, &[]).expect("nothing wrong");
+        let tags = tags(&assembled.config).expect("a document");
+
+        assert_eq!(
+            tags,
+            [
+                Tag {
+                    tag: "direct".to_string(),
+                    space: Space::Outbound,
+                    kind: Some("direct".to_string()),
+                    path: "outbounds[0].tag".to_string(),
+                },
+                Tag {
+                    tag: "s".to_string(),
+                    space: Space::Outbound,
+                    kind: Some("selector".to_string()),
+                    path: "outbounds[1].tag".to_string(),
+                },
+                Tag {
+                    tag: "in".to_string(),
+                    space: Space::Inbound,
+                    kind: Some("socks".to_string()),
+                    path: "inbounds[0].tag".to_string(),
+                },
+            ]
         );
     }
 

@@ -270,11 +270,14 @@ fn carries_itself(kind: Kind) -> bool {
     matches!(kind, Kind::Hysteria2 | Kind::Tuic | Kind::AnyTls)
 }
 
-/// A client document: one outbound per node, in the order they are given.
+/// One outbound per node, in the order they are given.
 ///
-/// Nodes this crate cannot express are left out and reported, with the position
-/// they had in the input so that a caller can say which one it was.
-pub fn client_config(nodes: &[(&str, &Node<Client>)]) -> (String, Vec<Refused>) {
+/// This is the piece every caller wants: a document someone is served is these
+/// values under an `outbounds` key, and a configuration this host runs is these
+/// values beside whatever else the user wrote. Nodes this crate cannot express
+/// are left out and reported, with the position they had in the input so that a
+/// caller can say which one it was.
+pub fn outbounds(nodes: &[(&str, &Node<Client>)]) -> (Vec<Value>, Vec<Refused>) {
     let mut outbounds = Vec::new();
     let mut refused = Vec::new();
     let mut tags: Vec<String> = Vec::new();
@@ -288,12 +291,7 @@ pub fn client_config(nodes: &[(&str, &Node<Client>)]) -> (String, Vec<Refused>) 
         }
     }
 
-    let document = json!({ "outbounds": outbounds });
-    // The values are built here, so a failure would be this crate's bug rather
-    // than something a caller could act on.
-    let body = serde_json::to_string(&document).expect("the document this crate built");
-
-    (body, refused)
+    (outbounds, refused)
 }
 
 /// The tag for one node.
@@ -732,17 +730,16 @@ mod tests {
     }
 
     #[test]
-    fn the_document_holds_the_nodes_that_can_be_written_and_names_the_rest() {
+    fn the_walk_writes_the_nodes_that_can_be_written_and_names_the_rest() {
         let trojan = node("trojan://PASSWORD@example.com:443?sni=example.com#Trojan");
         let ssr = node(
             "ssr://Z29sZGVuLmV4YW1wbGUuY29tOjQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6aHR0cF9zaW1wbGU6YkdWMGJXVnBiZy8_b2Jmc3BhcmFtPSZyZW1hcmtzPVUxTlM",
         );
 
-        let (body, refused) = client_config(&[("Trojan", &trojan), ("SSR", &ssr)]);
+        let (outbounds, refused) = outbounds(&[("Trojan", &trojan), ("SSR", &ssr)]);
 
-        let document: Value = serde_json::from_str(&body).expect("valid JSON");
-        assert_eq!(document["outbounds"].as_array().unwrap().len(), 1);
-        assert_eq!(document["outbounds"][0]["tag"], json!("Trojan"));
+        assert_eq!(outbounds.len(), 1);
+        assert_eq!(outbounds[0]["tag"], json!("Trojan"));
         assert_eq!(
             refused,
             [Refused {
@@ -759,31 +756,24 @@ mod tests {
         let first = node("trojan://PASSWORD@example.com:443?sni=example.com#Tokyo");
         let second = node("trojan://OTHER@example.org:443?sni=example.org#Tokyo");
 
-        let (body, refused) = client_config(&[("Tokyo", &first), ("Tokyo", &second)]);
-        let document: Value = serde_json::from_str(&body).expect("valid JSON");
-        let tags: Vec<&str> = document["outbounds"]
-            .as_array()
-            .unwrap()
+        let (outbounds, refused) = outbounds(&[("Tokyo", &first), ("Tokyo", &second)]);
+        let tags: Vec<&str> = outbounds
             .iter()
             .map(|outbound| outbound["tag"].as_str().unwrap())
             .collect();
 
         assert!(refused.is_empty());
         assert_eq!(tags, ["Tokyo", "Tokyo 2"]);
-        assert_ne!(
-            document["outbounds"][0]["server"],
-            document["outbounds"][1]["server"]
-        );
+        assert_ne!(outbounds[0]["server"], outbounds[1]["server"]);
     }
 
     #[test]
     fn a_node_with_no_name_still_gets_a_tag() {
         let anonymous = node("trojan://PASSWORD@example.com:443?sni=example.com");
 
-        let (body, _) = client_config(&[("", &anonymous)]);
-        let document: Value = serde_json::from_str(&body).expect("valid JSON");
+        let (outbounds, _) = outbounds(&[("", &anonymous)]);
 
-        assert_eq!(document["outbounds"][0]["tag"], json!("node-1"));
+        assert_eq!(outbounds[0]["tag"], json!("node-1"));
     }
 
     /// Whatever this crate says it can write, it writes.

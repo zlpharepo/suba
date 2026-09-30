@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-singbox = ["dep:suba-singbox", "suba-singbox/render"]
+singbox = ["dep:suba-singbox", "suba-singbox/render", "dep:serde_json"]
 clash = ["dep:suba-clash"]
 
 [dependencies]
@@ -16,6 +16,7 @@ suba-clash = { workspace = true, optional = true }
 
 regex = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 
