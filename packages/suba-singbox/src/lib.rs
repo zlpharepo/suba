@@ -17,6 +17,9 @@
 //! both is a core fed by a collection.
 
 #[cfg(feature = "core")]
+pub mod assemble;
+
+#[cfg(feature = "core")]
 pub mod core;
 
 #[cfg(feature = "render")]
