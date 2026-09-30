@@ -121,15 +121,20 @@ pub enum Error {
     #[error("{0}")]
     Document(String),
 
-    /// Something in the fragments directory is not a fragment.
-    #[cfg(feature = "singbox-core")]
-    #[error("{name}: {reason}")]
-    Fragment { name: String, reason: &'static str },
-
     /// A section the operator has not written yet.
     #[cfg(feature = "singbox-core")]
     #[error("section '{section}' is not there")]
-    NoFragment { section: String },
+    NoSection { section: String },
+
+    /// An entry an array section does not hold.
+    #[cfg(feature = "singbox-core")]
+    #[error("{section} has no entry tagged '{tag}'")]
+    NoEntry { section: String, tag: String },
+
+    /// The document changed since the caller read it (`If-Match`).
+    #[cfg(feature = "singbox-core")]
+    #[error("the configuration changed since it was read")]
+    Stale,
 
     /// There is no version to run.
     #[cfg(feature = "singbox-core")]
@@ -331,14 +336,19 @@ impl IntoHttpError for Error {
                 message,
             },
             #[cfg(feature = "singbox-core")]
-            Error::Fragment { name, reason } => HttpError {
-                status_code: StatusCode::UNPROCESSABLE_ENTITY,
-                message: format!("{name}: {reason}"),
-            },
-            #[cfg(feature = "singbox-core")]
-            Error::NoFragment { section } => HttpError {
+            Error::NoSection { section } => HttpError {
                 status_code: StatusCode::NOT_FOUND,
                 message: format!("Section '{section}' is not there"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::NoEntry { section, tag } => HttpError {
+                status_code: StatusCode::NOT_FOUND,
+                message: format!("{section} has no entry tagged '{tag}'"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::Stale => HttpError {
+                status_code: StatusCode::PRECONDITION_FAILED,
+                message: "The configuration changed since it was read".to_string(),
             },
             #[cfg(feature = "singbox-core")]
             Error::NoVersion => HttpError {

@@ -14,11 +14,22 @@ use crate::{handlers::singbox, AppState};
 pub fn route() -> Router<AppState> {
     Router::new()
         .route("/", get(singbox::index))
-        .route("/", put(singbox::switch))
+        .route("/", put(singbox::choose))
         .route("/status", get(singbox::status))
         .route("/status", put(singbox::act))
-        .route("/config/{section}", get(singbox::config))
-        .route("/config/{section}", put(singbox::write_config))
+        .route("/config", get(singbox::config).put(singbox::write_config))
+        .route(
+            "/config/{section}",
+            get(singbox::section)
+                .put(singbox::write_section)
+                .delete(singbox::delete_section),
+        )
+        .route(
+            "/config/{section}/{tag}",
+            get(singbox::entry)
+                .put(singbox::write_entry)
+                .delete(singbox::delete_entry),
+        )
         .route("/versions", get(singbox::versions))
         .route(
             "/versions/{version}",

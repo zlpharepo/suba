@@ -1,8 +1,6 @@
-//! Assemble the document the core runs, out of the user's fragments.
+//! Assemble the document the core runs, out of the one the user wrote.
 //!
-//! A fragment is one section of a configuration in one file —
-//! `config/sing-box/outbounds.json` holds what belongs under `outbounds` — and
-//! the user's fragments are never rewritten. The one section with a generated
+//! The user's document is never rewritten. The one section with a generated
 //! half is `outbounds`: what a collection renders is put in front of what the
 //! user wrote, and nothing is merged field by field.
 //!
@@ -107,13 +105,7 @@ pub struct Assembled {
 /// tags carry the tag: a user has to be able to find what to edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unfit {
-    /// A fragment is not JSON at all.
-    NotJson {
-        section: String,
-        line: usize,
-        column: usize,
-    },
-    /// A fragment, or something inside it, is not the shape its place has.
+    /// The document, or something inside it, is not the shape its place has.
     Shape { path: String, reason: &'static str },
     /// A tag is repeated, missing, or in a cycle.
     Tag {
@@ -137,11 +129,6 @@ pub enum Fault {
 impl fmt::Display for Unfit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Unfit::NotJson {
-                section,
-                line,
-                column,
-            } => write!(f, "{section}: not JSON (line {line}, column {column})"),
             Unfit::Shape { path, reason } => write!(f, "{path}: {reason}"),
             Unfit::Tag { path, tag, fault } => write!(f, "{path}: {tag:?} {fault}"),
         }
@@ -160,22 +147,18 @@ impl fmt::Display for Fault {
 
 impl std::error::Error for Unfit {}
 
-/// Assemble the user's fragments and the generated outbounds into one document.
+/// Assemble the user's document and the generated outbounds into one.
 ///
-/// `fragments` maps a section name to that section's value as bytes — the
-/// caller reads `config/sing-box/<section>.json` and hands them over as they
-/// are. `generated` is what a collection rendered, in the order it should be
+/// `written` is the document the user wrote (an object; `Value::Null` for none
+/// yet). `generated` is what a collection rendered, in the order it should be
 /// looked at first; every entry of it must be named, because a tag is the only
 /// thing that can refer to an outbound.
 ///
 /// The document comes back only if it holds up: repeated tags, references with
 /// nothing behind them, and cycles are refused, in that order, before anything
 /// is written anywhere.
-pub fn assemble(
-    fragments: &BTreeMap<String, Vec<u8>>,
-    generated: &[Value],
-) -> Result<Assembled, Unfit> {
-    let config = document(fragments, generated)?;
+pub fn assemble(written: &Value, generated: &[Value]) -> Result<Assembled, Unfit> {
+    let config = document(written, generated)?;
 
     let links = scan(&config)?;
     repeated(&links)?;
@@ -188,51 +171,43 @@ pub fn assemble(
     })
 }
 
-/// The document the fragments and the generated outbounds make, without asking
+/// The document the user's and the generated outbounds make, without asking
 /// whether it holds up.
 ///
 /// A form has to be able to list the tags that exist while the operator is still
 /// writing the document that will use them, so the merge is available on its
-/// own. Everything it refuses is about the fragments as JSON — a section that is
-/// not JSON, or not an object or an array.
-pub fn document(
-    fragments: &BTreeMap<String, Vec<u8>>,
-    generated: &[Value],
-) -> Result<Value, Unfit> {
-    let mut sections: BTreeMap<String, Value> = BTreeMap::new();
-    for (section, bytes) in fragments {
-        sections.insert(section.clone(), parse(section, bytes)?);
+/// own. Everything it refuses is about shape: a document that is not an object,
+/// or a section that is not an object or an array.
+pub fn document(written: &Value, generated: &[Value]) -> Result<Value, Unfit> {
+    let mut sections: Map<String, Value> = match written {
+        Value::Null => Map::new(),
+        Value::Object(sections) => sections.clone(),
+        _ => {
+            return Err(Unfit::Shape {
+                path: String::new(),
+                reason: "a configuration is an object",
+            })
+        }
+    };
+
+    // A section is an object (`log`, `dns`, `route`) or an array of entries
+    // (`inbounds`, `outbounds`). Which section names exist is the core's
+    // business: it refuses an unknown one itself (`json: unknown field`).
+    for (section, value) in &sections {
+        if !value.is_object() && !value.is_array() {
+            return Err(Unfit::Shape {
+                path: section.clone(),
+                reason: "a section is an object or an array",
+            });
+        }
     }
 
     let outbounds = merge(sections.remove(OUTBOUNDS), generated)?;
-
-    let mut sections: Map<String, Value> = sections.into_iter().collect();
     if !outbounds.is_empty() {
         sections.insert(OUTBOUNDS.to_string(), Value::Array(outbounds));
     }
 
     Ok(Value::Object(sections))
-}
-
-/// One fragment, read as its section's value.
-fn parse(section: &str, bytes: &[u8]) -> Result<Value, Unfit> {
-    let value: Value = serde_json::from_slice(bytes).map_err(|error| Unfit::NotJson {
-        section: section.to_string(),
-        line: error.line(),
-        column: error.column(),
-    })?;
-
-    // A section is an object (`log`, `dns`, `route`) or an array of entries
-    // (`inbounds`, `outbounds`). Anything else is a file whose name and content
-    // disagree, and which section names exist is the core's business: it refuses
-    // an unknown one itself (`json: unknown field "bogus_section"`).
-    match value {
-        Value::Object(_) | Value::Array(_) => Ok(value),
-        _ => Err(Unfit::Shape {
-            path: section.to_string(),
-            reason: "a section is an object or an array",
-        }),
-    }
 }
 
 /// The two halves of `outbounds` added together, generated first.
@@ -687,11 +662,19 @@ fn kind_of(entry: &Value) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn written(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
-        pairs
-            .iter()
-            .map(|(section, value)| (section.to_string(), value.as_bytes().to_vec()))
-            .collect()
+    /// A document out of sections spelled as JSON text.
+    fn written(pairs: &[(&str, &str)]) -> Value {
+        Value::Object(
+            pairs
+                .iter()
+                .map(|(section, value)| {
+                    (
+                        section.to_string(),
+                        serde_json::from_str(value).expect("a section"),
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn outbound(tag: &str) -> Value {
@@ -702,22 +685,8 @@ mod tests {
         serde_json::json!({ "type": "selector", TAG: tag, "outbounds": members })
     }
 
-    /// What a caller does with a document it already has in hand: one fragment
-    /// per section.
     fn assembled(config: &Value) -> Value {
-        let fragments: BTreeMap<String, Vec<u8>> = config
-            .as_object()
-            .expect("an object")
-            .iter()
-            .map(|(section, value)| {
-                (
-                    section.clone(),
-                    serde_json::to_vec(value).expect("a section"),
-                )
-            })
-            .collect();
-
-        assemble(&fragments, &[]).expect("nothing wrong").config
+        assemble(config, &[]).expect("nothing wrong").config
     }
 
     #[test]
@@ -754,7 +723,7 @@ mod tests {
         let generated = vec![serde_json::json!({ "type": "direct" })];
 
         assert_eq!(
-            assemble(&BTreeMap::new(), &generated),
+            assemble(&Value::Null, &generated),
             Err(Unfit::Shape {
                 path: "outbounds[0]".to_string(),
                 reason: "a generated outbound carries the tag that refers to it",
@@ -1030,21 +999,18 @@ mod tests {
     }
 
     #[test]
-    fn a_fragment_that_is_not_json_says_where() {
-        let fragments = written(&[("log", "{")]);
-
+    fn a_document_that_is_not_an_object_is_refused() {
         assert_eq!(
-            assemble(&fragments, &[]),
-            Err(Unfit::NotJson {
-                section: "log".to_string(),
-                line: 1,
-                column: 1,
+            assemble(&serde_json::json!([]), &[]),
+            Err(Unfit::Shape {
+                path: String::new(),
+                reason: "a configuration is an object",
             })
         );
     }
 
     #[test]
-    fn a_fragment_of_the_wrong_shape_is_refused() {
+    fn a_section_of_the_wrong_shape_is_refused() {
         let fragments = written(&[("log", r#""warn""#)]);
 
         assert_eq!(
@@ -1144,7 +1110,7 @@ mod tests {
 
     #[test]
     fn nothing_at_all_is_an_empty_document() {
-        let assembled = assemble(&BTreeMap::new(), &[]).expect("nothing wrong");
+        let assembled = assemble(&Value::Null, &[]).expect("nothing wrong");
 
         assert_eq!(assembled.config, serde_json::json!({}));
         assert_eq!(assembled.unchecked.len(), UNCHECKED.len());

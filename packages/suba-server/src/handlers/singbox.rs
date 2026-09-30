@@ -24,7 +24,8 @@ use suba_singbox::run::{self, Exit, Status};
 use crate::{
     dto::{Authenticated, ResponseResult},
     error::Error,
-    state::singbox::{InstallationTask, RuntimePhase, SingboxStore},
+    handlers::collections::outbounds_of,
+    state::singbox::{Document, InstallationTask, RuntimePhase, Saved, Settings, SingboxStore},
     AppState,
 };
 
@@ -32,17 +33,43 @@ use crate::{
 /// ended.
 const PATIENCE: Duration = Duration::from_secs(10);
 
-/// The core: which version is in use, and what state it is in.
+/// The module: what the operator chose, and what state the core is in.
 #[derive(Debug, Serialize)]
 pub struct Core {
-    /// The version in use, when one is installed and current.
+    /// The version in use, when one is chosen.
     pub version: Option<String>,
-    /// Whether its binary is where it should be.
+    /// The collections whose nodes become outbounds, in order.
+    pub collections: Vec<String>,
+    /// Whether the chosen version's binary is where it should be.
     pub installed: bool,
     /// Whether an assembled configuration is on disk.
     pub assembled: bool,
     /// Whether it is running now.
     pub running: bool,
+    /// Set when a core is running: it keeps running what it started with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// What the operator chooses for the module.
+#[derive(Debug, Deserialize)]
+pub struct Choose {
+    pub version: Option<String>,
+    #[serde(default)]
+    pub collections: Vec<String>,
+}
+
+fn core_view(store: &SingboxStore, note: Option<String>) -> Result<Core, Error> {
+    let settings = store.settings()?;
+
+    Ok(Core {
+        version: settings.version.map(|version| version.as_str().to_string()),
+        collections: settings.collections,
+        installed: store.binary_in_place()?,
+        assembled: store.assembled(),
+        running: store.status().running,
+        note,
+    })
 }
 
 /// What the process is doing, and the end of what it said.
@@ -78,58 +105,39 @@ pub enum Command {
     Restart,
 }
 
-/// The version to make the current one.
-#[derive(Debug, Deserialize)]
-pub struct Switch {
-    pub version: String,
-}
-
-/// What changed, and what a caller has to do about it.
-#[derive(Debug, Serialize)]
-pub struct Switched {
-    #[serde(flatten)]
-    pub core: Core,
-    /// Set when a core is running: it keeps running what it started with.
-    pub note: Option<String>,
-}
-
-/// Make an installed version the one in use.
+/// Replace the module's settings: the version in use and the collections that
+/// contribute outbounds.
 ///
-/// A switch does not touch a running process — the version it started with is
-/// the version it is — so the answer says so instead of pretending the change
+/// Neither touches a running process — it keeps the version and configuration
+/// it started with — so the answer says so instead of pretending the change
 /// has taken effect.
-pub async fn switch(
+pub async fn choose(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Json(switch): Json<Switch>,
-) -> ResponseResult<Json<Switched>> {
+    Json(choose): Json<Choose>,
+) -> ResponseResult<Json<Core>> {
     let store = state.singbox();
-    let version = Version::from_tag(&switch.version);
+    let settings = Settings {
+        version: choose.version.as_deref().map(Version::from_tag),
+        collections: choose.collections,
+    };
 
     Ok(Json(
-        tokio::task::spawn_blocking(move || -> Result<Switched, Error> {
-            store.set_current(&version)?;
+        tokio::task::spawn_blocking(move || -> Result<Core, Error> {
+            store.set_settings(&settings)?;
 
-            let running = store.status().running;
+            let note = store.status().running.then(|| {
+                "the core that is running keeps what it started with; restart to change it"
+                    .to_string()
+            });
 
-            Ok(Switched {
-                core: Core {
-                    version: store.current()?.map(|version| version.as_str().to_string()),
-                    installed: store.binary_in_place()?,
-                    assembled: store.assembled(),
-                    running,
-                },
-                note: running.then(|| {
-                    "the core that is running keeps running the version it started with; restart to change it"
-                        .to_string()
-                }),
-            })
+            core_view(&store, note)
         })
         .await??,
     ))
 }
 
-/// The core, as this instance knows it.
+/// The module, as this instance knows it.
 pub async fn index(
     State(state): State<AppState>,
     _auth: Authenticated,
@@ -137,16 +145,18 @@ pub async fn index(
     let store = state.singbox();
 
     Ok(Json(
-        tokio::task::spawn_blocking(move || -> Result<Core, Error> {
-            Ok(Core {
-                version: store.current()?.map(|version| version.as_str().to_string()),
-                installed: store.binary_in_place()?,
-                assembled: store.assembled(),
-                running: store.status().running,
-            })
-        })
-        .await??,
+        tokio::task::spawn_blocking(move || core_view(&store, None)).await??,
     ))
+}
+
+/// The outbounds the chosen collections contribute right now.
+async fn generated(state: &AppState) -> Result<Vec<Value>, Error> {
+    let store = state.singbox();
+    let names = tokio::task::spawn_blocking(move || store.settings())
+        .await??
+        .collections;
+
+    outbounds_of(state, &names).await
 }
 
 /// What the process is doing, and the end of what it said.
@@ -187,17 +197,24 @@ pub async fn act(
 ) -> ResponseResult<Json<Running>> {
     let store = state.singbox();
     let tail = query.tail.unwrap_or(run::LOG_LINES).min(run::LOG_LINES);
+    let generated = match action.action {
+        Command::Stop => Vec::new(),
+        Command::Start | Command::Restart => generated(&state).await?,
+    };
 
     Ok(Json(
         tokio::task::spawn_blocking(move || -> Result<Running, Error> {
             match action.action {
                 Command::Start => {
-                    store.start(&[])?;
+                    store.start(&generated)?;
                 }
                 Command::Stop => store.stop(PATIENCE)?,
                 Command::Restart => {
+                    // Checked before the stop, so a configuration that does not
+                    // hold up leaves the running core running.
+                    store.assemble(&generated)?;
                     store.stop(PATIENCE)?;
-                    store.start(&[])?;
+                    store.start(&generated)?;
                 }
             }
 
@@ -215,49 +232,160 @@ pub async fn act(
     ))
 }
 
-/// One section of the configuration the operator wrote.
+/// The `ETag` a document is answered with, and the one a write must name.
+fn tagged(etag: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{etag}\"")) {
+        headers.insert(header::ETAG, value);
+    }
+
+    headers
+}
+
+/// The document an `If-Match` names, without its quotes; `*` names any.
+fn if_match(request: &HeaderMap) -> Option<String> {
+    let value = request.get(header::IF_MATCH)?.to_str().ok()?.trim();
+
+    match value {
+        "*" => None,
+        value => Some(value.trim_start_matches("W/").trim_matches('"').to_string()),
+    }
+}
+
+fn saved(saved: Saved) -> (HeaderMap, Json<Saved>) {
+    (tagged(&saved.etag), Json(saved))
+}
+
+/// The configuration the operator wrote, whole.
 pub async fn config(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path(section): Path<String>,
-) -> ResponseResult<Json<Value>> {
+) -> ResponseResult<(HeaderMap, Json<Value>)> {
     let store = state.singbox();
-    let name = section.clone();
+    let Document { value, etag } = tokio::task::spawn_blocking(move || store.document()).await??;
 
-    let fragment = tokio::task::spawn_blocking(move || store.fragment(&section)).await??;
-
-    fragment
-        .map(Json)
-        .ok_or(Error::NoFragment { section: name })
+    Ok((tagged(&etag), Json(value)))
 }
 
-/// One section as it was stored, and the checks that could not run on it.
-#[derive(Debug, Serialize)]
-pub struct Written {
-    pub value: Value,
-    pub unchecked: Vec<suba_singbox::schema::Skipped>,
-}
-
-/// Write one section of the configuration, once the schema has taken it.
+/// Replace the whole configuration.
 pub async fn write_config(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path(section): Path<String>,
+    request: HeaderMap,
     Json(value): Json<Value>,
-) -> ResponseResult<Json<Written>> {
+) -> ResponseResult<(HeaderMap, Json<Saved>)> {
+    let generated = generated(&state).await?;
     let store = state.singbox();
+    let expected = if_match(&request);
 
-    let (verdict, value) = tokio::task::spawn_blocking(move || {
-        store
-            .write_fragment(&section, &value)
-            .map(|verdict| (verdict, value))
-    })
-    .await??;
+    Ok(saved(
+        tokio::task::spawn_blocking(move || {
+            store.write_document(value, expected.as_deref(), &generated)
+        })
+        .await??,
+    ))
+}
 
-    Ok(Json(Written {
-        value,
-        unchecked: verdict.skipped().to_vec(),
-    }))
+/// One section of the configuration.
+pub async fn section(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(section): Path<String>,
+) -> ResponseResult<(HeaderMap, Json<Value>)> {
+    let store = state.singbox();
+    let (value, etag) = tokio::task::spawn_blocking(move || store.section(&section)).await??;
+
+    Ok((tagged(&etag), Json(value)))
+}
+
+/// Replace one section; the whole document is checked and written.
+pub async fn write_section(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(section): Path<String>,
+    request: HeaderMap,
+    Json(value): Json<Value>,
+) -> ResponseResult<(HeaderMap, Json<Saved>)> {
+    let generated = generated(&state).await?;
+    let store = state.singbox();
+    let expected = if_match(&request);
+
+    Ok(saved(
+        tokio::task::spawn_blocking(move || {
+            store.write_section(&section, value, expected.as_deref(), &generated)
+        })
+        .await??,
+    ))
+}
+
+/// Remove one section.
+pub async fn delete_section(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(section): Path<String>,
+    request: HeaderMap,
+) -> ResponseResult<(HeaderMap, Json<Saved>)> {
+    let generated = generated(&state).await?;
+    let store = state.singbox();
+    let expected = if_match(&request);
+
+    Ok(saved(
+        tokio::task::spawn_blocking(move || {
+            store.remove_section(&section, expected.as_deref(), &generated)
+        })
+        .await??,
+    ))
+}
+
+/// One entry of an array section, by its tag.
+pub async fn entry(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path((section, tag)): Path<(String, String)>,
+) -> ResponseResult<(HeaderMap, Json<Value>)> {
+    let store = state.singbox();
+    let (value, etag) = tokio::task::spawn_blocking(move || store.entry(&section, &tag)).await??;
+
+    Ok((tagged(&etag), Json(value)))
+}
+
+/// Put one entry of an array section under its tag.
+pub async fn write_entry(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path((section, tag)): Path<(String, String)>,
+    request: HeaderMap,
+    Json(value): Json<Value>,
+) -> ResponseResult<(HeaderMap, Json<Saved>)> {
+    let generated = generated(&state).await?;
+    let store = state.singbox();
+    let expected = if_match(&request);
+
+    Ok(saved(
+        tokio::task::spawn_blocking(move || {
+            store.write_entry(&section, &tag, value, expected.as_deref(), &generated)
+        })
+        .await??,
+    ))
+}
+
+/// Remove one entry of an array section.
+pub async fn delete_entry(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path((section, tag)): Path<(String, String)>,
+    request: HeaderMap,
+) -> ResponseResult<(HeaderMap, Json<Saved>)> {
+    let generated = generated(&state).await?;
+    let store = state.singbox();
+    let expected = if_match(&request);
+
+    Ok(saved(
+        tokio::task::spawn_blocking(move || {
+            store.remove_entry(&section, &tag, expected.as_deref(), &generated)
+        })
+        .await??,
+    ))
 }
 
 /// A version, as this instance knows it.
@@ -534,7 +662,12 @@ mod version_view_tests {
         let dirs = Dirs::new(root.join("data"));
         std::fs::create_dir_all(dirs.version(&version)).unwrap();
         std::fs::write(dirs.metadata(&version), "{}").unwrap();
-        suba_singbox::install::set_current(&dirs, &version).unwrap();
+        store
+            .write_settings(&Settings {
+                version: Some(version.clone()),
+                collections: Vec::new(),
+            })
+            .unwrap();
 
         assert!(store.start(&[]).is_err());
         // A broken record is reported as an error rather than used as a view.
@@ -906,12 +1039,9 @@ pub async fn references(
     State(state): State<AppState>,
     _auth: Authenticated,
 ) -> ResponseResult<Json<References>> {
+    let generated = generated(&state).await?;
     let store = state.singbox();
-
-    // Nothing is contributed by collections yet: which collections feed a
-    // configuration is an open decision (the requirements' §9.9), and until it
-    // is made a configuration is what the operator wrote.
-    let tags = tokio::task::spawn_blocking(move || store.references(&[])).await??;
+    let tags = tokio::task::spawn_blocking(move || store.references(&generated)).await??;
 
     Ok(Json(References {
         tags,

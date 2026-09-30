@@ -1,37 +1,84 @@
-//! The sing-box module as the server uses it: the fragments an operator wrote,
-//! the configuration assembled from them, and the process running it.
+//! The sing-box module as the server uses it: the operator's settings and
+//! configuration, the configuration assembled from them, and the process
+//! running it.
+//!
+//! Three documents, three owners. `config/sing-box.<ext>` is the module's
+//! settings (which version runs, which collections contribute outbounds);
+//! `config/sing-box/config.json` is the configuration the operator wrote, one
+//! document, edited whole or a section or an entry at a time; and
+//! `data/sing-box/config/config.json` is what a start assembled from both, which
+//! is ours to overwrite.
 //!
 //! File and process operations run on the blocking pool. Release fetching is
 //! asynchronous; one in-memory cache shared by the releases route and install
 //! preflight keeps concurrent requests from hitting the upstream separately.
 //! The process itself outlives any single request.
 //!
-//! **The order a start keeps.** The fragments are read, assembled, checked
+//! **The order a start keeps.** The document is read, assembled, checked
 //! against the schema of the version that will run them, written out, and only
 //! then is a process started. A configuration that does not hold up is refused
 //! with the field it is about, and a core that is already serving is never
 //! touched by one — which is what makes "restart" safe to offer.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use suba_singbox::assemble::{self, Assembled, Tag};
 use suba_singbox::core::{self, Asset, Dirs, Metadata, Release, Version};
 use suba_singbox::install::{self, Generate};
 use suba_singbox::run::{self, Runner, Status};
-use suba_singbox::schema::{Schema, Verdict};
+use suba_singbox::schema::{Schema, Skipped, Verdict};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{error::Error, fs};
 
-/// The directory the operator's fragments live in, under the config directory.
-const FRAGMENTS: &str = "sing-box";
+/// The directory the operator's configuration lives in, under the config
+/// directory.
+const DOCUMENT_DIR: &str = "sing-box";
 
-/// What a fragment's file name ends in.
-const EXTENSION: &str = "json";
+/// The operator's configuration, one document.
+const DOCUMENT: &str = "config.json";
+
+/// The module's settings, beside the server's own in the config directory.
+pub(crate) const SETTINGS_BASENAME: &str = "sing-box";
+
+/// What the operator chose for the module.
+///
+/// Kept out of the server's `config` document because it is changed through
+/// the API at any time and only exists in a build that runs a core, and out of
+/// the sing-box configuration because the core refuses a field it does not know.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct Settings {
+    /// The version that runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<Version>,
+    /// The collections whose nodes become outbounds, in this order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<String>,
+}
+
+/// The operator's configuration, and the tag it is addressed by.
+pub(crate) struct Document {
+    pub value: Value,
+    /// The sha256 of the bytes on disk: what `If-Match` has to name.
+    pub etag: String,
+}
+
+/// What a write left behind.
+#[derive(Debug, Serialize)]
+pub(crate) struct Saved {
+    #[serde(skip)]
+    pub etag: String,
+    /// What the schema could not check.
+    pub unchecked: Vec<Skipped>,
+    /// References that do not resolve yet: saved anyway, refused at start.
+    pub warnings: Vec<String>,
+}
 
 /// The assembled configuration, named as the core is pointed at it.
 pub(crate) const CONFIG: &str = "config.json";
@@ -108,9 +155,10 @@ fn runtime_failure(error: &Error) -> &'static str {
 
 /// The sing-box module.
 pub(crate) struct SingboxStore {
-    /// `<config>/sing-box`: one file per section, which this server writes but
-    /// never rewrites on its own.
-    fragment_dir: PathBuf,
+    /// The config directory, which the settings live in.
+    config_dir: PathBuf,
+    /// `<config>/sing-box`, which the operator's configuration lives in.
+    document_dir: PathBuf,
     /// The module's own directories under the data directory.
     dirs: Dirs,
     /// The instance's HTTP client, which fetching a release goes through.
@@ -128,6 +176,9 @@ pub(crate) struct SingboxStore {
     schemas: Mutex<Option<(String, Arc<Schema>)>>,
     installs: Mutex<HashMap<Version, InstallationTask>>,
     selection: Mutex<()>,
+    /// Held across read, check and write, so an `If-Match` answers for the
+    /// document it is compared with.
+    writing: Mutex<()>,
     phase: Mutex<Option<RuntimePhase>>,
     failed_version: Mutex<Option<Version>>,
 }
@@ -135,7 +186,8 @@ pub(crate) struct SingboxStore {
 impl SingboxStore {
     pub(crate) fn new(config_dir: &Path, data_dir: &Path, http: reqwest::Client) -> Self {
         Self {
-            fragment_dir: config_dir.join(FRAGMENTS),
+            config_dir: config_dir.to_path_buf(),
+            document_dir: config_dir.join(DOCUMENT_DIR),
             dirs: Dirs::new(data_dir),
             http,
             releases: AsyncMutex::new(None),
@@ -144,6 +196,7 @@ impl SingboxStore {
             schemas: Mutex::new(None),
             installs: Mutex::new(HashMap::new()),
             selection: Mutex::new(()),
+            writing: Mutex::new(()),
             phase: Mutex::new(None),
             failed_version: Mutex::new(None),
         }
@@ -207,8 +260,10 @@ impl SingboxStore {
     /// Make the first installed version current, without replacing a choice.
     fn select_if_empty(&self, version: &Version) -> Result<(), Error> {
         let _selection = self.selection.lock().expect("current selection");
-        if self.current()?.is_none() {
-            self.write_current(version)?;
+        let mut settings = self.settings()?;
+        if settings.version.is_none() {
+            settings.version = Some(version.clone());
+            self.write_settings(&settings)?;
         }
         Ok(())
     }
@@ -225,90 +280,271 @@ impl SingboxStore {
         self.failed_version.lock().expect("failed version").clone()
     }
 
-    /// The fragments the operator wrote, one per section.
-    ///
-    /// A name that is not a section is refused rather than politely skipped: a
-    /// file put here to matter, which silently does not, is the failure mode
-    /// this whole module is written against. A name starting with a dot is this
-    /// server's own half-written file and is not the operator's business.
-    pub(crate) fn fragments(&self) -> Result<BTreeMap<String, Vec<u8>>, Error> {
-        let listing = match std::fs::read_dir(&self.fragment_dir) {
-            Ok(listing) => listing,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(BTreeMap::new())
-            }
-            Err(error) => {
-                return Err(Error::Io(error));
-            }
+    /// The operator's configuration, as it is on disk; an empty one when none
+    /// has been written.
+    pub(crate) fn document(&self) -> Result<Document, Error> {
+        let text = fs::read_to_string(&self.document_dir, DOCUMENT)?;
+        let value = match &text {
+            Some(text) => serde_json::from_str(text).map_err(|error| {
+                Error::Document(format!(
+                    "{DOCUMENT_DIR}/{DOCUMENT}: not JSON (line {}, column {})",
+                    error.line(),
+                    error.column()
+                ))
+            })?,
+            None => Value::Object(Map::new()),
         };
 
-        let mut fragments = BTreeMap::new();
-        for entry in listing {
-            let name = entry?.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-
-            let Some(section) = name.strip_suffix(&format!(".{EXTENSION}")) else {
-                return Err(Error::Fragment {
-                    name,
-                    reason: "a fragment is one section, named <section>.json",
-                });
-            };
-
-            let Some(text) = fs::read_to_string(&self.fragment_dir, &name)? else {
-                continue;
-            };
-
-            fragments.insert(section.to_string(), text.into_bytes());
-        }
-
-        Ok(fragments)
+        Ok(Document {
+            value,
+            etag: core::sha256_hex(text.unwrap_or_default().as_bytes()),
+        })
     }
 
-    /// One section's fragment, as it is on disk.
-    pub(crate) fn fragment(&self, section: &str) -> Result<Option<Value>, Error> {
-        let name = fragment_name(section)?;
+    /// One section of the operator's configuration.
+    pub(crate) fn section(&self, section: &str) -> Result<(Value, String), Error> {
+        let Document { value, etag } = self.document()?;
 
-        match fs::read_to_string(&self.fragment_dir, &name)? {
-            Some(text) => Ok(Some(serde_json::from_str(&text)?)),
-            None => Ok(None),
+        match value.get(section) {
+            Some(found) => Ok((found.clone(), etag)),
+            None => Err(Error::NoSection {
+                section: section.to_string(),
+            }),
         }
     }
 
-    /// Write one section's fragment, once the schema has taken it.
+    /// One entry of an array section, by its tag.
+    pub(crate) fn entry(&self, section: &str, tag: &str) -> Result<(Value, String), Error> {
+        let Document { value, etag } = self.document()?;
+
+        value
+            .get(section)
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.iter().find(|entry| tag_of(entry) == Some(tag)))
+            .map(|found| (found.clone(), etag))
+            .ok_or_else(|| Error::NoEntry {
+                section: section.to_string(),
+                tag: tag.to_string(),
+            })
+    }
+
+    /// Replace the whole configuration.
+    pub(crate) fn write_document(
+        &self,
+        value: Value,
+        if_match: Option<&str>,
+        generated: &[Value],
+    ) -> Result<Saved, Error> {
+        self.edit(if_match, generated, |sections| {
+            let Value::Object(replacement) = value else {
+                return Err(Error::Document("a configuration is an object".to_string()));
+            };
+            *sections = replacement;
+
+            Ok(())
+        })
+    }
+
+    /// Replace one section.
+    pub(crate) fn write_section(
+        &self,
+        section: &str,
+        value: Value,
+        if_match: Option<&str>,
+        generated: &[Value],
+    ) -> Result<Saved, Error> {
+        self.edit(if_match, generated, |sections| {
+            sections.insert(section.to_string(), value);
+
+            Ok(())
+        })
+    }
+
+    /// Remove one section.
+    pub(crate) fn remove_section(
+        &self,
+        section: &str,
+        if_match: Option<&str>,
+        generated: &[Value],
+    ) -> Result<Saved, Error> {
+        self.edit(if_match, generated, |sections| {
+            sections
+                .remove(section)
+                .map(drop)
+                .ok_or_else(|| Error::NoSection {
+                    section: section.to_string(),
+                })
+        })
+    }
+
+    /// Put one entry of an array section, replacing the one with its tag.
     ///
-    /// The document is checked as if it were the whole configuration with this
-    /// one section in it, which is what it would be: an unknown section, a wrong
-    /// type or a field this version does not have is refused here, with the
-    /// field path, instead of becoming a core that will not start.
-    pub(crate) fn write_fragment(&self, section: &str, value: &Value) -> Result<Verdict, Error> {
-        let (schema, _) = self.parsed_schema()?;
-
-        // As if it were the whole configuration with this one section in it,
-        // which is what it would be.
-        let mut document = serde_json::Map::new();
-        document.insert(section.to_string(), value.clone());
-        let document = Value::Object(document);
-
-        match schema.validate(&document) {
-            Verdict::Failed(fault) => {
-                Err(Error::Document(format!("{}: {}", fault.path, fault.reason)))
+    /// The tag is the entry's address, so an entry that spells a different one
+    /// is refused rather than moved: renaming is a removal and a write.
+    pub(crate) fn write_entry(
+        &self,
+        section: &str,
+        tag: &str,
+        value: Value,
+        if_match: Option<&str>,
+        generated: &[Value],
+    ) -> Result<Saved, Error> {
+        let Value::Object(mut entry) = value else {
+            return Err(Error::Document(format!(
+                "{section}.{tag}: an entry is an object"
+            )));
+        };
+        match entry.get("tag") {
+            None => {
+                entry.insert("tag".to_string(), Value::String(tag.to_string()));
             }
-            verdict => {
-                let name = fragment_name(section)?;
-                fs::ensure_dir(&self.fragment_dir)?;
-                let body = serde_json::to_vec_pretty(value)?;
-                fs::write_atomic(&self.fragment_dir, &name, body)?;
-
-                Ok(verdict)
+            Some(written) if written.as_str() == Some(tag) => {}
+            Some(_) => {
+                return Err(Error::Document(format!(
+                    "{section}.{tag}: the entry's tag is the one in its path"
+                )))
             }
         }
+        let entry = Value::Object(entry);
+
+        self.edit(if_match, generated, |sections| {
+            let entries = sections
+                .entry(section.to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(entries) = entries else {
+                return Err(Error::Document(format!(
+                    "{section}: the section is an array of entries"
+                )));
+            };
+
+            match entries.iter().position(|held| tag_of(held) == Some(tag)) {
+                Some(index) => entries[index] = entry,
+                None => entries.push(entry),
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Remove one entry of an array section.
+    pub(crate) fn remove_entry(
+        &self,
+        section: &str,
+        tag: &str,
+        if_match: Option<&str>,
+        generated: &[Value],
+    ) -> Result<Saved, Error> {
+        self.edit(if_match, generated, |sections| {
+            let index = sections
+                .get(section)
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.iter().position(|held| tag_of(held) == Some(tag)));
+
+            match (index, sections.get_mut(section)) {
+                (Some(index), Some(Value::Array(entries))) => {
+                    entries.remove(index);
+
+                    Ok(())
+                }
+                _ => Err(Error::NoEntry {
+                    section: section.to_string(),
+                    tag: tag.to_string(),
+                }),
+            }
+        })
+    }
+
+    /// Read, change, check the whole document, write it once.
+    ///
+    /// The whole document is checked, not the part that changed: a section is
+    /// valid or not as part of the configuration it sits in. References are
+    /// checked too, but only reported — the operator may write a selector before
+    /// the outbounds it names — and a start refuses what is still dangling.
+    fn edit(
+        &self,
+        if_match: Option<&str>,
+        generated: &[Value],
+        change: impl FnOnce(&mut Map<String, Value>) -> Result<(), Error>,
+    ) -> Result<Saved, Error> {
+        let _writing = self.writing.lock().expect("the configuration");
+        let Document { value, etag } = self.document()?;
+
+        if if_match.is_some_and(|expected| expected != etag) {
+            return Err(Error::Stale);
+        }
+
+        let Value::Object(mut sections) = value else {
+            return Err(Error::Document("a configuration is an object".to_string()));
+        };
+        change(&mut sections)?;
+        let value = Value::Object(sections);
+
+        let (schema, _) = self.parsed_schema()?;
+        let verdict = match schema.validate(&value) {
+            Verdict::Failed(fault) => {
+                return Err(Error::Document(format!("{}: {}", fault.path, fault.reason)))
+            }
+            verdict => verdict,
+        };
+
+        let body = serde_json::to_vec_pretty(&value)?;
+        fs::ensure_dir(&self.document_dir)?;
+        fs::write_atomic(&self.document_dir, DOCUMENT, &body)?;
+
+        let warnings = match assemble::assemble(&value, generated) {
+            Ok(_) => Vec::new(),
+            Err(unfit) => vec![unfit.to_string()],
+        };
+
+        Ok(Saved {
+            etag: core::sha256_hex(&body),
+            unchecked: verdict.skipped().to_vec(),
+            warnings,
+        })
+    }
+
+    /// The module's settings; the defaults when none have been written.
+    pub(crate) fn settings(&self) -> Result<Settings, Error> {
+        Ok(crate::config::read_config(
+            &self.config_dir.to_string_lossy(),
+            SETTINGS_BASENAME,
+        )?)
+    }
+
+    /// Replace the module's settings.
+    ///
+    /// A version that is not installed is refused; a collection that does not
+    /// exist is not, because a collection may be written after the settings
+    /// that name it, and a start says which one is missing.
+    pub(crate) fn set_settings(&self, settings: &Settings) -> Result<(), Error> {
+        let _selection = self.selection.lock().expect("current selection");
+
+        if let Some(version) = &settings.version {
+            if !self.dirs.metadata(version).exists() {
+                return Err(Error::Singbox(suba_singbox::core::Error::NotInstalled {
+                    version: version.clone(),
+                }));
+            }
+        }
+
+        self.write_settings(settings)
+    }
+
+    pub(crate) fn write_settings(&self, settings: &Settings) -> Result<(), Error> {
+        let path = crate::config::config_path(&self.config_dir, SETTINGS_BASENAME);
+        let body = crate::config::codec::encode(settings, &path)?;
+        fs::ensure_dir(&self.config_dir)?;
+
+        Ok(fs::write_atomic(
+            &self.config_dir,
+            &crate::config::config_name(SETTINGS_BASENAME),
+            body,
+        )?)
     }
 
     /// The version in use, when there is one.
     pub(crate) fn current(&self) -> Result<Option<Version>, Error> {
-        Ok(suba_singbox::install::current(&self.dirs)?)
+        Ok(self.settings()?.version)
     }
 
     /// The versions this machine has.
@@ -450,17 +686,11 @@ impl SingboxStore {
             }));
         }
 
-        Ok(install::uninstall(&self.dirs, version)?)
-    }
-
-    /// Make an installed version the one in use.
-    pub(crate) fn set_current(&self, version: &Version) -> Result<(), Error> {
-        let _selection = self.selection.lock().expect("current selection");
-        self.write_current(version)
-    }
-
-    fn write_current(&self, version: &Version) -> Result<(), Error> {
-        Ok(install::set_current(&self.dirs, version)?)
+        Ok(install::uninstall(
+            &self.dirs,
+            version,
+            self.current()?.as_ref(),
+        )?)
     }
 
     /// Ask the version in use for something it generates.
@@ -493,11 +723,11 @@ impl SingboxStore {
 
     /// The tags a form can offer as references.
     ///
-    /// Read from the document the fragments make, without requiring it to hold
-    /// up: the operator is still writing it, and the tags that exist so far are
-    /// exactly what the next field needs.
+    /// Read from the document and the generated outbounds, without requiring it
+    /// to hold up: the operator is still writing it, and the tags that exist so
+    /// far are exactly what the next field needs.
     pub(crate) fn references(&self, generated: &[Value]) -> Result<Vec<Tag>, Error> {
-        let document = assemble::document(&self.fragments()?, generated)
+        let document = assemble::document(&self.document()?.value, generated)
             .map_err(|unfit| Error::Document(unfit.to_string()))?;
 
         assemble::tags(&document).map_err(|unfit| Error::Document(unfit.to_string()))
@@ -525,10 +755,10 @@ impl SingboxStore {
         Ok((schema, file.body))
     }
 
-    /// The configuration the core would run: the fragments, and whatever a
-    /// collection contributed.
+    /// The configuration the core would run: the operator's, and whatever the
+    /// collections contributed.
     pub(crate) fn assemble(&self, generated: &[Value]) -> Result<Assembled, Error> {
-        assemble::assemble(&self.fragments()?, generated)
+        assemble::assemble(&self.document()?.value, generated)
             .map_err(|unfit| Error::Document(unfit.to_string()))
     }
 
@@ -626,21 +856,9 @@ impl SingboxStore {
     }
 }
 
-/// The file name a section's fragment has, refusing a name that is not one.
-fn fragment_name(section: &str) -> Result<String, Error> {
-    let usable = !section.is_empty()
-        && !section.contains(['/', '\\', '\0'])
-        && section != "."
-        && section != "..";
-
-    if !usable {
-        return Err(Error::Fragment {
-            name: section.to_string(),
-            reason: "a section is named by a plain word",
-        });
-    }
-
-    Ok(format!("{section}.{EXTENSION}"))
+/// The tag an entry is addressed by.
+fn tag_of(entry: &Value) -> Option<&str> {
+    entry.get("tag").and_then(Value::as_str)
 }
 
 #[cfg(test)]
@@ -766,7 +984,8 @@ mod tests {
         let schema = serde_json::json!({
             "type": "object",
             "properties": {
-                "log": { "type": "object", "properties": { "level": { "type": "string" } } }
+                "log": { "type": "object", "properties": { "level": { "type": "string" } } },
+                "outbounds": { "type": "array", "items": { "type": "object" } }
             },
             "additionalProperties": false,
             "$defs": {
@@ -837,7 +1056,12 @@ mod tests {
             1_700_000_000,
         )
         .expect("an install");
-        suba_singbox::install::set_current(&store.dirs, &version).expect("a current version");
+        store
+            .set_settings(&Settings {
+                version: Some(version),
+                collections: Vec::new(),
+            })
+            .expect("a current version");
 
         (scratch, store)
     }
@@ -938,25 +1162,13 @@ mod tests {
         assert_eq!(store.current().unwrap(), Some(version));
     }
 
+    /// The document is checked whole before it is written, and a refusal
+    /// leaves the file as it was.
     #[test]
-    fn a_fragment_that_is_not_a_section_is_refused() {
-        let (_scratch, store) = store();
-        std::fs::create_dir_all(&store.fragment_dir).expect("the fragments directory");
-        std::fs::write(store.fragment_dir.join("notes.txt"), "hello").expect("a file");
-
-        assert!(matches!(
-            store.fragments(),
-            Err(Error::Fragment { name, reason })
-                if name == "notes.txt" && reason == "a fragment is one section, named <section>.json"
-        ));
-    }
-
-    #[test]
-    fn a_fragment_is_checked_before_it_is_written() {
+    fn a_section_is_checked_as_part_of_the_whole_document() {
         let (_scratch, store) = store();
 
-        let refused = store.write_fragment("bogus", &serde_json::json!({}));
-
+        let refused = store.write_section("bogus", serde_json::json!({}), None, &[]);
         assert!(
             matches!(
                 &refused,
@@ -965,25 +1177,161 @@ mod tests {
             ),
             "{refused:?}"
         );
-        assert!(!store.fragment_dir.join("bogus.json").exists());
+        assert!(!store.document_dir.join(DOCUMENT).exists());
 
-        let verdict = store
-            .write_fragment("log", &serde_json::json!({ "level": "info" }))
-            .expect("a fragment");
-        assert_eq!(verdict, Verdict::Ok);
-
+        let saved = store
+            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .expect("a section");
+        assert!(saved.unchecked.is_empty());
         assert_eq!(
-            store.fragment("log").expect("a fragment"),
-            Some(serde_json::json!({ "level": "info" }))
+            store.section("log").expect("a section").0,
+            serde_json::json!({ "level": "info" })
         );
+        assert_eq!(saved.etag, store.document().unwrap().etag);
+    }
+
+    /// A write that names the document it read is refused once someone else
+    /// has written since.
+    #[test]
+    fn a_write_against_a_stale_etag_is_refused() {
+        let (_scratch, store) = store();
+        let before = store.document().unwrap().etag;
+
+        let saved = store
+            .write_section(
+                "log",
+                serde_json::json!({ "level": "info" }),
+                Some(&before),
+                &[],
+            )
+            .expect("a write against the current document");
+
+        assert!(matches!(
+            store.write_section(
+                "log",
+                serde_json::json!({ "level": "warn" }),
+                Some(&before),
+                &[]
+            ),
+            Err(Error::Stale)
+        ));
+        assert_eq!(
+            store.section("log").unwrap().0,
+            serde_json::json!({ "level": "info" }),
+            "the refused write changed nothing"
+        );
+        assert!(store
+            .write_section(
+                "log",
+                serde_json::json!({ "level": "warn" }),
+                Some(&saved.etag),
+                &[]
+            )
+            .is_ok());
+    }
+
+    /// An entry is addressed by its tag: written in place, added when new,
+    /// removed alone.
+    #[test]
+    fn an_entry_is_edited_by_its_tag() {
+        let (_scratch, store) = store();
+        let direct = |tag: &str| serde_json::json!({ "type": "direct", "tag": tag });
+
+        store
+            .write_section(
+                "outbounds",
+                serde_json::json!([direct("a"), direct("b")]),
+                None,
+                &[],
+            )
+            .unwrap();
+        store
+            .write_entry(
+                "outbounds",
+                "c",
+                serde_json::json!({ "type": "direct" }),
+                None,
+                &[],
+            )
+            .unwrap();
+        store
+            .write_entry("outbounds", "a", direct("a"), None, &[])
+            .unwrap();
+
+        let tags = |store: &SingboxStore| -> Vec<String> {
+            store
+                .section("outbounds")
+                .unwrap()
+                .0
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["tag"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(tags(&store), ["a", "b", "c"]);
+        assert_eq!(store.entry("outbounds", "c").unwrap().0, direct("c"));
+
+        assert!(matches!(
+            store.write_entry("outbounds", "a", direct("renamed"), None, &[]),
+            Err(Error::Document(_))
+        ));
+
+        store.remove_entry("outbounds", "b", None, &[]).unwrap();
+        assert_eq!(tags(&store), ["a", "c"]);
+        assert!(matches!(
+            store.remove_entry("outbounds", "b", None, &[]),
+            Err(Error::NoEntry { .. })
+        ));
+    }
+
+    /// A reference that does not resolve yet is saved and reported; the start
+    /// is what refuses it.
+    #[test]
+    fn a_dangling_reference_is_a_warning_when_saved() {
+        let (_scratch, store) = store();
+
+        let saved = store
+            .write_section(
+                "outbounds",
+                serde_json::json!([{ "type": "selector", "tag": "s", "outbounds": ["gone"] }]),
+                None,
+                &[],
+            )
+            .expect("saved anyway");
+
+        assert_eq!(saved.warnings.len(), 1, "{:?}", saved.warnings);
+        assert!(saved.warnings[0].contains("gone"), "{:?}", saved.warnings);
+    }
+
+    /// The settings are the operator's file in the config directory, and the
+    /// version they name is the one in use.
+    #[test]
+    fn the_version_in_use_is_the_one_the_settings_name() {
+        let (scratch, store) = store();
+
+        assert_eq!(store.current().unwrap(), Some(Version::from_tag("1.14.2")));
+        assert!(crate::config::config_path(scratch.0.join("config"), SETTINGS_BASENAME).is_file());
+        assert!(!store.dirs.root.join("current.json").exists());
+
+        assert!(matches!(
+            store.set_settings(&Settings {
+                version: Some(Version::from_tag("1.99.0")),
+                collections: Vec::new(),
+            }),
+            Err(Error::Singbox(
+                suba_singbox::core::Error::NotInstalled { .. }
+            ))
+        ));
+        assert_eq!(store.current().unwrap(), Some(Version::from_tag("1.14.2")));
     }
 
     #[test]
     fn the_assembled_configuration_lands_where_the_core_is_pointed() {
         let (_scratch, store) = store();
         store
-            .write_fragment("log", &serde_json::json!({ "level": "warn" }))
-            .expect("a fragment");
+            .write_section("log", serde_json::json!({ "level": "warn" }), None, &[])
+            .expect("a section");
 
         let generated = vec![serde_json::json!({ "type": "direct", "tag": "node 1" })];
         let assembled = store.assemble(&generated).expect("an assembly");
@@ -1048,20 +1396,23 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_fragment_stops_a_start_and_leaves_the_product_alone() {
+    fn a_broken_document_stops_a_start_and_leaves_the_product_alone() {
         let (_scratch, store) = store();
         store
-            .write_fragment("log", &serde_json::json!({ "level": "info" }))
-            .expect("a fragment");
+            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .expect("a section");
         store.assemble(&[]).expect("an assembly");
         let assembled = store.assemble(&[]).expect("an assembly");
         store.write_product(&assembled.config).expect("a product");
         let before = std::fs::read(store.dirs.config().join(CONFIG)).expect("the configuration");
 
-        // A fragment the schema refuses, written by hand: the one way to get one
-        // past `write_fragment`, and what a start has to survive.
-        std::fs::write(store.fragment_dir.join("log.json"), r#"{"level": 7}"#)
-            .expect("a broken fragment");
+        // A document the schema refuses, written by hand: the one way to get
+        // one past `edit`, and what a start has to survive.
+        std::fs::write(
+            store.document_dir.join(DOCUMENT),
+            r#"{"log": {"level": 7}}"#,
+        )
+        .expect("a broken document");
 
         let refused = store.start(&[]);
 
@@ -1095,18 +1446,21 @@ mod tests {
     /// running. A start that would reload a broken configuration is refused, and
     /// the process that is serving keeps serving.
     #[test]
-    fn a_broken_fragment_leaves_the_running_core_alone() {
+    fn a_broken_document_leaves_the_running_core_alone() {
         let (_scratch, store) = store();
         store
-            .write_fragment("log", &serde_json::json!({ "level": "info" }))
-            .expect("a fragment");
+            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .expect("a section");
 
         let pid = store.start(&[]).expect("a start");
         wait_for(&store, "started");
 
-        // The one way to get a broken fragment past `write_fragment`.
-        std::fs::write(store.fragment_dir.join("log.json"), r#"{"level": 7}"#)
-            .expect("a broken fragment");
+        // The one way to get a broken document past `edit`.
+        std::fs::write(
+            store.document_dir.join(DOCUMENT),
+            r#"{"log": {"level": 7}}"#,
+        )
+        .expect("a broken document");
 
         let refused = store.start(&[]);
 
@@ -1124,8 +1478,8 @@ mod tests {
     fn the_core_runs_and_stops_one_at_a_time() {
         let (_scratch, store) = store();
         store
-            .write_fragment("log", &serde_json::json!({ "level": "info" }))
-            .expect("a fragment");
+            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .expect("a section");
 
         let pid = store.start(&[]).expect("a start");
         assert!(pid > 0);
@@ -1174,7 +1528,12 @@ mod tests {
             1_700_000_000,
         )
         .expect("an installed core");
-        store.set_current(&version).expect("a current version");
+        store
+            .set_settings(&Settings {
+                version: Some(version),
+                collections: Vec::new(),
+            })
+            .expect("a current version");
 
         store.start(&[]).expect("a start");
         wait_for(&store, "started");

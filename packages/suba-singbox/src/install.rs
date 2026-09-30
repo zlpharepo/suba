@@ -20,7 +20,6 @@
 //! a URL up on its own or reads a clock, so every one of these can be exercised
 //! without a network and at a fixed time.
 
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -38,12 +37,6 @@ const LICENSE: &str = "LICENSE";
 /// A released archive for one platform is tens of megabytes; the cap is what
 /// keeps a mistyped URL or a hostile answer from filling memory.
 pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
-
-/// What `current.json` holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Current {
-    version: Version,
-}
 
 /// Install a version from the bytes of its release archive.
 ///
@@ -216,69 +209,18 @@ pub fn installed(dirs: &Dirs) -> Result<Vec<Metadata>, Error> {
     Ok(versions)
 }
 
-/// Which version is current, when one is.
-pub fn current(dirs: &Dirs) -> Result<Option<Version>, Error> {
-    let bytes = match fs::read(dirs.current()) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Error::Files {
-                at: "the current version",
-                reason: reason_of(&error),
-            })
-        }
-    };
-
-    let current: Current = serde_json::from_slice(&bytes).map_err(|_| Error::Record {
-        version: "current".to_string(),
-        reason: "the current version is not a record",
-    })?;
-
-    Ok(Some(current.version))
-}
-
-/// Make an installed version the current one.
-///
-/// Written beside the file it replaces and renamed onto it, so a reader finds
-/// either the version that was current or the one that is: a half-written file
-/// would make the whole record unreadable.
-pub fn set_current(dirs: &Dirs, version: &Version) -> Result<(), Error> {
-    if !dirs.metadata(version).exists() {
-        return Err(Error::NotInstalled {
-            version: version.clone(),
-        });
-    }
-
-    let record = serde_json::to_vec_pretty(&Current {
-        version: version.clone(),
-    })
-    .map_err(|_| Error::Files {
-        at: "the current version",
-        reason: "it does not serialise",
-    })?;
-
-    let staging = dirs
-        .current()
-        .with_extension(format!("{}.staging", std::process::id()));
-    write(&staging, &record, false)?;
-    fs::rename(&staging, dirs.current()).map_err(|error| Error::Files {
-        at: "the current version",
-        reason: reason_of(&error),
-    })
-}
-
 /// Remove an installed version.
 ///
-/// The current version is refused: whichever version is being run, it is the one
-/// a machine falls back to, so removing it is a decision a caller has to make
-/// explicitly by switching first.
-pub fn uninstall(dirs: &Dirs, version: &Version) -> Result<(), Error> {
+/// Which version is in use is the caller's record, not this crate's; it passes
+/// that version as `current`, and removing it is refused: the version a machine
+/// falls back to is taken away only after switching.
+pub fn uninstall(dirs: &Dirs, version: &Version, current: Option<&Version>) -> Result<(), Error> {
     if !dirs.metadata(version).exists() {
         return Err(Error::NotInstalled {
             version: version.clone(),
         });
     }
-    if current(dirs)?.as_ref() == Some(version) {
+    if current == Some(version) {
         return Err(Error::Current {
             version: version.clone(),
         });
@@ -1086,42 +1028,22 @@ mod tests {
     }
 
     #[test]
-    fn the_current_version_is_the_one_that_was_set() {
-        let (_root, dirs) = dirs();
-        let version = Version::from_tag("v1.14.2");
-
-        assert_eq!(current(&dirs).expect("a look"), None);
-
-        install_one(&dirs, "v1.14.2");
-        set_current(&dirs, &version).expect("a current version");
-
-        assert_eq!(current(&dirs).expect("a look"), Some(version));
-    }
-
-    #[test]
-    fn a_version_that_is_not_installed_cannot_be_made_current() {
-        let (_root, dirs) = dirs();
-        let version = Version::from_tag("v1.14.2");
-
-        assert_eq!(
-            set_current(&dirs, &version),
-            Err(Error::NotInstalled { version })
-        );
-    }
-
-    #[test]
     fn the_current_version_is_not_removable() {
         let (_root, dirs) = dirs();
         let version = Version::from_tag("v1.14.2");
         install_one(&dirs, "v1.14.2");
-        set_current(&dirs, &version).expect("a current version");
 
-        assert_eq!(uninstall(&dirs, &version), Err(Error::Current { version }));
+        assert_eq!(
+            uninstall(&dirs, &version, Some(&version)),
+            Err(Error::Current {
+                version: version.clone()
+            })
+        );
         assert!(dirs.version(&Version::from_tag("v1.14.2")).exists());
 
         // And the other one is.
         install_one(&dirs, "v1.13.9");
-        uninstall(&dirs, &Version::from_tag("v1.13.9")).expect("a removal");
+        uninstall(&dirs, &Version::from_tag("v1.13.9"), Some(&version)).expect("a removal");
         assert_eq!(installed(&dirs).expect("the installed versions").len(), 1);
     }
 }

@@ -566,6 +566,40 @@ mod artifact_tests {
 
         assert_eq!(before.unwrap(), after.unwrap(), "two renders add no files");
     }
+
+    /// The collections a sing-box configuration names contribute their nodes as
+    /// tagged outbounds, once each, and a name nothing answers to is an error.
+    #[cfg(all(feature = "singbox", feature = "singbox-core"))]
+    #[tokio::test]
+    async fn chosen_collections_contribute_their_nodes_once() {
+        let state = state().await;
+        inline(
+            &state,
+            "alpha",
+            &format!(
+                "{}{}",
+                link("alpha.example.com", "US-01"),
+                link("beta.example.com", "JP-01")
+            ),
+        )
+        .await;
+        collection(&state, "main", &["alpha"], Format::Links).await;
+        collection(&state, "again", &["alpha"], Format::Links).await;
+
+        let outbounds = outbounds_of(&state, &["main".to_string(), "again".to_string()])
+            .await
+            .unwrap();
+        let tags: Vec<&str> = outbounds
+            .iter()
+            .map(|outbound| outbound["tag"].as_str().unwrap())
+            .collect();
+        assert_eq!(tags, ["US-01", "JP-01"]);
+
+        assert!(matches!(
+            outbounds_of(&state, &["missing".to_string()]).await,
+            Err(Error::CollectionNotFound(name)) if name == "missing"
+        ));
+    }
 }
 
 async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
@@ -617,6 +651,64 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
         orphans: resolved.orphans,
         unresolved: resolved.unresolved,
     })
+}
+
+/// The outbounds the named collections contribute to a sing-box configuration,
+/// in the order the collections are named.
+///
+/// A collection that does not exist is an error naming it: an empty
+/// contribution would look like a collection that serves nothing.
+#[cfg(all(feature = "singbox", feature = "singbox-core"))]
+pub(crate) async fn outbounds_of(
+    state: &AppState,
+    names: &[String],
+) -> Result<Vec<serde_json::Value>, Error> {
+    let observations = state.providers().observations().await?;
+    let declared = state.providers().formats().await;
+    let index = NodeIndex::from_observations(observations.iter().map(|(name, observation)| {
+        (
+            name.as_str(),
+            declared
+                .get(name)
+                .copied()
+                .unwrap_or(suba_core::subscription::DeclaredFormat::Links),
+            observation,
+        )
+    }));
+
+    let mut nodes: Vec<&IndexEntry> = Vec::new();
+    for name in names {
+        let collection = state
+            .collections()
+            .get(name)
+            .await
+            .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
+        let resolved = collection.resolve(
+            &index,
+            &provider_filters(state, &collection).await?,
+            &collection.filter()?,
+            View::default(),
+        );
+
+        // A node two collections share is one outbound, not a duplicate tag.
+        for entry in resolved.nodes {
+            if !nodes.iter().any(|held| held.id == entry.id) {
+                nodes.push(entry);
+            }
+        }
+    }
+
+    Ok(suba_core::outbounds(&nodes).0)
+}
+
+/// A build that cannot render sing-box documents contributes no outbounds: the
+/// core runs what the operator wrote.
+#[cfg(all(feature = "singbox-core", not(feature = "singbox")))]
+pub(crate) async fn outbounds_of(
+    _state: &AppState,
+    _names: &[String],
+) -> Result<Vec<serde_json::Value>, Error> {
+    Ok(Vec::new())
 }
 
 /// The compiled filter of every provider the collection names.

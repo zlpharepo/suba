@@ -554,11 +554,6 @@ impl Dirs {
         self.version(version).join("metadata.json")
     }
 
-    /// The version currently in use.
-    pub fn current(&self) -> PathBuf {
-        self.root.join("current.json")
-    }
-
     /// Where the configuration sing-box is run with is assembled.
     pub fn config(&self) -> PathBuf {
         self.root.join("config")
@@ -766,7 +761,6 @@ mod tests {
             dirs.metadata(&version),
             Path::new("/data/sing-box/versions/1.14.2/metadata.json")
         );
-        assert_eq!(dirs.current(), Path::new("/data/sing-box/current.json"));
         assert_eq!(dirs.config(), Path::new("/data/sing-box/config"));
         assert_eq!(dirs.work(), Path::new("/data/sing-box/data"));
     }
