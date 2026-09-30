@@ -264,13 +264,13 @@ mod tests {
         state: &AppState,
         name: &str,
         payload: &str,
-        include: &[&str],
-        exclude: &[&str],
+        includes: &[&str],
+        excludes: &[&str],
     ) {
         let provider = Provider::Inline(Inline {
             shared: SharedFields {
-                include: include.iter().map(|pattern| pattern.to_string()).collect(),
-                exclude: exclude.iter().map(|pattern| pattern.to_string()).collect(),
+                includes: includes.iter().map(|pattern| pattern.to_string()).collect(),
+                excludes: excludes.iter().map(|pattern| pattern.to_string()).collect(),
                 ..SharedFields::default()
             },
             payload: payload.to_string(),

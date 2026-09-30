@@ -150,8 +150,8 @@ mod tests {
 
         let broken = Collection {
             providers: vec!["airport".to_string()],
-            include: vec!["regex:(".to_string()],
-            exclude: Vec::new(),
+            includes: vec!["regex:(".to_string()],
+            excludes: Vec::new(),
         };
 
         assert!(matches!(
@@ -161,6 +161,32 @@ mod tests {
         assert!(store.get("main").await.is_none());
 
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    /// The two lists are written under the names an operator edits.
+    #[tokio::test]
+    async fn the_two_lists_are_written_under_their_own_names() {
+        let dir = scratch("list-names");
+        let store = load(&dir);
+
+        store
+            .insert(
+                "main",
+                Collection {
+                    providers: vec!["airport".to_string()],
+                    includes: vec!["keyword:US".to_string()],
+                    excludes: vec!["keyword:LAX".to_string()],
+                },
+            )
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
+
+        assert!(written.contains("includes"), "{written}");
+        assert!(written.contains("excludes"), "{written}");
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 
     /// A collection naming a provider that does not exist is still stored: what

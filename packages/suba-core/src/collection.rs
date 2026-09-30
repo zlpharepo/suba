@@ -47,12 +47,12 @@ pub struct Collection {
     /// Extra filtering on top of what each provider already does: the provider's
     /// filter is a property of the source, this one of the collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<String>,
+    pub includes: Vec<String>,
 
     /// Nodes to drop, in the same vocabulary. Takes precedence over
-    /// [`include`](Self::include).
+    /// [`includes`](Self::includes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude: Vec<String>,
+    pub excludes: Vec<String>,
 }
 
 impl Collection {
@@ -62,7 +62,7 @@ impl Collection {
     /// is refused where it was typed rather than discovered by a filter that
     /// quietly does less than it says.
     pub fn filter(&self) -> Result<NodeFilter, FilterError> {
-        NodeFilter::compile(&self.include, &self.exclude)
+        NodeFilter::compile(&self.includes, &self.excludes)
     }
 
     /// The nodes this collection serves.
@@ -597,8 +597,8 @@ mod tests {
     fn the_collections_own_filter_is_validated_like_a_providers() {
         let broken = Collection {
             providers: vec!["alpha".to_string()],
-            include: vec!["regex:(".to_string()],
-            exclude: Vec::new(),
+            includes: vec!["regex:(".to_string()],
+            excludes: Vec::new(),
         };
 
         assert!(matches!(broken.filter(), Err(FilterError::Pattern { .. })));

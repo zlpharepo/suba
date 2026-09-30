@@ -78,14 +78,14 @@ pub struct SharedFields {
     /// rather than an empty list — the same reason the optional fields below are
     /// skipped. See [`NodeFilter`] for the vocabulary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub include: Vec<String>,
+    pub includes: Vec<String>,
 
     /// Nodes to drop, in the same vocabulary.
     ///
-    /// Takes precedence over [`include`](Self::include): a node that matches
+    /// Takes precedence over [`includes`](Self::includes): a node that matches
     /// both is dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub exclude: Vec<String>,
+    pub excludes: Vec<String>,
 }
 
 /// Whether a provider is declared to be a plain link list, which is the default.
@@ -100,7 +100,7 @@ impl SharedFields {
     /// cannot be used is refused at the point it is stored rather than
     /// discovered by a filter that quietly does less than it says.
     pub fn filter(&self) -> Result<NodeFilter, FilterError> {
-        NodeFilter::compile(&self.include, &self.exclude)
+        NodeFilter::compile(&self.includes, &self.excludes)
     }
 }
 
@@ -184,7 +184,7 @@ impl Provider {
     #[cfg(test)]
     pub(crate) fn is_none_of_the_optional_fields(&self) -> bool {
         let unfiltered = |shared: &SharedFields| {
-            shared.include.is_empty() && shared.exclude.is_empty() && is_links(&shared.format)
+            shared.includes.is_empty() && shared.excludes.is_empty() && is_links(&shared.format)
         };
 
         match self {
@@ -950,8 +950,8 @@ mod tests {
                 shared: SharedFields {
                     disabled: false,
                     format: DeclaredFormat::Links,
-                    include: vec!["^US".to_string(), "^(HK|TW)$".to_string()],
-                    exclude: vec!["-2x$".to_string()],
+                    includes: vec!["^US".to_string(), "^(HK|TW)$".to_string()],
+                    excludes: vec!["-2x$".to_string()],
                 },
                 ..remote()
             }),
@@ -967,12 +967,18 @@ mod tests {
             panic!("a remote provider comes back remote");
         };
 
-        assert_eq!(remote.shared.include, ["^US", "^(HK|TW)$"]);
-        assert_eq!(remote.shared.exclude, ["-2x$"]);
+        assert_eq!(remote.shared.includes, ["^US", "^(HK|TW)$"]);
+        assert_eq!(remote.shared.excludes, ["-2x$"]);
         assert!(
             !stored.is_none_of_the_optional_fields(),
             "a filter is not nothing"
         );
+
+        // The names the two lists are written under are part of the document,
+        // not an implementation detail: an operator edits these keys.
+        let written = std::fs::read_to_string(config_path(&path, PROVIDERS_BASENAME)).unwrap();
+        assert!(written.contains("includes"), "{written}");
+        assert!(written.contains("excludes"), "{written}");
 
         tokio::fs::remove_dir_all(path).await.unwrap();
     }

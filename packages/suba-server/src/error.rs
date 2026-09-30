@@ -43,7 +43,7 @@ pub enum Error {
 
     /// A provider's node filter cannot be compiled.
     ///
-    /// The text is the field path and a static reason — `include[1]: not a
+    /// The text is the field path and a static reason — `includes[1]: not a
     /// valid regular expression` — so the client is told what to fix without
     /// the pattern being quoted back at it.
     #[error(transparent)]

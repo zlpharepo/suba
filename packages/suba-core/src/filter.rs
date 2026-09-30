@@ -16,11 +16,12 @@
 //! must not turn a name into a pattern: `keyword:` and `regex:` are opt-in.
 //!
 //! Patterns inside one list are alternatives. [`NodeFilter`] holds the two
-//! lists and applies them in one order: exclusion first, then inclusion. A name
-//! the `exclude` list matches is dropped there and then, so a name matching both
-//! lists is out — the lists are written for different reasons (one says what the
-//! operator wants, the other what they never want), and "never" is the one that
-//! has to survive a `keep` pattern that is broader than intended.
+//! lists (`includes`, `excludes` — the names they are written under) and applies
+//! them in one order: exclusion first, then inclusion. A name the `excludes`
+//! list matches is dropped there and then, so a name matching both lists is out
+//! — the lists are written for different reasons (one says what the operator
+//! wants, the other what they never want), and "never" is the one that has to
+//! survive a `keep` pattern that is broader than intended.
 //!
 //! Matching is case-sensitive, as the names are: two nodes differing only in
 //! case are two names, and folding them would make the outcome depend on the
@@ -32,9 +33,9 @@ use regex::{Regex, RegexSet};
 pub struct NodeFilter {
     /// `None` when the operator configured no allowlist, which admits every
     /// name. An empty list is not the same as "match nothing".
-    include: Option<RegexSet>,
+    includes: Option<RegexSet>,
     /// `None` when the operator configured nothing to drop.
-    exclude: Option<RegexSet>,
+    excludes: Option<RegexSet>,
 }
 
 impl NodeFilter {
@@ -44,10 +45,10 @@ impl NodeFilter {
     /// entry: a filter the operator believes is in force and is not would drop
     /// nodes they asked to keep, and the one thing worse than either is not
     /// knowing which happened.
-    pub fn compile(include: &[String], exclude: &[String]) -> Result<Self, FilterError> {
+    pub fn compile(includes: &[String], excludes: &[String]) -> Result<Self, FilterError> {
         Ok(Self {
-            include: compile_set(include, "include")?,
-            exclude: compile_set(exclude, "exclude")?,
+            includes: compile_set(includes, "includes")?,
+            excludes: compile_set(excludes, "excludes")?,
         })
     }
 
@@ -58,21 +59,21 @@ impl NodeFilter {
     /// lists is out. The other order would let "keep" override "drop", which is
     /// the wrong way round for a list of things the operator never wants.
     pub fn admits(&self, name: &str) -> bool {
-        if let Some(exclude) = &self.exclude {
-            if exclude.is_match(name) {
+        if let Some(excludes) = &self.excludes {
+            if excludes.is_match(name) {
                 return false;
             }
         }
 
-        match &self.include {
-            Some(include) => include.is_match(name),
+        match &self.includes {
+            Some(includes) => includes.is_match(name),
             None => true,
         }
     }
 
     /// Whether this filter keeps everything, so a caller can skip it.
     pub fn is_unfiltered(&self) -> bool {
-        self.include.is_none() && self.exclude.is_none()
+        self.includes.is_none() && self.excludes.is_none()
     }
 }
 
@@ -86,8 +87,8 @@ impl std::fmt::Debug for NodeFilter {
         let count = |set: &Option<RegexSet>| set.as_ref().map_or(0, RegexSet::len);
 
         f.debug_struct("NodeFilter")
-            .field("include", &count(&self.include))
-            .field("exclude", &count(&self.exclude))
+            .field("includes", &count(&self.includes))
+            .field("excludes", &count(&self.excludes))
             .finish()
     }
 }
@@ -315,7 +316,7 @@ mod tests {
                 index,
                 reason,
             } => {
-                assert_eq!(*field, "include");
+                assert_eq!(*field, "includes");
                 assert_eq!(*index, 1, "the second pattern");
                 assert!(matches!(reason, PatternReason::Invalid));
             }
@@ -323,7 +324,7 @@ mod tests {
         }
 
         let printed = error.to_string();
-        assert!(printed.contains("include[1]"), "{printed}");
+        assert!(printed.contains("includes[1]"), "{printed}");
         assert!(
             !printed.contains("regex:(") && !printed.contains('('),
             "the operator's own text must not be echoed back: {printed}"
@@ -359,7 +360,7 @@ mod tests {
     fn an_invalid_exclude_pattern_names_the_exclude_list() {
         let error = NodeFilter::compile(&[], &["regex:[".to_string()]).expect_err("unclosed class");
 
-        assert!(error.to_string().starts_with("exclude[0]"), "{error}");
+        assert!(error.to_string().starts_with("excludes[0]"), "{error}");
     }
 
     #[test]
@@ -367,8 +368,8 @@ mod tests {
         let filter = both(&["US-LAX-01"], &["keyword:expired"]);
         let printed = format!("{filter:?}");
 
-        assert!(printed.contains("include: 1"), "{printed}");
-        assert!(printed.contains("exclude: 1"), "{printed}");
+        assert!(printed.contains("includes: 1"), "{printed}");
+        assert!(printed.contains("excludes: 1"), "{printed}");
         assert!(
             !printed.contains("US-LAX-01") && !printed.contains("expired"),
             "a pattern may be a node's name: {printed}"
