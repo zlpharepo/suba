@@ -1004,12 +1004,14 @@ mod tests {
              \tprintf '%s' '{}' > \"$3\"\n\
              \texit 0\n\
              fi\n\
+             if [ \"$1\" = generate ]; then echo 'PrivateKey: {SENTINEL}'; exit 0; fi\n\
              cd \"$2\" || exit 1\n\
              if [ ! -f \"$4\" ]; then echo 'config not found' >&2; exit 1; fi\n\
              echo started\n\
              trap 'exit 0' TERM\n\
              while :; do sleep 1; done\n",
-            schema
+            schema,
+            SENTINEL = SENTINEL,
         );
 
         let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -1034,6 +1036,50 @@ mod tests {
             .expect("the encoder")
             .finish()
             .expect("gzip")
+    }
+
+    /// What the fake core prints as a generated credential.
+    const SENTINEL: &str = "SENTINELPRIVATEKEY";
+
+    /// A generated credential is the answer and nothing else: it is not in any
+    /// line this server logs while producing it.
+    #[test]
+    fn a_generated_credential_is_not_logged() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_scratch, store) = store();
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let output = tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("capturing");
+            store.generate(Generate::RealityKeyPair, None)
+        })
+        .expect("a generated key pair");
+
+        let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains(SENTINEL), "the answer carries it: {output}");
+        assert!(logged.contains("capturing"), "the capture works: {logged}");
+        assert!(!logged.contains(SENTINEL), "logged: {logged}");
     }
 
     /// A store over a scratch directory, with one version installed and current.
