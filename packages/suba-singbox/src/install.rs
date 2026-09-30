@@ -321,7 +321,16 @@ pub async fn releases(client: &reqwest::Client, url: &str) -> Result<Vec<Release
 
 /// The bytes of one release asset.
 pub async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Error> {
-    let answer = client.get(url).send().await.map_err(|_| Error::Network {
+    download_with_progress(client, url, |_, _| {}).await
+}
+
+/// Download an asset, reporting bytes received and the declared total if known.
+pub async fn download_with_progress(
+    client: &reqwest::Client,
+    url: &str,
+    mut progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>, Error> {
+    let mut answer = client.get(url).send().await.map_err(|_| Error::Network {
         reason: "the release server could not be reached",
     })?;
 
@@ -339,17 +348,24 @@ pub async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Er
         });
     }
 
-    let body = answer.bytes().await.map_err(|_| Error::Network {
-        reason: "the download stopped part way",
-    })?;
+    let total = answer.content_length();
+    let mut body = Vec::new();
+    progress(0, total);
 
-    if body.len() as u64 > MAX_ASSET_BYTES {
-        return Err(Error::Archive {
-            reason: "the asset is larger than this build reads",
-        });
+    while let Some(chunk) = answer.chunk().await.map_err(|_| Error::Network {
+        reason: "the download stopped part way",
+    })? {
+        if body.len() as u64 + chunk.len() as u64 > MAX_ASSET_BYTES {
+            return Err(Error::Archive {
+                reason: "the asset is larger than this build reads",
+            });
+        }
+
+        body.extend_from_slice(&chunk);
+        progress(body.len() as u64, total);
     }
 
-    Ok(body.to_vec())
+    Ok(body)
 }
 
 /// What a caller may ask the core to generate.
@@ -554,6 +570,39 @@ fn reason_of(error: &std::io::Error) -> &'static str {
 mod tests {
     use super::*;
     use crate::core::Version;
+
+    #[tokio::test]
+    async fn a_download_reports_received_bytes_and_the_declared_total() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n12345")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            tokio::task::yield_now().await;
+            stream.write_all(b"67890").await.unwrap();
+        });
+        let mut progress = Vec::new();
+        let body = download_with_progress(
+            &reqwest::Client::new(),
+            &format!("http://{address}/asset"),
+            |downloaded, total| progress.push((downloaded, total)),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(body, b"1234567890");
+        assert_eq!(progress.first(), Some(&(0, Some(10))));
+        assert_eq!(progress.last(), Some(&(10, Some(10))));
+    }
 
     /// A release archive with a binary that writes a schema when asked — the one
     /// thing an install needs a real binary for.

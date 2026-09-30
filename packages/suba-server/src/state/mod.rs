@@ -6,7 +6,7 @@ mod scheduler;
 mod sessions;
 mod settings;
 #[cfg(feature = "singbox-core")]
-mod singbox;
+pub(crate) mod singbox;
 
 use std::{path::PathBuf, sync::Arc};
 

@@ -17,13 +17,14 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use suba_singbox::assemble::{self, Tag};
-use suba_singbox::core::{Metadata, Release, Version};
+use suba_singbox::core::{Release, Version};
 use suba_singbox::install::{Generate, Needs};
 use suba_singbox::run::{self, Exit, Status};
 
 use crate::{
     dto::{Authenticated, ResponseResult},
     error::Error,
+    state::singbox::{InstallationTask, RuntimePhase, SingboxStore},
     AppState,
 };
 
@@ -263,12 +264,272 @@ pub async fn write_config(
 /// A version, as this instance knows it.
 #[derive(Debug, Serialize)]
 pub struct VersionView {
-    #[serde(flatten)]
-    pub metadata: Metadata,
-    /// Whether it is the one in use.
+    pub version: String,
+    pub tag: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_sha256: Option<String>,
+    pub installation: InstallationView,
+    pub runtime: RuntimeView,
     pub current: bool,
-    /// Whether it is the one running.
-    pub running: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum InstallationView {
+    NotInstalled,
+    Downloading { progress: ProgressView },
+    Installed { installed_at: i64 },
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProgressView {
+    pub downloaded: u64,
+    pub total: Option<u64>,
+    pub percentage: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum RuntimeView {
+    Stopped,
+    Starting,
+    Running { pid: u32 },
+    Stopping,
+    Failed,
+}
+
+fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, Error> {
+    let metadata = store.installed_record(version)?;
+    let current = store.current()?.as_ref() == Some(version);
+    let running = store.running_version().as_ref() == Some(version);
+    let status = store.status();
+    let runtime = if running {
+        match store.runtime_phase() {
+            Some(RuntimePhase::Stopping) => RuntimeView::Stopping,
+            _ => RuntimeView::Running {
+                pid: status.pid.expect("a running process has a pid"),
+            },
+        }
+    } else if current {
+        match store.runtime_phase() {
+            Some(RuntimePhase::Starting) => RuntimeView::Starting,
+            Some(RuntimePhase::Stopping)
+                if store.last_started_version().as_ref() == Some(version) =>
+            {
+                RuntimeView::Stopping
+            }
+            Some(RuntimePhase::Stopping) => RuntimeView::Stopped,
+            Some(RuntimePhase::Failed) if store.failed_version().as_ref() == Some(version) => {
+                RuntimeView::Failed
+            }
+            Some(RuntimePhase::Failed) => RuntimeView::Stopped,
+            None if store.last_started_version().as_ref() == Some(version)
+                && status.exits.last().is_some_and(|exit| {
+                    exit.at >= status.started_at.unwrap_or(i64::MAX)
+                        && (exit.code != Some(0) || exit.signal.is_some())
+                }) =>
+            {
+                RuntimeView::Failed
+            }
+            None => RuntimeView::Stopped,
+        }
+    } else {
+        RuntimeView::Stopped
+    };
+
+    let installation = if let Some(ref metadata) = metadata {
+        InstallationView::Installed {
+            installed_at: metadata.installed_at,
+        }
+    } else {
+        match store.installation_task(version) {
+            Some(InstallationTask::Downloading { downloaded, total }) => {
+                InstallationView::Downloading {
+                    progress: ProgressView {
+                        downloaded,
+                        total,
+                        percentage: total
+                            .filter(|total| *total > 0)
+                            .map(|total| ((downloaded.saturating_mul(100) / total).min(100)) as u8),
+                    },
+                }
+            }
+            None => InstallationView::NotInstalled,
+        }
+    };
+
+    Ok(VersionView {
+        version: version.as_str().to_string(),
+        tag: version.tag(),
+        asset: metadata.as_ref().map(|record| record.asset.clone()),
+        platform: metadata.as_ref().map(|record| record.platform.clone()),
+        asset_sha256: metadata.as_ref().map(|record| record.asset_sha256.clone()),
+        binary_sha256: metadata.as_ref().map(|record| record.binary_sha256.clone()),
+        schema_sha256: metadata.as_ref().map(|record| record.schema_sha256.clone()),
+        installation,
+        runtime,
+        current,
+    })
+}
+
+#[cfg(test)]
+mod version_view_tests {
+    use super::*;
+    use suba_singbox::core::{Dirs, Metadata};
+
+    #[test]
+    fn absent_and_downloading_versions_have_distinct_structured_views() {
+        let root = std::env::temp_dir().join(format!("suba-version-view-{}", uuid::Uuid::now_v7()));
+        let store = SingboxStore::new(
+            &root.join("config"),
+            &root.join("data"),
+            reqwest::Client::new(),
+        );
+        let version = Version::from_tag("1.14.2");
+
+        let absent = serde_json::to_value(version_view(&store, &version).unwrap()).unwrap();
+        assert_eq!(absent["version"], "1.14.2");
+        assert_eq!(absent["tag"], "v1.14.2");
+        assert_eq!(absent["installation"]["status"], "not-installed");
+        assert_eq!(absent["runtime"]["status"], "stopped");
+        assert_eq!(absent["current"], false);
+        assert!(absent.get("asset").is_none());
+
+        assert!(store.begin_install(&version).unwrap());
+        assert!(
+            !store.begin_install(&version).unwrap(),
+            "one task per version"
+        );
+        let downloading = serde_json::to_value(version_view(&store, &version).unwrap()).unwrap();
+        assert_eq!(downloading["installation"]["status"], "downloading");
+        assert_eq!(downloading["installation"]["progress"]["downloaded"], 0);
+
+        store.finish_install(&version);
+        assert_eq!(
+            serde_json::to_value(version_view(&store, &version).unwrap()).unwrap()["installation"]
+                ["status"],
+            "not-installed",
+            "a failed task can be retried"
+        );
+        assert!(store.begin_install(&version).unwrap());
+    }
+
+    #[test]
+    fn runtime_and_progress_have_the_requested_shapes() {
+        let progress = serde_json::to_value(InstallationView::Downloading {
+            progress: ProgressView {
+                downloaded: 5,
+                total: Some(10),
+                percentage: Some(50),
+            },
+        })
+        .unwrap();
+        let running = serde_json::to_value(RuntimeView::Running { pid: 12345 }).unwrap();
+
+        assert_eq!(progress["status"], "downloading");
+        assert_eq!(progress["progress"]["percentage"], 50);
+        assert_eq!(
+            running,
+            serde_json::json!({"status": "running", "pid": 12345})
+        );
+        for (phase, name) in [
+            (RuntimeView::Starting, "starting"),
+            (RuntimeView::Stopping, "stopping"),
+            (RuntimeView::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(phase).unwrap()["status"], name);
+        }
+    }
+
+    #[test]
+    fn installed_version_has_metadata_and_a_stopped_runtime() {
+        let root =
+            std::env::temp_dir().join(format!("suba-version-installed-{}", uuid::Uuid::now_v7()));
+        let store = SingboxStore::new(
+            &root.join("config"),
+            &root.join("data"),
+            reqwest::Client::new(),
+        );
+        let dirs = Dirs::new(root.join("data"));
+        let version = Version::from_tag("1.14.2");
+        let metadata = Metadata {
+            version: version.clone(),
+            tag: version.tag(),
+            asset: "sing-box-1.14.2-darwin-arm64.tar.gz".to_string(),
+            platform: "darwin-arm64".to_string(),
+            asset_sha256: "asset-hash".to_string(),
+            binary_sha256: "binary-hash".to_string(),
+            schema_sha256: "schema-hash".to_string(),
+            installed_at: 1_700_000_000,
+        };
+        std::fs::create_dir_all(dirs.version(&version)).unwrap();
+        std::fs::write(
+            dirs.metadata(&version),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let view = serde_json::to_value(version_view(&store, &version).unwrap()).unwrap();
+        assert_eq!(
+            view["installation"],
+            serde_json::json!({"status": "installed", "installed_at": 1_700_000_000})
+        );
+        assert_eq!(view["runtime"], serde_json::json!({"status": "stopped"}));
+        assert_eq!(view["asset"], metadata.asset);
+        assert_eq!(view["schema_sha256"], metadata.schema_sha256);
+        assert_eq!(view["current"], false);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_start_is_reported_for_the_attempted_version() {
+        let root =
+            std::env::temp_dir().join(format!("suba-version-failed-{}", uuid::Uuid::now_v7()));
+        let store = SingboxStore::new(
+            &root.join("config"),
+            &root.join("data"),
+            reqwest::Client::new(),
+        );
+        let version = Version::from_tag("1.14.2");
+        let dirs = Dirs::new(root.join("data"));
+        std::fs::create_dir_all(dirs.version(&version)).unwrap();
+        std::fs::write(dirs.metadata(&version), "{}").unwrap();
+        suba_singbox::install::set_current(&dirs, &version).unwrap();
+
+        assert!(store.start(&[]).is_err());
+        // A broken record is reported as an error rather than used as a view.
+        // Keep the metadata valid so the runtime view can be inspected.
+        let metadata = Metadata {
+            version: version.clone(),
+            tag: version.tag(),
+            asset: "asset".into(),
+            platform: "platform".into(),
+            asset_sha256: "asset-hash".into(),
+            binary_sha256: "binary-hash".into(),
+            schema_sha256: "schema-hash".into(),
+            installed_at: 1_700_000_000,
+        };
+        std::fs::write(
+            dirs.metadata(&version),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(version_view(&store, &version).unwrap()).unwrap()["runtime"]
+                ["status"],
+            "failed"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// The versions this machine has.
@@ -280,18 +541,11 @@ pub async fn versions(
 
     Ok(Json(
         tokio::task::spawn_blocking(move || -> Result<Vec<VersionView>, Error> {
-            let current = store.current()?;
-            let running = store.running_version();
-
-            Ok(store
+            store
                 .versions()?
-                .into_iter()
-                .map(|metadata| VersionView {
-                    current: current.as_ref() == Some(&metadata.version),
-                    running: running.as_ref() == Some(&metadata.version),
-                    metadata,
-                })
-                .collect())
+                .iter()
+                .map(|record| version_view(&store, &record.version))
+                .collect()
         })
         .await??,
     ))
@@ -308,17 +562,7 @@ pub async fn version(
 
     Ok(Json(
         tokio::task::spawn_blocking(move || -> Result<VersionView, Error> {
-            let metadata = store.installed_record(&version)?.ok_or_else(|| {
-                Error::Singbox(suba_singbox::core::Error::NotInstalled {
-                    version: version.clone(),
-                })
-            })?;
-
-            Ok(VersionView {
-                current: store.current()?.as_ref() == Some(&version),
-                running: store.running_version().as_ref() == Some(&version),
-                metadata,
-            })
+            version_view(&store, &version)
         })
         .await??,
     ))
@@ -326,8 +570,7 @@ pub async fn version(
 
 /// Install a version from the release server.
 ///
-/// Already installed is an answer, not a failure: it comes back as it is, and
-/// nothing is downloaded again.
+/// An accepted request reserves the task and answers before network work begins.
 pub async fn install_version(
     State(state): State<AppState>,
     _auth: Authenticated,
@@ -335,35 +578,43 @@ pub async fn install_version(
 ) -> ResponseResult<(StatusCode, Json<VersionView>)> {
     let store = state.singbox();
     let version = Version::from_tag(&asked);
-
-    let already = {
-        let store = state.singbox();
-        let version = version.clone();
-
-        tokio::task::spawn_blocking(move || store.installed_record(&version)).await??
-    };
-
-    if let Some(metadata) = already {
-        return Ok((
-            StatusCode::OK,
-            Json(VersionView {
-                metadata,
-                current: store.current()?.as_ref() == Some(&version),
-                running: false,
-            }),
-        ));
+    let preparing = store.clone();
+    let requested = version.clone();
+    let existing = tokio::task::spawn_blocking(move || -> Result<_, Error> {
+        let response = version_view(&preparing, &requested)?;
+        Ok(matches!(
+            response.installation,
+            InstallationView::Installed { .. } | InstallationView::Downloading { .. }
+        )
+        .then_some(response))
+    })
+    .await??;
+    if let Some(response) = existing {
+        return Ok((StatusCode::OK, Json(response)));
     }
 
-    let metadata = store.install(&version).await?;
+    // An unknown release is a failed request, never a successfully queued job.
+    let (asset, platform) = store.install_asset(&version).await?;
+    let preparing = store.clone();
+    let requested = version.clone();
+    let (created, response) = tokio::task::spawn_blocking(move || -> Result<_, Error> {
+        let created = preparing.begin_install(&requested)?;
+        let response = version_view(&preparing, &requested)?;
+        Ok((created, response))
+    })
+    .await??;
+    if !created {
+        return Ok((StatusCode::OK, Json(response)));
+    }
+    tokio::spawn(async move {
+        let result = store.install(&version, asset, platform).await;
+        if let Err(ref error) = result {
+            tracing::error!("sing-box installation failed: {error}");
+        }
+        store.finish_install(&version);
+    });
 
-    Ok((
-        StatusCode::CREATED,
-        Json(VersionView {
-            metadata,
-            current: store.current()?.as_ref() == Some(&version),
-            running: false,
-        }),
-    ))
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 /// Remove an installed version.

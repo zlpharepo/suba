@@ -1,10 +1,10 @@
 //! The sing-box module as the server uses it: the fragments an operator wrote,
 //! the configuration assembled from them, and the process running it.
 //!
-//! Everything here is synchronous — each step is file I/O or a process — and the
-//! handlers reach it from the blocking pool, the way observations are read. The
-//! one thing held between calls is the process itself, which outlives any single
-//! request.
+//! File and process operations run on the blocking pool. Release fetching is
+//! asynchronous; one in-memory cache shared by the releases route and install
+//! preflight keeps concurrent requests from hitting the upstream separately.
+//! The process itself outlives any single request.
 //!
 //! **The order a start keeps.** The fragments are read, assembled, checked
 //! against the schema of the version that will run them, written out, and only
@@ -12,16 +12,18 @@
 //! with the field it is about, and a core that is already serving is never
 //! touched by one — which is what makes "restart" safe to offer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use suba_singbox::assemble::{self, Assembled, Tag};
-use suba_singbox::core::{self, Dirs, Metadata, Release, Version};
+use suba_singbox::core::{self, Asset, Dirs, Metadata, Release, Version};
 use suba_singbox::install::{self, Generate};
 use suba_singbox::run::{self, Runner, Status};
 use suba_singbox::schema::{Schema, Verdict};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{error::Error, fs};
 
@@ -41,11 +43,36 @@ pub(crate) const CONFIG: &str = "config.json";
 /// there.
 const RELEASES: &str = "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30";
 
+/// A short-lived listing shared by the releases route and installation preflight.
+const RELEASES_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// An expired listing remains useful while the release API refuses requests.
+const RELEASES_RETRY: Duration = Duration::from_secs(60);
+
+struct ReleasesCache {
+    fetched_at: Instant,
+    retry_after: Instant,
+    values: Vec<Release>,
+}
+
 /// A schema, as it was read: which version's, which bytes, and their hash.
 pub(crate) struct SchemaBytes {
     pub version: Version,
     pub sha256: String,
     pub body: Vec<u8>,
+}
+
+/// A download in flight, or a failed attempt that may be retried.
+#[derive(Clone, Copy)]
+pub(crate) enum InstallationTask {
+    Downloading { downloaded: u64, total: Option<u64> },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RuntimePhase {
+    Starting,
+    Stopping,
+    Failed,
 }
 
 /// The sing-box module.
@@ -57,6 +84,8 @@ pub(crate) struct SingboxStore {
     dirs: Dirs,
     /// The instance's HTTP client, which fetching a release goes through.
     http: reqwest::Client,
+    /// Held across a cache miss so concurrent requests make one upstream call.
+    releases: AsyncMutex<Option<ReleasesCache>>,
     /// The process, which outlives any request that touched it.
     runner: Arc<Runner>,
     /// Which version was started, while that process is the one in the runner.
@@ -66,6 +95,10 @@ pub(crate) struct SingboxStore {
     /// A schema is addressed by its bytes (I3), so holding one costs nothing but
     /// memory and saves parsing 445 KB on every form save and every start.
     schemas: Mutex<Option<(String, Arc<Schema>)>>,
+    installs: Mutex<HashMap<Version, InstallationTask>>,
+    selection: Mutex<()>,
+    phase: Mutex<Option<RuntimePhase>>,
+    failed_version: Mutex<Option<Version>>,
 }
 
 impl SingboxStore {
@@ -74,10 +107,78 @@ impl SingboxStore {
             fragment_dir: config_dir.join(FRAGMENTS),
             dirs: Dirs::new(data_dir),
             http,
+            releases: AsyncMutex::new(None),
             runner: Arc::new(Runner::new()),
             started: Mutex::new(None),
             schemas: Mutex::new(None),
+            installs: Mutex::new(HashMap::new()),
+            selection: Mutex::new(()),
+            phase: Mutex::new(None),
+            failed_version: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn installation_task(&self, version: &Version) -> Option<InstallationTask> {
+        self.installs
+            .lock()
+            .expect("install tasks")
+            .get(version)
+            .copied()
+    }
+
+    /// Reserve a version before spawning work; a second request sees this task.
+    pub(crate) fn begin_install(&self, version: &Version) -> Result<bool, Error> {
+        if version < &Version::from_tag(core::MIN_VERSION) {
+            return Err(suba_singbox::core::Error::TooOld {
+                version: version.clone(),
+                floor: core::MIN_VERSION,
+            }
+            .into());
+        }
+        if self.installed_record(version)?.is_some() {
+            self.select_if_empty(version)?;
+            return Ok(false);
+        }
+        let mut installs = self.installs.lock().expect("install tasks");
+        if matches!(
+            installs.get(version),
+            Some(InstallationTask::Downloading { .. })
+        ) {
+            return Ok(false);
+        }
+        installs.insert(
+            version.clone(),
+            InstallationTask::Downloading {
+                downloaded: 0,
+                total: None,
+            },
+        );
+        Ok(true)
+    }
+
+    pub(crate) fn finish_install(&self, version: &Version) {
+        self.installs.lock().expect("install tasks").remove(version);
+    }
+
+    /// Make the first installed version current, without replacing a choice.
+    fn select_if_empty(&self, version: &Version) -> Result<(), Error> {
+        let _selection = self.selection.lock().expect("current selection");
+        if self.current()?.is_none() {
+            self.write_current(version)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn runtime_phase(&self) -> Option<RuntimePhase> {
+        *self.phase.lock().expect("runtime phase")
+    }
+
+    pub(crate) fn last_started_version(&self) -> Option<Version> {
+        self.started.lock().expect("the started version").clone()
+    }
+
+    pub(crate) fn failed_version(&self) -> Option<Version> {
+        self.failed_version.lock().expect("failed version").clone()
     }
 
     /// The fragments the operator wrote, one per section.
@@ -191,23 +292,38 @@ impl SingboxStore {
 
     /// What the release server lists.
     pub(crate) async fn releases(&self) -> Result<Vec<Release>, Error> {
-        install::releases(&self.http, RELEASES)
-            .await
-            .map_err(Error::from)
+        self.releases_from(RELEASES).await
     }
 
-    /// Install a version, or answer with the one that is already there.
-    ///
-    /// Already installed means nothing is downloaded: the record on disk is the
-    /// answer, and the bytes it was made from are not fetched again.
-    pub(crate) async fn install(&self, version: &Version) -> Result<Metadata, Error> {
-        if let Some(record) = self.installed_record(version)? {
-            return Ok(record);
+    async fn releases_from(&self, url: &str) -> Result<Vec<Release>, Error> {
+        let mut cached = self.releases.lock().await;
+        if let Some(cache) = cached.as_ref() {
+            if cache.fetched_at.elapsed() < RELEASES_TTL || Instant::now() < cache.retry_after {
+                return Ok(cache.values.clone());
+            }
         }
 
-        // Before the listing and before any download: a version under the floor
-        // is refused by name rather than reported as one nobody publishes,
-        // which would be a different (and untrue) thing to tell a caller.
+        match install::releases(&self.http, url).await {
+            Ok(releases) => {
+                *cached = Some(ReleasesCache {
+                    fetched_at: Instant::now(),
+                    retry_after: Instant::now(),
+                    values: releases.clone(),
+                });
+                Ok(releases)
+            }
+            Err(error) => match cached.as_mut() {
+                Some(cache) => {
+                    cache.retry_after = Instant::now() + RELEASES_RETRY;
+                    Ok(cache.values.clone())
+                }
+                None => Err(error.into()),
+            },
+        }
+    }
+
+    /// Resolve an installable asset before claiming an installation task.
+    pub(crate) async fn install_asset(&self, version: &Version) -> Result<(Asset, String), Error> {
         if version < &Version::from_tag(core::MIN_VERSION) {
             return Err(suba_singbox::core::Error::TooOld {
                 version: version.clone(),
@@ -215,27 +331,54 @@ impl SingboxStore {
             }
             .into());
         }
-
         let platform = core::platform()?;
-        let release = self
-            .releases()
-            .await?
-            .into_iter()
+        let releases = self.releases().await?;
+        Ok(Self::asset_in(&releases, version, platform)?)
+    }
+
+    /// Find an asset before creating a task; an absent release is not queued.
+    fn asset_in(
+        releases: &[Release],
+        version: &Version,
+        platform: &str,
+    ) -> Result<(Asset, String), suba_singbox::core::Error> {
+        let release = releases
+            .iter()
             .find(|release| &release.version == version)
             .ok_or_else(|| suba_singbox::core::Error::Unpublished {
                 version: version.clone(),
             })?;
-        let asset = release.asset_for(platform)?;
-        let archive = install::download(&self.http, &asset.url).await?;
+        Ok((release.asset_for(platform)?.clone(), platform.to_string()))
+    }
+
+    /// Download and install an asset already confirmed to exist by the caller.
+    pub(crate) async fn install(
+        &self,
+        version: &Version,
+        asset: Asset,
+        platform: String,
+    ) -> Result<Metadata, Error> {
+        let expected_size = (asset.size > 0).then_some(asset.size);
+        let archive =
+            install::download_with_progress(&self.http, &asset.url, |downloaded, total| {
+                let mut installs = self.installs.lock().expect("install tasks");
+                if let Some(task @ InstallationTask::Downloading { .. }) = installs.get_mut(version)
+                {
+                    *task = InstallationTask::Downloading {
+                        downloaded,
+                        total: total.or(expected_size),
+                    };
+                }
+            })
+            .await?;
 
         let dirs = self.dirs.clone();
         let version = version.clone();
         let name = asset.name.clone();
         let expected = asset.sha256.clone();
-        let platform = platform.to_string();
         let now = chrono::Utc::now().timestamp();
 
-        Ok(tokio::task::spawn_blocking(move || {
+        let metadata = tokio::task::spawn_blocking(move || {
             install::install(
                 &dirs,
                 &version,
@@ -246,7 +389,13 @@ impl SingboxStore {
                 now,
             )
         })
-        .await??)
+        .await??;
+
+        // Selecting the first installed version and an explicit switch must
+        // serialize, otherwise a late download could overwrite the user's pick.
+        self.select_if_empty(&metadata.version)?;
+
+        Ok(metadata)
     }
 
     /// Remove an installed version.
@@ -262,6 +411,11 @@ impl SingboxStore {
 
     /// Make an installed version the one in use.
     pub(crate) fn set_current(&self, version: &Version) -> Result<(), Error> {
+        let _selection = self.selection.lock().expect("current selection");
+        self.write_current(version)
+    }
+
+    fn write_current(&self, version: &Version) -> Result<(), Error> {
         Ok(install::set_current(&self.dirs, version)?)
     }
 
@@ -360,6 +514,18 @@ impl SingboxStore {
     /// without one passes nothing. Nothing is started until the document has
     /// been assembled, checked and written.
     pub(crate) fn start(&self, generated: &[Value]) -> Result<u32, Error> {
+        let attempted = self.current().ok().flatten();
+        *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Starting);
+        let result = self.start_checked(generated);
+        *self.phase.lock().expect("runtime phase") = match &result {
+            Ok(_) => None,
+            Err(_) => Some(RuntimePhase::Failed),
+        };
+        *self.failed_version.lock().expect("failed version") = result.as_ref().err().and(attempted);
+        result
+    }
+
+    fn start_checked(&self, generated: &[Value]) -> Result<u32, Error> {
         let version = self.current()?.ok_or(Error::NoVersion)?;
 
         let assembled = self.assemble(generated)?;
@@ -376,12 +542,20 @@ impl SingboxStore {
         let config = self.dirs.config().join(CONFIG);
         let work = self.dirs.work();
 
-        Ok(self.runner.spawn(run::command(&binary, &config, &work))?)
+        let pid = self.runner.spawn(run::command(&binary, &config, &work))?;
+        *self.started.lock().expect("the started version") = Some(version);
+        Ok(pid)
     }
 
     /// Ask the core to stop.
     pub(crate) fn stop(&self, patience: std::time::Duration) -> Result<(), Error> {
-        Ok(self.runner.stop(patience)?)
+        *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Stopping);
+        let result = self.runner.stop(patience).map_err(Error::from);
+        *self.phase.lock().expect("runtime phase") = match &result {
+            Ok(()) => None,
+            Err(_) => Some(RuntimePhase::Failed),
+        };
+        result
     }
 
     /// What the process is doing.
@@ -425,6 +599,115 @@ fn fragment_name(section: &str) -> Result<String, Error> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    async fn release_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0; 1024];
+                if stream.read(&mut request).await.unwrap() == 0 {
+                    continue;
+                }
+                let call = observed.fetch_add(1, Ordering::SeqCst);
+                let body = r#"[{"tag_name":"v1.14.2","assets":[]}]"#;
+                let response = if call == 2 {
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (url, calls)
+    }
+
+    #[tokio::test]
+    async fn releases_share_a_fetch_until_expired_and_keep_the_last_good_listing() {
+        use std::sync::atomic::Ordering;
+
+        let scratch = Scratch::new();
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+        );
+        let (url, calls) = release_server().await;
+
+        let (first, second) = tokio::join!(store.releases_from(&url), store.releases_from(&url));
+        assert_eq!(first.unwrap()[0].version.as_str(), "1.14.2");
+        assert_eq!(second.unwrap()[0].version.as_str(), "1.14.2");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one fetch for concurrent callers"
+        );
+        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a fresh hit does not call upstream"
+        );
+
+        store.releases.lock().await.as_mut().unwrap().fetched_at = Instant::now() - RELEASES_TTL;
+        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "expiry fetches again");
+
+        store.releases.lock().await.as_mut().unwrap().fetched_at = Instant::now() - RELEASES_TTL;
+        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a failed refresh is retried"
+        );
+        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a failed refresh backs off"
+        );
+        store.releases.lock().await.as_mut().unwrap().retry_after = Instant::now();
+        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "refresh resumes after backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_first_release_fetch_is_not_cached() {
+        use std::sync::atomic::Ordering;
+
+        let scratch = Scratch::new();
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+        );
+        let (url, calls) = release_server().await;
+        let failed = format!("{url}/missing");
+
+        // A malformed path is still answered by this local server, so explicitly
+        // test a fresh upstream refusal by letting its third response be the
+        // first response for another store.
+        store.releases_from(&url).await.unwrap();
+        store.releases.lock().await.take();
+        store.releases_from(&url).await.unwrap();
+        assert!(store.releases.lock().await.take().is_some());
+        assert!(store.releases_from(&failed).await.is_err());
+        assert!(store.releases.lock().await.is_none());
+        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
 
     /// A fake release archive: a binary that writes a schema when asked and runs
     /// until it is asked to stop, and a minimal schema that accepts one section.
@@ -532,6 +815,77 @@ mod tests {
     }
 
     #[test]
+    fn first_install_becomes_current_without_replacing_a_later_choice() {
+        let (_scratch, store) = store();
+        let original = Version::from_tag("1.14.2");
+        let next = Version::from_tag("1.14.3");
+        suba_singbox::install::install(
+            &store.dirs,
+            &next,
+            "linux-amd64",
+            "sing-box-1.14.3-linux-amd64.tar.gz",
+            &archive(),
+            None,
+            1_700_000_000,
+        )
+        .expect("a second install");
+
+        store.select_if_empty(&next).unwrap();
+        assert_eq!(store.current().unwrap(), Some(original));
+    }
+
+    #[test]
+    fn first_install_selects_itself_when_there_is_no_current_version() {
+        let scratch = Scratch::new();
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+        );
+        let version = Version::from_tag("1.14.2");
+        suba_singbox::install::install(
+            &store.dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive(),
+            None,
+            1_700_000_000,
+        )
+        .expect("an install");
+
+        store.select_if_empty(&version).unwrap();
+        assert_eq!(store.current().unwrap(), Some(version));
+    }
+
+    #[test]
+    fn retrying_an_installed_version_repairs_a_missing_current_selection() {
+        let scratch = Scratch::new();
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+        );
+        let version = Version::from_tag("1.14.2");
+        suba_singbox::install::install(
+            &store.dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive(),
+            None,
+            1_700_000_000,
+        )
+        .expect("a completed install without a current selection");
+
+        assert!(
+            !store.begin_install(&version).unwrap(),
+            "nothing is downloaded again"
+        );
+        assert_eq!(store.current().unwrap(), Some(version));
+    }
+
+    #[test]
     fn a_fragment_that_is_not_a_section_is_refused() {
         let (_scratch, store) = store();
         std::fs::create_dir_all(&store.fragment_dir).expect("the fragments directory");
@@ -600,9 +954,31 @@ mod tests {
         let (_scratch, store) = store();
 
         assert!(matches!(
-            store.install(&Version::from_tag("1.13.0")).await,
+            store.install_asset(&Version::from_tag("1.13.0")).await,
             Err(Error::Singbox(suba_singbox::core::Error::TooOld { .. }))
         ));
+    }
+
+    #[test]
+    fn an_unpublished_version_is_not_an_installation_task() {
+        let scratch = Scratch::new();
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+        );
+        let version = Version::from_tag("9.99.9");
+        let release = Release::from_json(&serde_json::json!({
+            "tag_name": "v1.14.2",
+            "assets": [],
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            SingboxStore::asset_in(&[release], &version, "darwin-arm64"),
+            Err(suba_singbox::core::Error::Unpublished { .. })
+        ));
+        assert!(store.installation_task(&version).is_none());
     }
 
     #[test]
