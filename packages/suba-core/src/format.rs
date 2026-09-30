@@ -79,6 +79,65 @@ impl Format {
         }
     }
 
+    /// The media type a response in this format is served as.
+    pub const fn media_type(self) -> &'static str {
+        match self {
+            Self::Links | Self::Base64 => "text/plain; charset=utf-8",
+            #[cfg(feature = "singbox")]
+            Self::Singbox => "application/json; charset=utf-8",
+            #[cfg(feature = "clash")]
+            Self::Clash => "text/yaml; charset=utf-8",
+        }
+    }
+
+    /// The file extension a client saves this format under.
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Links | Self::Base64 => "txt",
+            #[cfg(feature = "singbox")]
+            Self::Singbox => "json",
+            #[cfg(feature = "clash")]
+            Self::Clash => "yaml",
+        }
+    }
+
+    /// The format a name spells, when this build serves it.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::all()
+            .iter()
+            .copied()
+            .find(|format| format.as_str() == name)
+    }
+
+    /// The format a client's `User-Agent` says it reads, when it says one.
+    ///
+    /// Only the shapes a client cannot read otherwise are recognised: a
+    /// sing-box or clash client asked for a document it can load, and anything
+    /// else is left to what the collection declares. Matched without regard to
+    /// case, because the clients spell themselves inconsistently.
+    pub fn for_user_agent(agent: &str) -> Option<Self> {
+        let agent = agent.to_ascii_lowercase();
+
+        #[cfg(feature = "singbox")]
+        if ["sing-box", "sfa/", "sfi/", "sfm/", "sft/"]
+            .iter()
+            .any(|marker| agent.contains(marker))
+        {
+            return Some(Self::Singbox);
+        }
+
+        #[cfg(feature = "clash")]
+        if ["clash", "mihomo", "stash"]
+            .iter()
+            .any(|marker| agent.contains(marker))
+        {
+            return Some(Self::Clash);
+        }
+
+        let _ = agent;
+        None
+    }
+
     /// What it can express, before anything is rendered.
     pub const fn descriptor(self) -> FormatDescriptor {
         match self {
@@ -680,6 +739,44 @@ mod tests {
         assert_eq!(rendered.skipped[0].id, dropped.id());
         assert_eq!(rendered.skipped[0].name, None);
         assert_eq!(rendered.skipped[0].reason, SkipReason::Orphan);
+    }
+
+    #[test]
+    fn a_format_is_found_by_the_name_it_is_spelled_with() {
+        for format in Format::all() {
+            assert_eq!(Format::named(format.as_str()), Some(*format));
+        }
+        assert_eq!(Format::named("xray"), None);
+    }
+
+    /// A client that can only read one shape is recognised; a browser, a curl
+    /// and a v2ray client are left to the collection's declaration.
+    #[test]
+    fn a_client_is_served_the_shape_it_reads() {
+        #[cfg(feature = "singbox")]
+        for agent in ["SFA/1.11.0 (Android)", "sing-box 1.14.2", "SFI/1.10 (iOS)"] {
+            assert_eq!(
+                Format::for_user_agent(agent),
+                Some(Format::Singbox),
+                "{agent}"
+            );
+        }
+        #[cfg(feature = "clash")]
+        for agent in [
+            "clash-verge/v2.2.0",
+            "mihomo/1.19.31",
+            "ClashX Pro",
+            "Stash/2.4",
+        ] {
+            assert_eq!(
+                Format::for_user_agent(agent),
+                Some(Format::Clash),
+                "{agent}"
+            );
+        }
+        for agent in ["curl/8.7.1", "Mozilla/5.0", "v2rayNG/1.9.0", ""] {
+            assert_eq!(Format::for_user_agent(agent), None, "{agent}");
+        }
     }
 
     /// Links describe a client. A server document is a different shape, and one

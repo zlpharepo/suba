@@ -1,4 +1,5 @@
 mod collections;
+pub(crate) mod limiter;
 mod persisted;
 pub(crate) mod providers;
 pub(crate) mod render;
@@ -17,7 +18,7 @@ use crate::{config::ServerConfig, error::Error};
 #[cfg(feature = "singbox-core")]
 use self::singbox::SingboxStore;
 use self::{
-    collections::CollectionStore, providers::ProviderStore, render::RenderMemo,
+    collections::CollectionStore, limiter::Limiter, providers::ProviderStore, render::RenderMemo,
     scheduler::Refresher, sessions::SessionStore, settings::SettingsStore,
 };
 /// Everything a request handler shares, behind a single reference count.
@@ -36,6 +37,7 @@ struct Inner {
     providers: Arc<ProviderStore>,
     collections: CollectionStore,
     rendered: RenderMemo,
+    deliveries: Limiter,
     sessions: SessionStore,
     #[cfg(feature = "singbox-core")]
     singbox: Arc<SingboxStore>,
@@ -60,6 +62,7 @@ impl AppState {
             providers: Arc::new(ProviderStore::load(&config.config_dir, &config.data_dir)?),
             collections: CollectionStore::load(&config.config_dir)?,
             rendered: RenderMemo::new(),
+            deliveries: Limiter::new(),
             sessions: SessionStore::load(&config.data_dir)?,
             #[cfg(feature = "singbox-core")]
             singbox: Arc::new(SingboxStore::new(
@@ -112,6 +115,11 @@ impl AppState {
     /// The artifacts rendered so far, by content address.
     pub(crate) fn rendered(&self) -> &RenderMemo {
         &self.0.rendered
+    }
+
+    /// How often each delivery token has been used lately.
+    pub(crate) fn deliveries(&self) -> &Limiter {
+        &self.0.deliveries
     }
 
     /// The sessions currently allowed to authenticate.

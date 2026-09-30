@@ -88,6 +88,18 @@ pub enum Error {
     #[error("not found")]
     NoSuchDelivery,
 
+    /// A delivery token name that cannot be used.
+    #[error("token name: {reason}")]
+    TokenName { reason: &'static str },
+
+    /// A format this build does not serve was asked for by name.
+    #[error("format: not a format this build serves")]
+    UnknownFormat,
+
+    /// A delivery token was used more often than it may be.
+    #[error("too many requests")]
+    TooManyRequests { retry_after: u64 },
+
     /// The configured delivery prefix cannot be used.
     ///
     /// Said out loud because an operator can fix it: a prefix that is not one
@@ -249,6 +261,18 @@ impl IntoHttpError for Error {
             Error::Prefix { reason } => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
                 message: format!("subscription prefix: {reason}"),
+            },
+            Error::TokenName { reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("token name: {reason}"),
+            },
+            Error::UnknownFormat => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: "format: not a format this build serves".to_string(),
+            },
+            Error::TooManyRequests { .. } => HttpError {
+                status_code: StatusCode::TOO_MANY_REQUESTS,
+                message: "Too many requests".to_string(),
             },
             Error::NoSuchDelivery => HttpError {
                 status_code: StatusCode::NOT_FOUND,

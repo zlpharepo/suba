@@ -78,8 +78,8 @@ impl Refresher {
 /// The first refresh happens straight away, so a provider added at runtime is
 /// fetched without waiting a full interval.
 async fn worker(providers: Arc<ProviderStore>, http: Client, name: String, interval: Duration) {
-    // An interval of zero would spin, so a floor is applied to whatever the
-    // configuration asked for.
+    // Zero never reaches here (it means "not polled"); the floor keeps a
+    // sub-second interval from spinning.
     let interval = interval.max(Duration::from_secs(1));
     let mut ticks = time::interval_at(Instant::now(), interval);
 

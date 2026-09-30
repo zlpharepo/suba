@@ -28,6 +28,9 @@ use super::persisted::Persisted;
 /// A URL that hands out a subscription is a credential, so it is drawn from the
 /// operating system's entropy and long enough that guessing is not a strategy.
 const TOKEN_BYTES: usize = 32;
+
+/// The longest name a token can be given.
+const TOKEN_NAME_MAX: usize = 64;
 /// The file the collection definitions live in, without the format extension.
 pub(crate) const COLLECTIONS_BASENAME: &str = "collections";
 
@@ -85,13 +88,28 @@ impl CollectionStore {
         Ok(())
     }
 
-    /// Give `name` a new delivery token, and answer the token itself.
+    /// The names of a collection's delivery tokens.
+    pub(crate) async fn tokens(&self, name: &str) -> Result<Vec<String>, Error> {
+        self.file
+            .read(|config| {
+                config
+                    .collections
+                    .get(name)
+                    .map(|collection| collection.tokens.keys().cloned().collect())
+            })
+            .await
+            .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))
+    }
+
+    /// Give `name` a delivery token called `label`, and answer the token itself.
     ///
-    /// Minting replaces whatever token the collection had: there is one URL per
-    /// collection, and rotating it is how a leaked one is taken out of service.
-    /// The token is answered once and only its hash is stored, so this call is
-    /// the only chance to read it.
-    pub(crate) async fn mint_token(&self, name: &str) -> Result<String, Error> {
+    /// Minting under a label that exists replaces that token, which is how a
+    /// leaked one is taken out of service; the collection's other tokens keep
+    /// working. The token is answered once and only its hash is stored, so this
+    /// call is the only chance to read it.
+    pub(crate) async fn mint_token(&self, name: &str, label: &str) -> Result<String, Error> {
+        token_name(label)?;
+
         let mut bytes = [0u8; TOKEN_BYTES];
         fill(&mut bytes).map_err(|error| Error::Entropy(error.to_string()))?;
 
@@ -105,17 +123,17 @@ impl CollectionStore {
             .get_mut(name)
             .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
 
-        collection.token = Some(hash);
+        collection.tokens.insert(label.to_owned(), hash);
         locked.commit(config).await?;
 
         Ok(token)
     }
 
-    /// Take the collection's delivery token out of service.
+    /// Take one of the collection's delivery tokens out of service.
     ///
-    /// A collection that has no token is not an error: revoking is asked for by
+    /// A token that does not exist is not an error: revoking is asked for by
     /// the state the caller wants to be in, not by the state it found.
-    pub(crate) async fn revoke_token(&self, name: &str) -> Result<(), Error> {
+    pub(crate) async fn revoke_token(&self, name: &str, label: &str) -> Result<(), Error> {
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
         let collection = config
@@ -123,29 +141,48 @@ impl CollectionStore {
             .get_mut(name)
             .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
 
-        collection.token = None;
-        locked.commit(config).await?;
+        if collection.tokens.remove(label).is_some() {
+            locked.commit(config).await?;
+        }
 
         Ok(())
     }
 
-    /// The collection a token addresses, and its name.
+    /// The collection a token addresses and the token's name, in that order.
     ///
     /// Compared as hashes: what a caller holds is the token, and what is stored
     /// is the hash of it, so a comparison that is not constant time leaks bits
     /// of a value the caller cannot use.
-    pub(crate) async fn by_token(&self, token: &str) -> Option<(String, Collection)> {
+    pub(crate) async fn by_token(&self, token: &str) -> Option<(String, String)> {
         let hash = sha256_hex(token.as_bytes());
 
         self.file
             .read(|config| {
-                config
-                    .collections
-                    .iter()
-                    .find(|(_, collection)| collection.token.as_deref() == Some(hash.as_str()))
-                    .map(|(name, collection)| (name.clone(), collection.clone()))
+                config.collections.iter().find_map(|(name, collection)| {
+                    collection
+                        .tokens
+                        .iter()
+                        .find(|(_, held)| **held == hash)
+                        .map(|(label, _)| (name.clone(), label.clone()))
+                })
             })
             .await
+    }
+}
+
+/// Refuse a token name that could not be told apart in a URL or a log line.
+fn token_name(label: &str) -> Result<(), Error> {
+    let usable = !label.is_empty()
+        && label.len() <= TOKEN_NAME_MAX
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+
+    match usable {
+        true => Ok(()),
+        false => Err(Error::TokenName {
+            reason: "a name is 1 to 64 letters, digits, '.', '_' or '-'",
+        }),
     }
 }
 
@@ -247,7 +284,7 @@ mod tests {
             .await
             .unwrap();
 
-        let token = store.mint_token("main").await.unwrap();
+        let token = store.mint_token("main", "phone").await.unwrap();
         let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
 
         assert!(!written.contains(&token), "the token itself: {written}");
@@ -255,14 +292,17 @@ mod tests {
             written.contains(&sha256_hex(token.as_bytes())),
             "the hash of it: {written}"
         );
-        assert_eq!(store.by_token(&token).await.unwrap().0, "main");
+        assert_eq!(
+            store.by_token(&token).await.unwrap(),
+            ("main".to_string(), "phone".to_string())
+        );
         assert!(store.by_token("not-a-token").await.is_none());
 
-        store.revoke_token("main").await.unwrap();
+        store.revoke_token("main", "phone").await.unwrap();
 
         assert!(store.by_token(&token).await.is_none());
         let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
-        assert!(!written.contains("token"), "{written}");
+        assert!(!written.contains("tokens"), "{written}");
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
@@ -274,7 +314,50 @@ mod tests {
         let store = load(&dir);
         store.insert("main", collection(&[])).await.unwrap();
 
-        store.revoke_token("main").await.unwrap();
+        store.revoke_token("main", "phone").await.unwrap();
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// Each token is its own: revoking one leaves the others serving, and
+    /// minting under a name that exists rotates only that one.
+    #[tokio::test]
+    async fn one_token_is_revoked_without_the_others() {
+        let dir = scratch("tokens");
+        let store = load(&dir);
+        store.insert("main", collection(&[])).await.unwrap();
+
+        let phone = store.mint_token("main", "phone").await.unwrap();
+        let laptop = store.mint_token("main", "laptop").await.unwrap();
+        assert_eq!(store.tokens("main").await.unwrap(), ["laptop", "phone"]);
+
+        store.revoke_token("main", "phone").await.unwrap();
+        assert!(store.by_token(&phone).await.is_none());
+        assert!(store.by_token(&laptop).await.is_some());
+
+        let rotated = store.mint_token("main", "laptop").await.unwrap();
+        assert!(store.by_token(&laptop).await.is_none());
+        assert!(store.by_token(&rotated).await.is_some());
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_token_name_is_a_plain_word() {
+        let dir = scratch("token-names");
+        let store = load(&dir);
+        store.insert("main", collection(&[])).await.unwrap();
+
+        for bad in ["", "a b", "a/b", &"x".repeat(65)] {
+            assert!(
+                matches!(
+                    store.mint_token("main", bad).await,
+                    Err(Error::TokenName { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(store.tokens("main").await.unwrap().is_empty());
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }

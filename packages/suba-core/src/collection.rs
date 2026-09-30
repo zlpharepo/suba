@@ -64,14 +64,14 @@ pub struct Collection {
     #[serde(default = "base64", skip_serializing_if = "is_base64")]
     pub format: Format,
 
-    /// The delivery token, as a hash.
+    /// The delivery tokens, by the name the operator gave each one, as hashes.
     ///
-    /// The token itself is handed to whoever minted it and is never written
-    /// down: what is kept is the sha256 of it, so a copied configuration file is
-    /// not a set of working subscription URLs. Recognising a token that comes
-    /// back in a URL needs nothing but the hash.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
+    /// One per device or person, so one can be revoked without changing the URL
+    /// everyone else holds. The token itself is handed to whoever minted it and
+    /// is never written down: what is kept is the sha256 of it, so a copied
+    /// configuration file is not a set of working subscription URLs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens: BTreeMap<String, String>,
 }
 
 /// The format a collection serves in when its document does not say.
@@ -91,7 +91,7 @@ impl Default for Collection {
             includes: Vec::new(),
             excludes: Vec::new(),
             format: Format::Base64,
-            token: None,
+            tokens: BTreeMap::new(),
         }
     }
 }

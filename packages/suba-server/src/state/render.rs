@@ -49,6 +49,9 @@ pub(crate) struct Artifact {
     pub(crate) nodes: usize,
     /// How many nodes the format could not write.
     pub(crate) skipped: usize,
+    /// How often a client should ask again, in hours: the shortest refresh
+    /// interval among the providers, or `None` when none refreshes by itself.
+    pub(crate) update_hours: Option<u64>,
 }
 
 impl RenderMemo {
@@ -101,6 +104,7 @@ mod tests {
             format: Format::Links,
             nodes: 1,
             skipped: 0,
+            update_hours: None,
         })
     }
 

@@ -118,13 +118,17 @@ impl Provider {
     ///
     /// `None` for a provider there is nothing to poll for: an [`Inline`]
     /// provider carries its nodes in the document the caller is already holding,
-    /// so re-reading it would only ever produce bytes that are already in hand.
+    /// so re-reading it would only ever produce bytes that are already in hand;
+    /// an interval of `0` is the operator saying the same thing about a remote
+    /// or local one, which then changes only when it is refreshed by hand.
     pub fn interval(&self) -> Option<Duration> {
-        match self {
-            Self::Remote(remote) => Some(Duration::from_secs(remote.interval)),
-            Self::Local(local) => Some(Duration::from_secs(local.interval)),
-            Self::Inline(_) => None,
-        }
+        let seconds = match self {
+            Self::Remote(remote) => remote.interval,
+            Self::Local(local) => local.interval,
+            Self::Inline(_) => return None,
+        };
+
+        (seconds > 0).then(|| Duration::from_secs(seconds))
     }
 
     /// What this provider serves right now.
@@ -258,6 +262,7 @@ pub struct Remote {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
+    /// Seconds between automatic refreshes; `0` never refreshes on its own.
     #[serde(default = "default_interval")]
     pub interval: u64,
 }
@@ -372,6 +377,7 @@ pub struct Local {
     /// provider document that travels with the file it names keeps working.
     pub path: PathBuf,
 
+    /// Seconds between automatic refreshes; `0` never refreshes on its own.
     #[serde(default = "default_interval")]
     pub interval: u64,
 }
@@ -640,8 +646,19 @@ mod tests {
         assert_eq!(inline.interval(), None);
         assert_eq!(
             Provider::Remote(remote()).interval(),
-            Some(Duration::from_secs(default_interval()))
+            Some(Duration::from_secs(3600))
         );
+    }
+
+    /// Zero is "do not poll", not "poll as fast as possible".
+    #[test]
+    fn an_interval_of_zero_is_never_polled() {
+        let manual = Provider::Remote(Remote {
+            interval: 0,
+            ..remote()
+        });
+
+        assert_eq!(manual.interval(), None);
     }
 
     /// The declared shape survives the document, in whichever notation the

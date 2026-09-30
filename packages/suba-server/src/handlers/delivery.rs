@@ -6,19 +6,22 @@
 //! the configured one answers — there is no reply that would help someone
 //! looking for a token that works.
 //!
-//! **The token is never written down**: this module logs the collection it found
-//! and never the URL it arrived on, and the request line is not logged by
-//! anything above it either.
+//! **The token is never written down**: this module logs the collection and the
+//! token's name, never the token or the URL it arrived on, and the request line
+//! is not logged by anything above it either.
+//!
+//! What is left out of a document is not said here: the node counts are the
+//! operator's business, and this route answers anyone holding a token.
 
 use axum::{
-    extract::{Path, State},
-    response::IntoResponse,
+    extract::{Path, Query, State},
+    response::{IntoResponse, Response},
 };
-use http::{HeaderMap, StatusCode};
+use http::{header, HeaderMap, HeaderValue, StatusCode};
 
 use crate::{
     error::Error,
-    handlers::collections::{artifact_headers, artifact_of},
+    handlers::collections::{artifact_headers, artifact_of, Choice},
     tracing, AppState,
 };
 
@@ -26,10 +29,21 @@ use crate::{
 pub async fn serve(
     State(state): State<AppState>,
     Path((prefix, token)): Path<(String, String)>,
-) -> Result<impl IntoResponse, Error> {
-    let (headers, body) = deliver(&state, &prefix, &token).await?;
+    Query(choice): Query<Choice>,
+    request: HeaderMap,
+) -> Response {
+    match deliver(&state, &prefix, &token, &choice, &request).await {
+        Ok((headers, body)) => (StatusCode::OK, headers, body).into_response(),
+        Err(Error::TooManyRequests { retry_after }) => {
+            let mut response = Error::TooManyRequests { retry_after }.into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(retry_after));
 
-    Ok((StatusCode::OK, headers, body))
+            response
+        }
+        Err(error) => error.into_response(),
+    }
 }
 
 /// Find the collection behind a token and render it.
@@ -37,6 +51,8 @@ async fn deliver(
     state: &AppState,
     prefix: &str,
     token: &str,
+    choice: &Choice,
+    request: &HeaderMap,
 ) -> Result<(HeaderMap, String), Error> {
     // A prefix this instance cannot use makes every delivery address nothing,
     // which is exactly what a wrong prefix means from outside — but the operator
@@ -56,20 +72,44 @@ async fn deliver(
 
     // A token that addresses nothing and a token that was revoked are the same
     // answer, because they are the same thing from outside.
-    let Some((name, _)) = state.collections().by_token(token).await else {
+    let Some((name, label)) = state.collections().by_token(token).await else {
         return Err(Error::NoSuchDelivery);
     };
 
+    // Counted by the token's name, never by the token.
+    if let Err(retry_after) = state.deliveries().check(&format!("{name}/{label}")) {
+        tracing::warn!("Delivery '{name}' via token '{label}': rate limited");
+
+        return Err(Error::TooManyRequests { retry_after });
+    }
+
+    let format = choice.resolve(request)?;
+
     // The collection can go away between the lookup and the render; that is the
     // delivery's 404 too, never a message naming it.
-    let artifact = artifact_of(state, &name)
-        .await
-        .map_err(|error| match error {
-            Error::CollectionNotFound(_) => Error::NoSuchDelivery,
-            other => other,
-        })?;
+    let (artifact, cached) =
+        artifact_of(state, &name, format)
+            .await
+            .map_err(|error| match error {
+                Error::CollectionNotFound(_) => Error::NoSuchDelivery,
+                other => other,
+            })?;
 
-    Ok((artifact_headers(&artifact), artifact.body.to_string()))
+    tracing::info!(
+        "Delivered '{name}' via token '{label}': {} nodes as {}, {} bytes, {}",
+        artifact.nodes,
+        artifact.format,
+        artifact.body.len(),
+        match cached {
+            true => "cached",
+            false => "rendered",
+        },
+    );
+
+    Ok((
+        artifact_headers(&artifact, &name),
+        artifact.body.to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -124,6 +164,31 @@ mod tests {
         format!("trojan://hunter2@{host}:443#{name}\n")
     }
 
+    /// A delivery as a client with no preference asks for it.
+    async fn get(
+        state: &AppState,
+        prefix: &str,
+        token: &str,
+    ) -> Result<(HeaderMap, String), Error> {
+        deliver(state, prefix, token, &Choice::default(), &HeaderMap::new()).await
+    }
+
+    /// A delivery as a client that names itself.
+    async fn get_as(
+        state: &AppState,
+        token: &str,
+        format: Option<&str>,
+        agent: &str,
+    ) -> Result<(HeaderMap, String), Error> {
+        let mut request = HeaderMap::new();
+        request.insert(header::USER_AGENT, HeaderValue::from_str(agent).unwrap());
+        let choice = Choice {
+            format: format.map(str::to_owned),
+        };
+
+        deliver(state, "s", token, &choice, &request).await
+    }
+
     async fn served(state: &AppState) {
         let provider = Provider::Inline(Inline {
             shared: SharedFields::default(),
@@ -152,8 +217,12 @@ mod tests {
         let state = state().await;
         served(&state).await;
 
-        let token = state.collections().mint_token("main").await.unwrap();
-        let (_, body) = deliver(&state, "s", &token).await.unwrap();
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+        let (_, body) = get(&state, "s", &token).await.unwrap();
 
         // A collection that declares nothing is served base64-wrapped.
         let links = suba_core::proto::base64::decode_to_string(body.as_bytes()).unwrap();
@@ -167,7 +236,7 @@ mod tests {
         served(&state).await;
 
         assert!(matches!(
-            deliver(&state, "sub", "0".repeat(64).as_str()).await,
+            get(&state, "sub", "0".repeat(64).as_str()).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -179,10 +248,14 @@ mod tests {
         let state = state().await;
         served(&state).await;
 
-        let token = state.collections().mint_token("main").await.unwrap();
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
 
         assert!(matches!(
-            deliver(&state, "elsewhere", &token).await,
+            get(&state, "elsewhere", &token).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -192,11 +265,19 @@ mod tests {
         let state = state().await;
         served(&state).await;
 
-        let token = state.collections().mint_token("main").await.unwrap();
-        state.collections().revoke_token("main").await.unwrap();
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+        state
+            .collections()
+            .revoke_token("main", "phone")
+            .await
+            .unwrap();
 
         assert!(matches!(
-            deliver(&state, "s", &token).await,
+            get(&state, "s", &token).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -208,11 +289,15 @@ mod tests {
         let state = state_with(Some("/proxy")).await;
         served(&state).await;
 
-        let token = state.collections().mint_token("main").await.unwrap();
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
 
-        assert!(deliver(&state, "proxy", &token).await.is_ok());
+        assert!(get(&state, "proxy", &token).await.is_ok());
         assert!(matches!(
-            deliver(&state, "s", &token).await,
+            get(&state, "s", &token).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -223,14 +308,159 @@ mod tests {
         let state = state().await;
         served(&state).await;
 
-        let old = state.collections().mint_token("main").await.unwrap();
-        let new = state.collections().mint_token("main").await.unwrap();
+        let old = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+        let new = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
 
         assert_ne!(old, new);
         assert!(matches!(
-            deliver(&state, "s", &old).await,
+            get(&state, "s", &old).await,
             Err(Error::NoSuchDelivery)
         ));
-        assert!(deliver(&state, "s", &new).await.is_ok());
+        assert!(get(&state, "s", &new).await.is_ok());
+    }
+
+    /// What a client needs is in the headers; what the operator needs is not.
+    #[tokio::test]
+    async fn a_delivery_carries_the_headers_a_client_reads() {
+        let state = state().await;
+        served(&state).await;
+
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+        let (headers, _) = get(&state, "s", &token).await.unwrap();
+
+        assert_eq!(headers[header::CONTENT_TYPE], "text/plain; charset=utf-8");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"subscription.txt\"; filename*=UTF-8''main.txt"
+        );
+        // An inline provider refreshes by itself never, so there is no pace to
+        // suggest.
+        assert!(headers.get("profile-update-interval").is_none());
+        assert!(headers.get("x-suba-nodes").is_none(), "{headers:?}");
+        assert!(headers.get("x-suba-skipped").is_none(), "{headers:?}");
+    }
+
+    /// The pace suggested to a client is the fastest member's, rounded up to
+    /// the hour the header counts in.
+    #[tokio::test]
+    async fn the_update_interval_is_the_shortest_provider_interval() {
+        use crate::provider::Local;
+
+        let state = state().await;
+        served(&state).await;
+        let file = state.data_dir().with_extension("links.txt");
+        std::fs::write(&file, link("beta.example.com", "JP-01")).unwrap();
+        for (name, interval) in [("slow", 10800), ("fast", 5400), ("manual", 0)] {
+            let provider = Provider::Local(Local {
+                shared: SharedFields::default(),
+                path: file.clone(),
+                interval,
+            });
+            state
+                .providers()
+                .upsert(name, provider, state.http())
+                .await
+                .unwrap();
+        }
+        state
+            .collections()
+            .insert(
+                "main",
+                Collection {
+                    providers: ["alpha", "slow", "fast", "manual"]
+                        .map(String::from)
+                        .to_vec(),
+                    ..Collection::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+        let (headers, _) = get(&state, "s", &token).await.unwrap();
+
+        assert_eq!(headers["profile-update-interval"], "2");
+    }
+
+    /// The query names a format; failing that, a client that can read only one
+    /// shape gets that shape; failing that, the collection's declaration.
+    #[tokio::test]
+    async fn the_format_is_asked_for_or_recognised() {
+        let state = state().await;
+        served(&state).await;
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+
+        let (headers, body) = get_as(&state, &token, Some("links"), "clash-verge/v2")
+            .await
+            .unwrap();
+        assert_eq!(headers["x-suba-format"], "links");
+        assert!(body.contains("#US-01"), "{body}");
+
+        #[cfg(feature = "clash")]
+        {
+            let (headers, body) = get_as(&state, &token, None, "clash-verge/v2")
+                .await
+                .unwrap();
+            assert_eq!(headers["x-suba-format"], "clash");
+            assert_eq!(headers[header::CONTENT_TYPE], "text/yaml; charset=utf-8");
+            assert!(body.contains("proxies:"), "{body}");
+        }
+
+        let (headers, _) = get_as(&state, &token, None, "curl/8.7.1").await.unwrap();
+        assert_eq!(headers["x-suba-format"], "base64");
+
+        assert!(matches!(
+            get_as(&state, &token, Some("xray"), "curl/8.7.1").await,
+            Err(Error::UnknownFormat)
+        ));
+    }
+
+    /// A token used past its limit is refused until its window passes, and the
+    /// collection's other tokens are counted on their own.
+    #[tokio::test]
+    async fn a_token_used_too_often_is_refused() {
+        let state = state().await;
+        served(&state).await;
+        let phone = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+        let laptop = state
+            .collections()
+            .mint_token("main", "laptop")
+            .await
+            .unwrap();
+
+        for _ in 0..crate::state::limiter::LIMIT {
+            get(&state, "s", &phone).await.unwrap();
+        }
+
+        assert!(matches!(
+            get(&state, "s", &phone).await,
+            Err(Error::TooManyRequests { retry_after }) if retry_after > 0
+        ));
+        assert!(get(&state, "s", &laptop).await.is_ok());
     }
 }

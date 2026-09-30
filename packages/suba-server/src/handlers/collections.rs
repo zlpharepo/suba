@@ -3,13 +3,13 @@
 use std::{collections::BTreeMap, path::Path as StdPath};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
     Json,
 };
 use http::{header, HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
-use suba_core::format::RenderIntent;
+use suba_core::format::{Format, RenderIntent};
 use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source, View};
 
 use crate::{
@@ -158,6 +158,27 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Which format a caller asks an artifact in, instead of the collection's.
+#[derive(Debug, Default, Deserialize)]
+pub struct Choice {
+    pub format: Option<String>,
+}
+
+impl Choice {
+    /// The format asked for by name, then by the client's `User-Agent`, then
+    /// the one the collection declares.
+    pub(crate) fn resolve(&self, headers: &HeaderMap) -> Result<Option<Format>, Error> {
+        if let Some(name) = self.format.as_deref() {
+            return Format::named(name).map(Some).ok_or(Error::UnknownFormat);
+        }
+
+        Ok(headers
+            .get(header::USER_AGENT)
+            .and_then(|agent| agent.to_str().ok())
+            .and_then(Format::for_user_agent))
+    }
+}
+
 /// The delivery token, as the caller mints it.
 #[derive(Debug, Serialize)]
 pub struct Minted {
@@ -169,32 +190,42 @@ pub struct Minted {
     pub path: String,
 }
 
-/// Give a collection a new delivery token.
-///
-/// Minting again rotates: the URL that was handed out stops working, which is
-/// what a leaked token needs.
-pub async fn mint_token(
+/// The names of a collection's delivery tokens; the tokens themselves are not
+/// kept, so they cannot be listed.
+pub async fn tokens(
     _auth: Authenticated,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
-    let token = state.collections().mint_token(&name).await?;
+    Ok(Json(state.collections().tokens(&name).await?))
+}
+
+/// Give a collection a delivery token under a name.
+///
+/// Minting a name that exists rotates that token: its URL stops working, which
+/// is what a leaked token needs, and the collection's other tokens keep theirs.
+pub async fn mint_token(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+    Path((name, label)): Path<(String, String)>,
+) -> ResponseResult<impl IntoResponse> {
+    let token = state.collections().mint_token(&name, &label).await?;
     let path = format!("/{}/{token}", state.settings().subscription_prefix().await?);
 
-    // The collection is named, the token never is.
-    tracing::debug!("Minted a delivery token for collection '{name}'");
+    // The collection and the token's name are logged, the token never is.
+    tracing::debug!("Minted delivery token '{label}' for collection '{name}'");
 
     Ok((StatusCode::CREATED, Json(Minted { token, path })))
 }
 
-/// Take a collection's delivery token out of service.
+/// Take one of a collection's delivery tokens out of service.
 pub async fn revoke_token(
     _auth: Authenticated,
     State(state): State<AppState>,
-    Path(name): Path<String>,
+    Path((name, label)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
-    state.collections().revoke_token(&name).await?;
-    tracing::debug!("Revoked the delivery token of collection '{name}'");
+    state.collections().revoke_token(&name, &label).await?;
+    tracing::debug!("Revoked delivery token '{label}' of collection '{name}'");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -204,15 +235,26 @@ pub async fn revoke_token(
 /// The one path a subscription comes out of: the management route previews it
 /// and the delivery route hands it to a client, so the two cannot be two
 /// different documents.
+///
+/// `format` overrides the collection's declaration for this one request. The
+/// answer says whether the artifact was already rendered.
 pub(crate) async fn artifact_of(
     state: &AppState,
     name: &str,
-) -> Result<std::sync::Arc<Artifact>, Error> {
-    let collection = state
+    format: Option<Format>,
+) -> Result<(std::sync::Arc<Artifact>, bool), Error> {
+    let mut collection = state
         .collections()
         .get(name)
         .await
         .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
+
+    if let Some(format) = format {
+        collection.format = format;
+    }
+
+    // Tokens do not change the document, so they do not change its address.
+    collection.tokens.clear();
 
     let observations = state.providers().observations().await?;
     let declared = state.providers().formats().await;
@@ -220,7 +262,7 @@ pub(crate) async fn artifact_of(
     let key = address(state, &collection, &observations, &declared).await?;
 
     if let Some(artifact) = state.rendered().get(&key) {
-        return Ok(artifact);
+        return Ok((artifact, true));
     }
 
     // The same index the node view is built from, so a preview and a delivery
@@ -256,11 +298,12 @@ pub(crate) async fn artifact_of(
         format: collection.format,
         nodes: nodes.len().saturating_sub(rendered.skipped.len()),
         skipped: rendered.skipped.len(),
+        update_hours: update_hours(state, &collection).await,
     });
 
     state.rendered().put(key, std::sync::Arc::clone(&artifact));
 
-    Ok(artifact)
+    Ok((artifact, false))
 }
 
 /// Everything that can change an artifact's bytes, as one address.
@@ -299,12 +342,35 @@ async fn address(
     Ok(suba_core::checksum::sha256_hex(key.as_bytes()))
 }
 
+/// How often a subscriber should ask again, in whole hours, rounded up.
+///
+/// The shortest interval among the member providers: asking more often than
+/// the fastest one changes gets nothing new, and asking less often misses it.
+async fn update_hours(state: &AppState, collection: &Collection) -> Option<u64> {
+    let mut shortest: Option<u64> = None;
+
+    for name in &collection.providers {
+        let seconds = state
+            .providers()
+            .get(name)
+            .await
+            .and_then(|provider| provider.interval())
+            .map(|interval| interval.as_secs());
+
+        if let Some(seconds) = seconds {
+            shortest = Some(shortest.map_or(seconds, |known| known.min(seconds)));
+        }
+    }
+
+    shortest.map(|seconds| seconds.div_ceil(3600))
+}
+
 /// A document as the instance's codec writes it, for the address above.
 fn encode<T: Serialize>(value: &T) -> Result<String, Error> {
     crate::config::codec::encode(value, StdPath::new("render")).map_err(Error::Config)
 }
 
-/// Serve what this collection hands to a subscriber.
+/// Serve what this collection hands to a subscriber, for the operator.
 ///
 /// The body is the document itself; what was left out is reported in headers
 /// rather than in the body, which belongs to the client's core.
@@ -312,29 +378,50 @@ pub async fn content(
     _auth: Authenticated,
     State(state): State<AppState>,
     Path(name): Path<String>,
+    Query(choice): Query<Choice>,
+    request: HeaderMap,
 ) -> ResponseResult<impl IntoResponse> {
-    let artifact = artifact_of(&state, &name).await?;
+    let (artifact, _) = artifact_of(&state, &name, choice.resolve(&request)?).await?;
 
-    Ok((artifact_headers(&artifact), artifact.body.to_string()))
+    let mut headers = artifact_headers(&artifact, &name);
+    headers.insert("x-suba-nodes", HeaderValue::from(artifact.nodes));
+    headers.insert("x-suba-skipped", HeaderValue::from(artifact.skipped));
+
+    Ok((headers, artifact.body.to_string()))
 }
 
-/// The headers every artifact is served with.
-///
-/// What was left out is reported here rather than in the body: the body belongs
-/// to the client's core, and a comment it did not ask for would be an edit to it.
-pub(crate) fn artifact_headers(artifact: &Artifact) -> HeaderMap {
+/// The headers a subscription client reads, on every artifact.
+pub(crate) fn artifact_headers(artifact: &Artifact, name: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
+        HeaderValue::from_static(artifact.format.media_type()),
     );
     headers.insert(
         "x-suba-format",
         HeaderValue::from_static(artifact.format.as_str()),
     );
-    headers.insert("x-suba-nodes", HeaderValue::from(artifact.nodes));
-    headers.insert("x-suba-skipped", HeaderValue::from(artifact.skipped));
+
+    // RFC 6266: the name percent-encoded, so any collection name is a valid
+    // header, and a plain fallback for clients that read only `filename`.
+    let mut encoded = String::new();
+    suba_core::proto::percent::encode_into(name, &mut encoded);
+    let disposition = format!(
+        "attachment; filename=\"subscription.{extension}\"; filename*=UTF-8''{encoded}.{extension}",
+        extension = artifact.format.extension(),
+    );
+    if let Ok(value) = HeaderValue::from_str(&disposition) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+
+    if let Some(hours) = artifact.update_hours {
+        headers.insert("profile-update-interval", HeaderValue::from(hours));
+    }
+
+    // The URL carries a credential; nothing between here and the client may
+    // keep a copy.
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     headers
 }
@@ -412,7 +499,7 @@ mod artifact_tests {
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"], Format::Links).await;
 
-        let artifact = artifact_of(&state, "main").await.unwrap();
+        let artifact = artifact_of(&state, "main", None).await.unwrap().0;
 
         assert_eq!(artifact.nodes, 1);
         assert_eq!(artifact.skipped, 0);
@@ -431,7 +518,7 @@ mod artifact_tests {
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"], Format::Clash).await;
 
-        let artifact = artifact_of(&state, "main").await.unwrap();
+        let artifact = artifact_of(&state, "main", None).await.unwrap().0;
 
         assert!(
             artifact.body.contains("proxies:"),
@@ -449,8 +536,8 @@ mod artifact_tests {
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"], Format::Links).await;
 
-        let once = artifact_of(&state, "main").await.unwrap();
-        let twice = artifact_of(&state, "main").await.unwrap();
+        let once = artifact_of(&state, "main", None).await.unwrap().0;
+        let twice = artifact_of(&state, "main", None).await.unwrap().0;
 
         assert_eq!(once.body, twice.body);
         assert!(std::sync::Arc::ptr_eq(&once, &twice), "the same artifact");
@@ -470,8 +557,8 @@ mod artifact_tests {
         collection(&state, "main", &["alpha"], Format::Links).await;
 
         let before = std::fs::read_dir(state.data_dir()).map(Iterator::count);
-        artifact_of(&state, "main").await.unwrap();
-        artifact_of(&state, "main").await.unwrap();
+        artifact_of(&state, "main", None).await.unwrap();
+        artifact_of(&state, "main", None).await.unwrap();
         let after = std::fs::read_dir(state.data_dir()).map(Iterator::count);
 
         assert_eq!(before.unwrap(), after.unwrap(), "two renders add no files");
