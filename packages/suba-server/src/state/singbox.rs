@@ -498,6 +498,35 @@ mod tests {
         );
     }
 
+    /// Acceptance 7: a configuration that does not hold up leaves a running core
+    /// running. A start that would reload a broken configuration is refused, and
+    /// the process that is serving keeps serving.
+    #[test]
+    fn a_broken_fragment_leaves_the_running_core_alone() {
+        let (_scratch, store) = store();
+        store
+            .write_fragment("log", &serde_json::json!({ "level": "info" }))
+            .expect("a fragment");
+
+        let pid = store.start(&[]).expect("a start");
+        wait_for(&store, "started");
+
+        // The one way to get a broken fragment past `write_fragment`.
+        std::fs::write(store.fragment_dir.join("log.json"), r#"{"level": 7}"#)
+            .expect("a broken fragment");
+
+        let refused = store.start(&[]);
+
+        assert!(matches!(&refused, Err(Error::Document(_))), "{refused:?}");
+
+        let status = store.status();
+        assert!(status.running, "the core that was serving is still serving");
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(status.exits.len(), 0);
+
+        store.stop(Duration::from_secs(2)).expect("a stop");
+    }
+
     #[test]
     fn the_core_runs_and_stops_one_at_a_time() {
         let (_scratch, store) = store();
