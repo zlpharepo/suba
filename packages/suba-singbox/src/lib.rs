@@ -22,6 +22,9 @@ pub mod assemble;
 #[cfg(feature = "core")]
 pub mod core;
 
+#[cfg(feature = "core")]
+pub mod schema;
+
 #[cfg(feature = "render")]
 mod render;
 
