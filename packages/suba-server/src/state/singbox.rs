@@ -664,11 +664,14 @@ mod tests {
                 }
                 let call = observed.fetch_add(1, Ordering::SeqCst);
                 let body = r#"[{"tag_name":"v1.14.2","assets":[]}]"#;
+                // Each connection is answered once and dropped, so the client
+                // must not pool it: a reused dead connection is a failed fetch.
                 let response = if call == 2 {
-                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_string()
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
                 } else {
                     format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     )
                 };
