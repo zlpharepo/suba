@@ -21,18 +21,35 @@ use http::{header, HeaderMap, HeaderValue, StatusCode};
 
 use crate::{
     error::Error,
-    handlers::collections::{artifact_headers, artifact_of, Choice},
+    handlers::collections::{artifact_headers, artifact_of, attachment, Choice},
     tracing, AppState,
 };
 
-/// Serve the collection this token addresses.
+/// Serve the collection this token addresses, to be read where it lands.
+///
+/// No `Content-Disposition`: a browser opening the URL shows the document
+/// instead of saving it, and a subscription client ignores the difference.
 pub async fn serve(
     State(state): State<AppState>,
     Path((prefix, token)): Path<(String, String)>,
     Query(choice): Query<Choice>,
     request: HeaderMap,
 ) -> Response {
-    match deliver(&state, &prefix, &token, &choice, &request).await {
+    respond(deliver(&state, &prefix, &token, &choice, &request, false).await)
+}
+
+/// Serve the same document as a file, named after the collection.
+pub async fn download(
+    State(state): State<AppState>,
+    Path((prefix, token)): Path<(String, String)>,
+    Query(choice): Query<Choice>,
+    request: HeaderMap,
+) -> Response {
+    respond(deliver(&state, &prefix, &token, &choice, &request, true).await)
+}
+
+fn respond(delivered: Result<(HeaderMap, String), Error>) -> Response {
+    match delivered {
         Ok((headers, body)) => (StatusCode::OK, headers, body).into_response(),
         Err(Error::TooManyRequests { retry_after }) => {
             let mut response = Error::TooManyRequests { retry_after }.into_response();
@@ -53,6 +70,7 @@ async fn deliver(
     token: &str,
     choice: &Choice,
     request: &HeaderMap,
+    download: bool,
 ) -> Result<(HeaderMap, String), Error> {
     // A prefix this instance cannot use makes every delivery address nothing,
     // which is exactly what a wrong prefix means from outside — but the operator
@@ -106,10 +124,14 @@ async fn deliver(
         },
     );
 
-    Ok((
-        artifact_headers(&artifact, &name),
-        artifact.body.to_string(),
-    ))
+    let mut headers = artifact_headers(&artifact);
+    if download {
+        if let Some(disposition) = attachment(&artifact, &name) {
+            headers.insert(header::CONTENT_DISPOSITION, disposition);
+        }
+    }
+
+    Ok((headers, artifact.body.to_string()))
 }
 
 #[cfg(test)]
@@ -170,7 +192,15 @@ mod tests {
         prefix: &str,
         token: &str,
     ) -> Result<(HeaderMap, String), Error> {
-        deliver(state, prefix, token, &Choice::default(), &HeaderMap::new()).await
+        deliver(
+            state,
+            prefix,
+            token,
+            &Choice::default(),
+            &HeaderMap::new(),
+            false,
+        )
+        .await
     }
 
     /// A delivery as a client that names itself.
@@ -186,7 +216,7 @@ mod tests {
             format: format.map(str::to_owned),
         };
 
-        deliver(state, "s", token, &choice, &request).await
+        deliver(state, "s", token, &choice, &request, false).await
     }
 
     async fn served(state: &AppState) {
@@ -342,15 +372,46 @@ mod tests {
 
         assert_eq!(headers[header::CONTENT_TYPE], "text/plain; charset=utf-8");
         assert_eq!(headers[header::CACHE_CONTROL], "no-store");
-        assert_eq!(
-            headers[header::CONTENT_DISPOSITION],
-            "attachment; filename=\"subscription.txt\"; filename*=UTF-8''main.txt"
+        // Opened in a browser, it is shown rather than saved.
+        assert!(
+            headers.get(header::CONTENT_DISPOSITION).is_none(),
+            "{headers:?}"
         );
         // An inline provider refreshes by itself never, so there is no pace to
         // suggest.
         assert!(headers.get("profile-update-interval").is_none());
         assert!(headers.get("x-suba-nodes").is_none(), "{headers:?}");
         assert!(headers.get("x-suba-skipped").is_none(), "{headers:?}");
+    }
+
+    /// The download path is the same document, saved under the collection's
+    /// name.
+    #[tokio::test]
+    async fn a_download_is_saved_under_the_collection_name() {
+        let state = state().await;
+        served(&state).await;
+
+        let token = state
+            .collections()
+            .mint_token("main", "phone")
+            .await
+            .unwrap();
+        let (headers, body) = deliver(
+            &state,
+            "s",
+            &token,
+            &Choice::default(),
+            &HeaderMap::new(),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            "attachment; filename=\"subscription.txt\"; filename*=UTF-8''main.txt"
+        );
+        assert_eq!(body, get(&state, "s", &token).await.unwrap().1);
     }
 
     /// The pace suggested to a client is the fastest member's, rounded up to

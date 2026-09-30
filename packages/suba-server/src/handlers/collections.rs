@@ -383,7 +383,7 @@ pub async fn content(
 ) -> ResponseResult<impl IntoResponse> {
     let (artifact, _) = artifact_of(&state, &name, choice.resolve(&request)?).await?;
 
-    let mut headers = artifact_headers(&artifact, &name);
+    let mut headers = artifact_headers(&artifact);
     headers.insert("x-suba-nodes", HeaderValue::from(artifact.nodes));
     headers.insert("x-suba-skipped", HeaderValue::from(artifact.skipped));
 
@@ -391,7 +391,7 @@ pub async fn content(
 }
 
 /// The headers a subscription client reads, on every artifact.
-pub(crate) fn artifact_headers(artifact: &Artifact, name: &str) -> HeaderMap {
+pub(crate) fn artifact_headers(artifact: &Artifact) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
     headers.insert(
@@ -403,18 +403,6 @@ pub(crate) fn artifact_headers(artifact: &Artifact, name: &str) -> HeaderMap {
         HeaderValue::from_static(artifact.format.as_str()),
     );
 
-    // RFC 6266: the name percent-encoded, so any collection name is a valid
-    // header, and a plain fallback for clients that read only `filename`.
-    let mut encoded = String::new();
-    suba_core::proto::percent::encode_into(name, &mut encoded);
-    let disposition = format!(
-        "attachment; filename=\"subscription.{extension}\"; filename*=UTF-8''{encoded}.{extension}",
-        extension = artifact.format.extension(),
-    );
-    if let Ok(value) = HeaderValue::from_str(&disposition) {
-        headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-
     if let Some(hours) = artifact.update_hours {
         headers.insert("profile-update-interval", HeaderValue::from(hours));
     }
@@ -424,6 +412,21 @@ pub(crate) fn artifact_headers(artifact: &Artifact, name: &str) -> HeaderMap {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
 
     headers
+}
+
+/// `Content-Disposition` for saving an artifact under the collection's name.
+///
+/// RFC 6266: the name percent-encoded, so any collection name is a valid
+/// header, and a plain fallback for clients that read only `filename`.
+pub(crate) fn attachment(artifact: &Artifact, name: &str) -> Option<HeaderValue> {
+    let mut encoded = String::new();
+    suba_core::proto::percent::encode_into(name, &mut encoded);
+
+    HeaderValue::from_str(&format!(
+        "attachment; filename=\"subscription.{extension}\"; filename*=UTF-8''{encoded}.{extension}",
+        extension = artifact.format.extension(),
+    ))
+    .ok()
 }
 
 /// The nodes this collection resolves to.

@@ -40,7 +40,12 @@ impl AppRouter {
         // client's core, not to this instance's own callers, and the token in it
         // is the whole of the authorization. It is merged before the web service,
         // which is the fallback and would otherwise answer for it.
-        let delivery = Router::new().route("/{prefix}/{token}", get(handlers::delivery::serve));
+        let delivery = Router::new()
+            .route("/{prefix}/{token}", get(handlers::delivery::serve))
+            .route(
+                "/{prefix}/{token}/download",
+                get(handlers::delivery::download),
+            );
 
         Router::new()
             .nest("/api", api_router)
