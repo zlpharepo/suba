@@ -287,6 +287,7 @@ pub enum InstallationView {
     NotInstalled,
     Downloading { progress: ProgressView },
     Installed { installed_at: i64 },
+    Failed { error: &'static str },
 }
 
 #[derive(Debug, Serialize)]
@@ -303,7 +304,7 @@ pub enum RuntimeView {
     Starting,
     Running { pid: u32 },
     Stopping,
-    Failed,
+    Failed { error: String },
 }
 
 fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, Error> {
@@ -327,17 +328,28 @@ fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, 
                 RuntimeView::Stopping
             }
             Some(RuntimePhase::Stopping) => RuntimeView::Stopped,
-            Some(RuntimePhase::Failed) if store.failed_version().as_ref() == Some(version) => {
-                RuntimeView::Failed
+            Some(RuntimePhase::Failed { error })
+                if store.failed_version().as_ref() == Some(version) =>
+            {
+                RuntimeView::Failed {
+                    error: error.to_string(),
+                }
             }
-            Some(RuntimePhase::Failed) => RuntimeView::Stopped,
+            Some(RuntimePhase::Failed { .. }) => RuntimeView::Stopped,
             None if store.last_started_version().as_ref() == Some(version)
                 && status.exits.last().is_some_and(|exit| {
                     exit.at >= status.started_at.unwrap_or(i64::MAX)
                         && (exit.code != Some(0) || exit.signal.is_some())
                 }) =>
             {
-                RuntimeView::Failed
+                let exit = status.exits.last().expect("an abnormal exit was recorded");
+                RuntimeView::Failed {
+                    error: match (exit.code, exit.signal) {
+                        (Some(code), _) => format!("the core process exited with status {code}"),
+                        (_, Some(signal)) => format!("the core process ended by signal {signal}"),
+                        _ => "the core process exited unexpectedly".to_string(),
+                    },
+                }
             }
             None => RuntimeView::Stopped,
         }
@@ -362,6 +374,7 @@ fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, 
                     },
                 }
             }
+            Some(InstallationTask::Failed { error }) => InstallationView::Failed { error },
             None => InstallationView::NotInstalled,
         }
     };
@@ -412,14 +425,29 @@ mod version_view_tests {
         assert_eq!(downloading["installation"]["status"], "downloading");
         assert_eq!(downloading["installation"]["progress"]["downloaded"], 0);
 
-        store.finish_install(&version);
+        store.finish_install(
+            &version,
+            &Err(Error::Singbox(suba_singbox::core::Error::Network {
+                reason: "the download stopped part way",
+            })),
+        );
         assert_eq!(
             serde_json::to_value(version_view(&store, &version).unwrap()).unwrap()["installation"]
                 ["status"],
-            "not-installed",
-            "a failed task can be retried"
+            "failed"
+        );
+        assert_eq!(
+            serde_json::to_value(version_view(&store, &version).unwrap()).unwrap()["installation"]
+                ["error"],
+            "the download could not be completed"
         );
         assert!(store.begin_install(&version).unwrap());
+        assert_eq!(
+            serde_json::to_value(version_view(&store, &version).unwrap()).unwrap()["installation"]
+                ["status"],
+            "downloading",
+            "a retry clears the previous failure"
+        );
     }
 
     #[test]
@@ -443,7 +471,12 @@ mod version_view_tests {
         for (phase, name) in [
             (RuntimeView::Starting, "starting"),
             (RuntimeView::Stopping, "stopping"),
-            (RuntimeView::Failed, "failed"),
+            (
+                RuntimeView::Failed {
+                    error: "the core process exited unexpectedly".to_string(),
+                },
+                "failed",
+            ),
         ] {
             assert_eq!(serde_json::to_value(phase).unwrap()["status"], name);
         }
@@ -523,10 +556,15 @@ mod version_view_tests {
         )
         .unwrap();
 
-        assert_eq!(
-            serde_json::to_value(version_view(&store, &version).unwrap()).unwrap()["runtime"]
-                ["status"],
-            "failed"
+        let runtime = serde_json::to_value(version_view(&store, &version).unwrap()).unwrap()
+            ["runtime"]
+            .clone();
+        assert_eq!(runtime["status"], "failed");
+        assert!(
+            runtime["error"]
+                .as_str()
+                .is_some_and(|error| !error.is_empty()),
+            "a failure says why: {runtime}"
         );
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -611,7 +649,7 @@ pub async fn install_version(
         if let Err(ref error) = result {
             tracing::error!("sing-box installation failed: {error}");
         }
-        store.finish_install(&version);
+        store.finish_install(&version, &result);
     });
 
     Ok((StatusCode::ACCEPTED, Json(response)))

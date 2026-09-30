@@ -62,17 +62,48 @@ pub(crate) struct SchemaBytes {
     pub body: Vec<u8>,
 }
 
-/// A download in flight, or a failed attempt that may be retried.
+/// An installation in flight, or its last failure until retried.
 #[derive(Clone, Copy)]
 pub(crate) enum InstallationTask {
     Downloading { downloaded: u64, total: Option<u64> },
+    Failed { error: &'static str },
 }
 
 #[derive(Clone, Copy)]
 pub(crate) enum RuntimePhase {
     Starting,
     Stopping,
-    Failed,
+    Failed { error: &'static str },
+}
+
+fn installation_failure(error: &Error) -> &'static str {
+    match error {
+        Error::Singbox(core::Error::Refused { .. }) => "the release server refused the download",
+        Error::Singbox(core::Error::Network { .. }) => "the download could not be completed",
+        Error::Singbox(core::Error::Hash { .. }) => "the downloaded asset failed its checksum",
+        Error::Singbox(core::Error::Archive { .. })
+        | Error::Singbox(core::Error::Member { .. })
+        | Error::Singbox(core::Error::MemberMissing { .. })
+        | Error::Singbox(core::Error::MemberTooLarge { .. }) => {
+            "the release archive could not be installed"
+        }
+        Error::Singbox(core::Error::Run { .. }) => {
+            "the installed binary could not generate its schema"
+        }
+        _ => "the installation could not be completed",
+    }
+}
+
+fn runtime_failure(error: &Error) -> &'static str {
+    match error {
+        Error::Document(_) => "the configuration did not pass validation",
+        Error::Schema(_) => "the installed schema could not be read",
+        Error::Singbox(core::Error::Run { .. }) => {
+            "the core process could not be started or stopped"
+        }
+        Error::Io(_) => "a runtime file could not be read or written",
+        _ => "the core could not be started or stopped",
+    }
 }
 
 /// The sing-box module.
@@ -156,8 +187,21 @@ impl SingboxStore {
         Ok(true)
     }
 
-    pub(crate) fn finish_install(&self, version: &Version) {
-        self.installs.lock().expect("install tasks").remove(version);
+    pub(crate) fn finish_install(&self, version: &Version, result: &Result<Metadata, Error>) {
+        let mut installs = self.installs.lock().expect("install tasks");
+        match result {
+            Ok(_) => {
+                installs.remove(version);
+            }
+            Err(error) => {
+                installs.insert(
+                    version.clone(),
+                    InstallationTask::Failed {
+                        error: installation_failure(error),
+                    },
+                );
+            }
+        }
     }
 
     /// Make the first installed version current, without replacing a choice.
@@ -519,7 +563,9 @@ impl SingboxStore {
         let result = self.start_checked(generated);
         *self.phase.lock().expect("runtime phase") = match &result {
             Ok(_) => None,
-            Err(_) => Some(RuntimePhase::Failed),
+            Err(error) => Some(RuntimePhase::Failed {
+                error: runtime_failure(error),
+            }),
         };
         *self.failed_version.lock().expect("failed version") = result.as_ref().err().and(attempted);
         result
@@ -538,9 +584,9 @@ impl SingboxStore {
         fs::ensure_dir(self.dirs.work())?;
         self.write_product(&assembled.config)?;
 
-        let binary = self.dirs.binary(&version);
-        let config = self.dirs.config().join(CONFIG);
-        let work = self.dirs.work();
+        let binary = std::fs::canonicalize(self.dirs.binary(&version))?;
+        let config = std::fs::canonicalize(self.dirs.config().join(CONFIG))?;
+        let work = std::fs::canonicalize(self.dirs.work())?;
 
         let pid = self.runner.spawn(run::command(&binary, &config, &work))?;
         *self.started.lock().expect("the started version") = Some(version);
@@ -553,7 +599,9 @@ impl SingboxStore {
         let result = self.runner.stop(patience).map_err(Error::from);
         *self.phase.lock().expect("runtime phase") = match &result {
             Ok(()) => None,
-            Err(_) => Some(RuntimePhase::Failed),
+            Err(error) => Some(RuntimePhase::Failed {
+                error: runtime_failure(error),
+            }),
         };
         result
     }
@@ -734,6 +782,8 @@ mod tests {
              \tprintf '%s' '{}' > \"$3\"\n\
              \texit 0\n\
              fi\n\
+             cd \"$2\" || exit 1\n\
+             if [ ! -f \"$4\" ]; then echo 'config not found' >&2; exit 1; fi\n\
              echo started\n\
              trap 'exit 0' TERM\n\
              while :; do sleep 1; done\n",
@@ -1101,5 +1151,32 @@ mod tests {
             "what the core said: {:?}",
             store.log(run::LOG_LINES)
         );
+    }
+
+    #[test]
+    fn a_relative_data_directory_still_points_the_core_at_its_config() {
+        let scratch = Scratch::new();
+        let relative =
+            PathBuf::from("target").join(format!("suba-relative-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&relative).expect("a relative scratch directory");
+        let store = SingboxStore::new(&scratch.0.join("config"), &relative, reqwest::Client::new());
+        let version = Version::from_tag("1.14.2");
+        suba_singbox::install::install(
+            &store.dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive(),
+            None,
+            1_700_000_000,
+        )
+        .expect("an installed core");
+        store.set_current(&version).expect("a current version");
+
+        store.start(&[]).expect("a start");
+        wait_for(&store, "started");
+        assert!(store.status().running, "the config was found after -D");
+        store.stop(Duration::from_secs(2)).expect("a stop");
+        std::fs::remove_dir_all(relative).expect("remove the relative scratch directory");
     }
 }
