@@ -64,6 +64,46 @@ pub enum Error {
 
     #[error(transparent)]
     Request(#[from] reqwest::Error),
+
+    /// The sing-box module refused something.
+    #[cfg(feature = "singbox-core")]
+    #[error(transparent)]
+    Singbox(#[from] suba_singbox::core::Error),
+
+    /// A configuration document is wrong.
+    ///
+    /// The text is a field path and a static reason, and may name the section or
+    /// the tag it is about — never a value, which is where credentials live.
+    #[cfg(feature = "singbox-core")]
+    #[error("{0}")]
+    Document(String),
+
+    /// Something in the fragments directory is not a fragment.
+    #[cfg(feature = "singbox-core")]
+    #[error("{name}: {reason}")]
+    Fragment { name: String, reason: &'static str },
+
+    /// A section the operator has not written yet.
+    #[cfg(feature = "singbox-core")]
+    #[error("section '{section}' is not there")]
+    NoFragment { section: String },
+
+    /// There is no version to run.
+    #[cfg(feature = "singbox-core")]
+    #[error("no version is installed and current")]
+    NoVersion,
+
+    /// A schema this build cannot read.
+    ///
+    /// The text is a schema position and a static reason, never a value from a
+    /// request, and it is logged rather than answered with.
+    #[cfg(feature = "singbox-core")]
+    #[error("the schema cannot be read: {0}")]
+    Schema(String),
+
+    /// A document that is not JSON.
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 pub struct HttpError {
@@ -170,6 +210,69 @@ impl IntoHttpError for Error {
             Error::Request(_) => HttpError {
                 status_code: StatusCode::BAD_GATEWAY,
                 message: "Upstream request failed".to_string(),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::Singbox(error) => {
+                use suba_singbox::core::Error as Core;
+
+                // What the client can act on is answered as itself; everything
+                // else is this instance's own problem and stays internal.
+                let status_code = match &error {
+                    Core::NotInstalled { .. } | Core::NoAsset { .. } => StatusCode::NOT_FOUND,
+                    Core::Installed { .. }
+                    | Core::Current { .. }
+                    | Core::Hash { .. }
+                    | Core::Running { .. } => StatusCode::CONFLICT,
+                    Core::Refused { .. } | Core::Network { .. } => StatusCode::BAD_GATEWAY,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+
+                let message = match status_code {
+                    StatusCode::INTERNAL_SERVER_ERROR => {
+                        tracing::error!("sing-box: {error}");
+
+                        "Internal server error".to_string()
+                    }
+                    _ => error.to_string(),
+                };
+
+                HttpError {
+                    status_code,
+                    message,
+                }
+            }
+            #[cfg(feature = "singbox-core")]
+            Error::Document(message) => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message,
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::Fragment { name, reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("{name}: {reason}"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::NoFragment { section } => HttpError {
+                status_code: StatusCode::NOT_FOUND,
+                message: format!("Section '{section}' is not there"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::NoVersion => HttpError {
+                status_code: StatusCode::CONFLICT,
+                message: "No version is installed and current".to_string(),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::Schema(text) => {
+                tracing::error!("sing-box schema: {text}");
+
+                HttpError {
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "Internal server error".to_string(),
+                }
+            }
+            Error::Json(_) => HttpError {
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "Internal server error".to_string(),
             },
         }
     }

@@ -4,6 +4,8 @@ pub(crate) mod providers;
 mod scheduler;
 mod sessions;
 mod settings;
+#[cfg(feature = "singbox-core")]
+mod singbox;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -11,6 +13,8 @@ use reqwest::Client;
 
 use crate::{config::ServerConfig, error::Error};
 
+#[cfg(feature = "singbox-core")]
+use self::singbox::SingboxStore;
 use self::{
     collections::CollectionStore, providers::ProviderStore, scheduler::Refresher,
     sessions::SessionStore, settings::SettingsStore,
@@ -31,6 +35,8 @@ struct Inner {
     providers: Arc<ProviderStore>,
     collections: CollectionStore,
     sessions: SessionStore,
+    #[cfg(feature = "singbox-core")]
+    singbox: Arc<SingboxStore>,
 }
 
 impl AppState {
@@ -43,6 +49,8 @@ impl AppState {
             providers: Arc::new(ProviderStore::load(&config.config_dir, &config.data_dir)?),
             collections: CollectionStore::load(&config.config_dir)?,
             sessions: SessionStore::load(&config.data_dir)?,
+            #[cfg(feature = "singbox-core")]
+            singbox: Arc::new(SingboxStore::new(&config.config_dir, &config.data_dir)),
         })))
     }
 
@@ -82,6 +90,12 @@ impl AppState {
     /// The sessions currently allowed to authenticate.
     pub(crate) fn sessions(&self) -> &SessionStore {
         &self.0.sessions
+    }
+
+    /// The sing-box module: its fragments, its configuration, its process.
+    #[cfg(feature = "singbox-core")]
+    pub(crate) fn singbox(&self) -> Arc<SingboxStore> {
+        Arc::clone(&self.0.singbox)
     }
 }
 

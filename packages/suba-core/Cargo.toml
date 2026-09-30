@@ -7,6 +7,7 @@ license.workspace = true
 
 [features]
 singbox = ["dep:suba-singbox", "suba-singbox/render", "dep:serde_json"]
+singbox-core = ["dep:suba-singbox", "suba-singbox/core"]
 clash = ["dep:suba-clash"]
 
 [dependencies]

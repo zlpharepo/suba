@@ -1,6 +1,8 @@
 mod auth;
 mod collections;
 mod providers;
+#[cfg(feature = "singbox-core")]
+mod singbox;
 mod system;
 
 use std::path::Path;
@@ -24,6 +26,9 @@ impl AppRouter {
             .nest("/auth", auth::route())
             .nest("/providers", providers::route())
             .nest("/collections", collections::route());
+
+        #[cfg(feature = "singbox-core")]
+        let api_router = api_router.nest("/cores/sing-box", singbox::route());
 
         let not_found_service = not_found.into_service();
         let web_service = ServeDir::new(web_path)

@@ -10,10 +10,12 @@ default = ["toml"]
 toml = ["dep:toml"]
 json = []
 singbox = ["suba-core/singbox"]
+singbox-core = ["suba-core/singbox-core", "dep:suba-singbox"]
 clash = ["suba-core/clash"]
 
 [dependencies]
 suba-core = { workspace = true }
+suba-singbox = { workspace = true, optional = true }
 
 argon2 = { workspace = true }
 axum = { workspace = true }
@@ -37,3 +39,9 @@ tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+# For the sing-box store's tests, which install a release archive they build
+# themselves rather than fetching one.
+flate2 = { workspace = true }
+tar = { workspace = true }
