@@ -1,33 +1,65 @@
 //! Node filtering: which of a provider's nodes survive.
 //!
-//! A filter is a list of patterns read against a node's name — the one field a
-//! client displays and an operator recognises. The vocabulary is three shapes
-//! rather than a bare regular expression:
+//! A filter is two lists of patterns read against a node's name — the one field
+//! a client displays and an operator recognises. Each pattern is a one-key
+//! table whose key says how it matches, so a kind is never spelled inside a
+//! pattern's own text:
 //!
-//! * A **bare** pattern is compared whole, so `US-LAX-01` does not also match
-//!   `US-LAX-01-IPv6`. It is the default because it is the only shape an
-//!   operator can read back from a node list without translating anything.
-//! * `keyword:` is a literal substring, escaped before it becomes a pattern, so
-//!   a name containing `.` or `+` matches itself.
-//! * `regex:` is a regular expression, for what the other two cannot express.
+//! ```toml
+//! excludes = [{ keyword = "expire" }, { regex = "^US-" }, { name = "HK-01" }]
+//! ```
 //!
-//! The bare form being the *strictest* is the point. A filter is written
-//! against a subscription the operator does not control, and the default shape
-//! must not turn a name into a pattern: `keyword:` and `regex:` are opt-in.
+//! * `name` is compared whole, so `US-LAX-01` does not also match
+//!   `US-LAX-01-IPv6`. The strictest shape, and the one an operator can read
+//!   back from a node list without translating anything.
+//! * `keyword` is a literal substring, escaped before it becomes a pattern, so a
+//!   name containing `.` or `+` matches itself.
+//! * `regex` is a regular expression, for what the other two cannot express.
 //!
-//! Patterns inside one list are alternatives. [`NodeFilter`] holds the two
-//! lists (`includes`, `excludes` — the names they are written under) and applies
-//! them in one order: exclusion first, then inclusion. A name the `excludes`
-//! list matches is dropped there and then, so a name matching both lists is out
-//! — the lists are written for different reasons (one says what the operator
-//! wants, the other what they never want), and "never" is the one that has to
-//! survive a `keep` pattern that is broader than intended.
+//! Patterns in one list are alternatives. [`NodeFilter`] holds the two lists
+//! (`includes`, `excludes` — the names they are written under) and applies them
+//! in one order: exclusion first, then inclusion. A name `excludes` matches is
+//! dropped there and then, so a name matching both is out — the lists are
+//! written for different reasons (one says what the operator wants, the other
+//! what they never want), and "never" is the one that has to survive a `keep`
+//! pattern that is broader than intended.
 //!
 //! Matching is case-sensitive, as the names are: two nodes differing only in
 //! case are two names, and folding them would make the outcome depend on the
 //! client's idea of case rather than on the configured pattern.
 
 use regex::{Regex, RegexSet};
+use serde::{Deserialize, Serialize};
+
+/// One pattern, and how it matches a node's name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Pattern {
+    /// The whole name.
+    Name(String),
+    /// A literal substring of the name.
+    Keyword(String),
+    /// A regular expression matched anywhere in the name.
+    Regex(String),
+}
+
+impl Pattern {
+    /// The regular expression this pattern means.
+    fn expression(&self) -> Result<String, PatternReason> {
+        let (Pattern::Name(text) | Pattern::Keyword(text) | Pattern::Regex(text)) = self;
+        if text.is_empty() {
+            return Err(PatternReason::Empty);
+        }
+
+        Ok(match self {
+            // Anchored, so a name is the whole name and nothing else.
+            Pattern::Name(text) => format!("^(?:{})$", regex::escape(text)),
+            // Escaped, so `a.b` must not also match `axb`.
+            Pattern::Keyword(text) => regex::escape(text),
+            Pattern::Regex(text) => format!("(?:{text})"),
+        })
+    }
+}
 
 /// The two lists, compiled into one decision.
 pub struct NodeFilter {
@@ -45,7 +77,7 @@ impl NodeFilter {
     /// entry: a filter the operator believes is in force and is not would drop
     /// nodes they asked to keep, and the one thing worse than either is not
     /// knowing which happened.
-    pub fn compile(includes: &[String], excludes: &[String]) -> Result<Self, FilterError> {
+    pub fn compile(includes: &[Pattern], excludes: &[Pattern]) -> Result<Self, FilterError> {
         Ok(Self {
             includes: compile_set(includes, "includes")?,
             excludes: compile_set(excludes, "excludes")?,
@@ -81,8 +113,7 @@ impl std::fmt::Debug for NodeFilter {
     /// How many patterns each list holds, never the patterns themselves.
     ///
     /// A pattern is read against a node's name, and a name is operator data
-    /// that has no business in a log line — an exact pattern often *is* the
-    /// name.
+    /// that has no business in a log line — a `name` pattern *is* the name.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let count = |set: &Option<RegexSet>| set.as_ref().map_or(0, RegexSet::len);
 
@@ -124,7 +155,7 @@ pub enum PatternReason {
 }
 
 /// Compile one list, or `None` when it is empty.
-fn compile_set(patterns: &[String], field: &'static str) -> Result<Option<RegexSet>, FilterError> {
+fn compile_set(patterns: &[Pattern], field: &'static str) -> Result<Option<RegexSet>, FilterError> {
     if patterns.is_empty() {
         return Ok(None);
     }
@@ -133,7 +164,7 @@ fn compile_set(patterns: &[String], field: &'static str) -> Result<Option<RegexS
         .iter()
         .enumerate()
         .map(|(index, pattern)| {
-            as_expression(pattern).map_err(|reason| FilterError::Pattern {
+            pattern.expression().map_err(|reason| FilterError::Pattern {
                 field,
                 index,
                 reason,
@@ -164,29 +195,22 @@ fn compile_set(patterns: &[String], field: &'static str) -> Result<Option<RegexS
     }
 }
 
-/// The regular expression one configured pattern means.
-fn as_expression(pattern: &str) -> Result<String, PatternReason> {
-    if let Some(literal) = pattern.strip_prefix("keyword:") {
-        return match literal.is_empty() {
-            true => Err(PatternReason::Empty),
-            // Escaped, so the literal is matched as text: `keyword:a.b` must not
-            // also match `axb`.
-            false => Ok(regex::escape(literal)),
-        };
-    }
-
-    if let Some(expression) = pattern.strip_prefix("regex:") {
-        return match expression.is_empty() {
-            true => Err(PatternReason::Empty),
-            false => Ok(format!("(?:{expression})")),
-        };
-    }
-
-    match pattern.is_empty() {
-        true => Err(PatternReason::Empty),
-        // Anchored, so a bare pattern is the whole name and nothing else.
-        false => Ok(format!("^(?:{})$", regex::escape(pattern))),
-    }
+/// Patterns out of fixtures written with their kind in front (`keyword:`,
+/// `regex:`, or bare for a whole name): the shortest way to spell a test.
+#[cfg(test)]
+pub(crate) fn prefixed(patterns: &[&str]) -> Vec<Pattern> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            if let Some(keyword) = pattern.strip_prefix("keyword:") {
+                Pattern::Keyword(keyword.to_string())
+            } else if let Some(regex) = pattern.strip_prefix("regex:") {
+                Pattern::Regex(regex.to_string())
+            } else {
+                Pattern::Name(pattern.to_string())
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -194,26 +218,15 @@ mod tests {
     use super::*;
 
     fn include(patterns: &[&str]) -> NodeFilter {
-        let patterns: Vec<String> = patterns.iter().map(|pattern| pattern.to_string()).collect();
-
-        NodeFilter::compile(&patterns, &[]).unwrap()
+        NodeFilter::compile(&prefixed(patterns), &[]).unwrap()
     }
 
     fn both(include_patterns: &[&str], exclude_patterns: &[&str]) -> NodeFilter {
-        let include_patterns = include_patterns
-            .iter()
-            .map(|pattern| pattern.to_string())
-            .collect::<Vec<_>>();
-        let exclude_patterns = exclude_patterns
-            .iter()
-            .map(|pattern| pattern.to_string())
-            .collect::<Vec<_>>();
-
-        NodeFilter::compile(&include_patterns, &exclude_patterns).unwrap()
+        NodeFilter::compile(&prefixed(include_patterns), &prefixed(exclude_patterns)).unwrap()
     }
 
     #[test]
-    fn a_bare_pattern_is_the_whole_name() {
+    fn a_name_is_the_whole_name() {
         let filter = include(&["US-LAX-01"]);
 
         assert!(filter.admits("US-LAX-01"));
@@ -223,13 +236,22 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_pattern_is_text_and_not_a_pattern() {
-        // The default shape must not turn a name into a regex: a dot in a node
-        // name is a dot.
+    fn a_name_is_text_and_not_a_pattern() {
+        // A dot in a node name is a dot.
         let filter = include(&["a.b"]);
 
         assert!(filter.admits("a.b"));
         assert!(!filter.admits("axb"));
+    }
+
+    /// A name that starts like a kind is still a name: the kind is the key it
+    /// is written under, never a prefix of its text.
+    #[test]
+    fn a_name_that_reads_like_a_prefix_is_still_a_name() {
+        let filter = NodeFilter::compile(&[Pattern::Name("keyword:LAX".to_string())], &[]).unwrap();
+
+        assert!(filter.admits("keyword:LAX"));
+        assert!(!filter.admits("US-LAX-01"));
     }
 
     #[test]
@@ -251,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_regex_is_a_regular_expression() {
-        let filter = include(&["regex:-\\d+$"]);
+        let filter = include(&[r"regex:-\d+$"]);
 
         assert!(filter.admits("US-01"));
         assert!(!filter.admits("US-LAX"), "no digits at the end");
@@ -307,8 +329,8 @@ mod tests {
 
     #[test]
     fn an_invalid_pattern_names_its_position_and_not_its_text() {
-        let patterns = vec!["US-01".to_string(), "regex:(".to_string()];
-        let error = NodeFilter::compile(&patterns, &[]).expect_err("an unclosed group");
+        let error = NodeFilter::compile(&prefixed(&["US-01", "regex:("]), &[])
+            .expect_err("an unclosed group");
 
         match &error {
             FilterError::Pattern {
@@ -323,11 +345,9 @@ mod tests {
             other => panic!("expected a pattern failure, got {other}"),
         }
 
-        let printed = error.to_string();
-        assert!(printed.contains("includes[1]"), "{printed}");
-        assert!(
-            !printed.contains("regex:(") && !printed.contains('('),
-            "the operator's own text must not be echoed back: {printed}"
+        assert_eq!(
+            error.to_string(),
+            "includes[1]: not a valid regular expression"
         );
     }
 
@@ -335,12 +355,9 @@ mod tests {
     fn an_empty_pattern_is_refused_rather_than_ignored() {
         // Skipping it would leave a filter that is not the one that was
         // configured, and the operator would have no way to tell.
-        for patterns in [
-            vec![String::new()],
-            vec!["keyword:".to_string()],
-            vec!["regex:".to_string()],
-        ] {
-            let error = NodeFilter::compile(&patterns, &[]).expect_err("an empty pattern");
+        for fixture in ["", "keyword:", "regex:"] {
+            let error =
+                NodeFilter::compile(&prefixed(&[fixture]), &[]).expect_err("an empty pattern");
 
             assert!(
                 matches!(
@@ -358,7 +375,7 @@ mod tests {
 
     #[test]
     fn an_invalid_exclude_pattern_names_the_exclude_list() {
-        let error = NodeFilter::compile(&[], &["regex:[".to_string()]).expect_err("unclosed class");
+        let error = NodeFilter::compile(&[], &prefixed(&["regex:["])).expect_err("unclosed class");
 
         assert!(error.to_string().starts_with("excludes[0]"), "{error}");
     }
@@ -374,5 +391,22 @@ mod tests {
             !printed.contains("US-LAX-01") && !printed.contains("expired"),
             "a pattern may be a node's name: {printed}"
         );
+    }
+
+    /// The document shape: each pattern is a one-key table naming its kind,
+    /// and a key that is not a kind is refused rather than ignored.
+    #[test]
+    fn a_pattern_is_written_as_its_kind_and_its_text() {
+        let read: Vec<Pattern> = serde_json::from_str(
+            r#"[{"keyword": "expire"}, {"regex": "^US-"}, {"name": "HK-01"}]"#,
+        )
+        .unwrap();
+        assert_eq!(read, prefixed(&["keyword:expire", "regex:^US-", "HK-01"]));
+
+        assert_eq!(
+            serde_json::to_string(&read).unwrap(),
+            r#"[{"keyword":"expire"},{"regex":"^US-"},{"name":"HK-01"}]"#
+        );
+        assert!(serde_json::from_str::<Vec<Pattern>>(r#"[{"glob": "US-*"}]"#).is_err());
     }
 }

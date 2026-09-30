@@ -615,7 +615,7 @@ mod tests {
 
         let broken = Provider::Inline(Inline {
             shared: SharedFields {
-                includes: vec!["regex:(".to_string()],
+                includes: vec![suba_core::Pattern::Regex("(".to_string())],
                 ..SharedFields::default()
             },
             payload: PAYLOAD.to_string(),
@@ -641,8 +641,11 @@ mod tests {
 
         let filtered = Provider::Inline(Inline {
             shared: SharedFields {
-                includes: vec!["US-01".to_string(), "keyword:LAX".to_string()],
-                excludes: vec!["regex:-\\d+$".to_string()],
+                includes: vec![
+                    suba_core::Pattern::Name("US-01".to_string()),
+                    suba_core::Pattern::Keyword("LAX".to_string()),
+                ],
+                excludes: vec![suba_core::Pattern::Regex(r"-\d+$".to_string())],
                 ..SharedFields::default()
             },
             payload: PAYLOAD.to_string(),

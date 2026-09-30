@@ -24,7 +24,7 @@ use std::{
 use http::{header, HeaderMap};
 use serde::{Deserialize, Serialize};
 use suba_core::subscription::DeclaredFormat;
-use suba_core::{Fetched, FilterError, NodeFilter};
+use suba_core::{Fetched, FilterError, NodeFilter, Pattern};
 
 /// The largest payload this hub will buffer from a provider.
 ///
@@ -68,24 +68,20 @@ pub struct SharedFields {
     #[serde(default, skip_serializing_if = "is_links")]
     pub format: DeclaredFormat,
 
-    /// Nodes to keep.
-    ///
-    /// Each entry is a pattern read against a node's name: a bare value is the
-    /// whole name, `keyword:` is a literal substring, `regex:` is a regular
-    /// expression. Empty means every node the provider serves.
+    /// Nodes to keep, as [`Pattern`]s read against a node's name. Empty means
+    /// every node the provider serves.
     ///
     /// Skipped when empty, so a provider that filters nothing has neither key
-    /// rather than an empty list — the same reason the optional fields below are
-    /// skipped. See [`NodeFilter`] for the vocabulary.
+    /// rather than an empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub includes: Vec<String>,
+    pub includes: Vec<Pattern>,
 
-    /// Nodes to drop, in the same vocabulary.
+    /// Nodes to drop, in the same shape.
     ///
     /// Takes precedence over [`includes`](Self::includes): a node that matches
     /// both is dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub excludes: Vec<String>,
+    pub excludes: Vec<Pattern>,
 }
 
 /// Whether a provider is declared to be a plain link list, which is the default.
@@ -967,8 +963,11 @@ mod tests {
                 shared: SharedFields {
                     disabled: false,
                     format: DeclaredFormat::Links,
-                    includes: vec!["^US".to_string(), "^(HK|TW)$".to_string()],
-                    excludes: vec!["-2x$".to_string()],
+                    includes: vec![
+                        suba_core::Pattern::Name("HK-01".to_string()),
+                        suba_core::Pattern::Regex("^US".to_string()),
+                    ],
+                    excludes: vec![suba_core::Pattern::Keyword("2x".to_string())],
                 },
                 ..remote()
             }),
@@ -984,8 +983,14 @@ mod tests {
             panic!("a remote provider comes back remote");
         };
 
-        assert_eq!(remote.shared.includes, ["^US", "^(HK|TW)$"]);
-        assert_eq!(remote.shared.excludes, ["-2x$"]);
+        assert_eq!(
+            remote.shared.includes,
+            [
+                Pattern::Name("HK-01".to_string()),
+                Pattern::Regex("^US".to_string())
+            ]
+        );
+        assert_eq!(remote.shared.excludes, [Pattern::Keyword("2x".to_string())]);
         assert!(
             !stored.is_none_of_the_optional_fields(),
             "a filter is not nothing"
@@ -996,6 +1001,12 @@ mod tests {
         let written = std::fs::read_to_string(config_path(&path, PROVIDERS_BASENAME)).unwrap();
         assert!(written.contains("includes"), "{written}");
         assert!(written.contains("excludes"), "{written}");
+        assert!(written.contains("regex"), "{written}");
+        assert!(written.contains("keyword"), "{written}");
+        assert!(
+            !written.contains("keyword:"),
+            "no kind is spelled inside a pattern: {written}"
+        );
 
         tokio::fs::remove_dir_all(path).await.unwrap();
     }

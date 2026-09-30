@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::filter::{FilterError, NodeFilter};
+use crate::filter::{FilterError, NodeFilter, Pattern};
 use crate::format::Format;
 use crate::index::{IndexEntry, NodeIndex};
 
@@ -43,17 +43,17 @@ pub struct Collection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
 
-    /// Nodes to keep, in the vocabulary of [`NodeFilter`].
+    /// Nodes to keep, as [`Pattern`]s.
     ///
     /// Extra filtering on top of what each provider already does: the provider's
     /// filter is a property of the source, this one of the collection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub includes: Vec<String>,
+    pub includes: Vec<Pattern>,
 
-    /// Nodes to drop, in the same vocabulary. Takes precedence over
+    /// Nodes to drop, in the same shape. Takes precedence over
     /// [`includes`](Self::includes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub excludes: Vec<String>,
+    pub excludes: Vec<Pattern>,
 
     /// The format this collection's artifact is written in.
     ///
@@ -284,14 +284,11 @@ mod tests {
     }
 
     fn filter(include: &[&str], exclude: &[&str]) -> NodeFilter {
-        let owned = |patterns: &[&str]| {
-            patterns
-                .iter()
-                .map(|pattern| pattern.to_string())
-                .collect::<Vec<_>>()
-        };
-
-        NodeFilter::compile(&owned(include), &owned(exclude)).expect("the fixture compiles")
+        NodeFilter::compile(
+            &crate::filter::prefixed(include),
+            &crate::filter::prefixed(exclude),
+        )
+        .expect("the fixture compiles")
     }
 
     fn unfiltered() -> NodeFilter {
@@ -638,7 +635,7 @@ mod tests {
     fn the_collections_own_filter_is_validated_like_a_providers() {
         let broken = Collection {
             providers: vec!["alpha".to_string()],
-            includes: vec!["regex:(".to_string()],
+            includes: crate::filter::prefixed(&["regex:("]),
             ..Collection::default()
         };
 

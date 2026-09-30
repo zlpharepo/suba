@@ -877,7 +877,7 @@ mod tests {
 
         let filtered = Collection {
             providers: vec!["alpha".to_string()],
-            excludes: vec!["JP-01".to_string()],
+            excludes: vec![suba_core::Pattern::Name("JP-01".to_string())],
             ..Collection::default()
         };
         state.collections().insert("main", filtered).await.unwrap();
@@ -900,7 +900,7 @@ mod tests {
         let state = state().await;
         let provider = Provider::Inline(Inline {
             shared: SharedFields {
-                excludes: vec!["JP-01".to_string()],
+                excludes: vec![suba_core::Pattern::Name("JP-01".to_string())],
                 ..SharedFields::default()
             },
             payload: format!(

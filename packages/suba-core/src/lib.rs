@@ -37,7 +37,7 @@ pub mod subscription;
 pub use suba_proto as proto;
 
 pub use collection::{Collection, Resolved, View};
-pub use filter::{FilterError, NodeFilter, PatternReason};
+pub use filter::{FilterError, NodeFilter, Pattern, PatternReason};
 #[cfg(feature = "singbox")]
 pub use format::outbounds;
 pub use format::{

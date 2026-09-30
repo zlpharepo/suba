@@ -260,6 +260,13 @@ mod tests {
         format!("trojan://{SENTINEL}@{host}:443#{name}\n")
     }
 
+    fn keywords(keywords: &[&str]) -> Vec<suba_core::Pattern> {
+        keywords
+            .iter()
+            .map(|keyword| suba_core::Pattern::Keyword(keyword.to_string()))
+            .collect()
+    }
+
     async fn inline(
         state: &AppState,
         name: &str,
@@ -269,8 +276,8 @@ mod tests {
     ) {
         let provider = Provider::Inline(Inline {
             shared: SharedFields {
-                includes: includes.iter().map(|pattern| pattern.to_string()).collect(),
-                excludes: excludes.iter().map(|pattern| pattern.to_string()).collect(),
+                includes: keywords(includes),
+                excludes: keywords(excludes),
                 ..SharedFields::default()
             },
             payload: payload.to_string(),
@@ -334,8 +341,8 @@ mod tests {
                 link("b.example.com", "US-LAX-01"),
                 link("c.example.com", "JP-01")
             ),
-            &["keyword:US"],
-            &["keyword:LAX"],
+            &["US"],
+            &["LAX"],
         )
         .await;
 

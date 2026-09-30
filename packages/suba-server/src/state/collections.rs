@@ -260,7 +260,7 @@ mod tests {
 
         let broken = Collection {
             providers: vec!["airport".to_string()],
-            includes: vec!["regex:(".to_string()],
+            includes: vec![suba_core::Pattern::Regex("(".to_string())],
             ..Collection::default()
         };
 
@@ -428,8 +428,8 @@ mod tests {
                 "main",
                 Collection {
                     providers: vec!["airport".to_string()],
-                    includes: vec!["keyword:US".to_string()],
-                    excludes: vec!["keyword:LAX".to_string()],
+                    includes: vec![suba_core::Pattern::Keyword("US".to_string())],
+                    excludes: vec![suba_core::Pattern::Keyword("LAX".to_string())],
                     ..Collection::default()
                 },
             )
