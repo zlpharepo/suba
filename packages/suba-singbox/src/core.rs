@@ -69,6 +69,40 @@ pub enum Error {
     /// The bytes are not the bytes that were recorded.
     #[error("the bytes hash to {found}, not the recorded {expected}")]
     Hash { expected: String, found: String },
+    /// The version is already on this machine.
+    #[error("{version} is already installed")]
+    Installed { version: Version },
+    /// The version is not on this machine.
+    #[error("{version} is not installed")]
+    NotInstalled { version: Version },
+    /// The version is the current one, which is not removed from under it.
+    #[error("{version} is the current version")]
+    Current { version: Version },
+    /// A file this module owns could not be read or written.
+    ///
+    /// Where it happened is this module's own description, and the reason is the
+    /// kind of failure rather than the operating system's message, which would
+    /// carry a path a caller gave us.
+    #[error("{at}: {reason}")]
+    Files {
+        at: &'static str,
+        reason: &'static str,
+    },
+    /// A version's record does not say what a record says.
+    #[error("{version}: {reason}")]
+    Record {
+        version: String,
+        reason: &'static str,
+    },
+    /// The binary was asked to write its own schema and did not.
+    #[error("the schema could not be generated: {reason}")]
+    Run { reason: &'static str },
+    /// A release server answered with an error status.
+    #[error("the release server answered {status}: {hint}")]
+    Refused { status: u16, hint: &'static str },
+    /// A request did not come back.
+    #[error("the request did not come back: {reason}")]
+    Network { reason: &'static str },
 }
 
 /// A version sing-box publishes: the release tag without its leading `v`.

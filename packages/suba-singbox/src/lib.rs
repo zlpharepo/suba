@@ -23,6 +23,9 @@ pub mod assemble;
 pub mod core;
 
 #[cfg(feature = "core")]
+pub mod install;
+
+#[cfg(feature = "core")]
 pub mod schema;
 
 #[cfg(feature = "render")]

@@ -1,0 +1,756 @@
+//! Putting a version on this machine, and taking one off.
+//!
+//! An install is one operation with one outcome: either the version is there,
+//! complete — binary, licence, its own schema, and the record of what was
+//! measured — or nothing has changed at all. It gets there by unpacking into a
+//! directory beside the final one, asking the unpacked binary to write its
+//! schema there, and only then renaming that directory into place. A rename
+//! within one directory is the moment the version appears; there is no in
+//! between state for anything else to read.
+//!
+//! **What the record is.** Facts only, and each of them measured here or given
+//! by whoever published the release: the bytes of the archive, of the binary,
+//! and of the schema. The schema is the binary's own output — `sing-box schema`
+//! — so "this version's grammar" is not a claim about the version, it is the
+//! version.
+//!
+//! **What a caller has to bring.** The archive's bytes, the digest it was
+//! published with (the release API carries one), the clock, and — for the two
+//! functions that use the network — an HTTP client and a URL. Nothing here looks
+//! a URL up on its own or reads a clock, so every one of these can be exercised
+//! without a network and at a fixed time.
+
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use crate::core::{extract, sha256_hex, Dirs, Error, Metadata, Release, Version};
+
+/// The name the binary has inside a release archive, and the name it keeps.
+const BINARY: &str = "sing-box";
+
+/// The licence that travels beside it.
+const LICENSE: &str = "LICENSE";
+
+/// How large an asset may be before this build stops reading it.
+///
+/// A released archive for one platform is tens of megabytes; the cap is what
+/// keeps a mistyped URL or a hostile answer from filling memory.
+pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What `current.json` holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Current {
+    version: Version,
+}
+
+/// Install a version from the bytes of its release archive.
+///
+/// `expected` is the sha256 the release was published with, when there is one:
+/// the archive is refused unless it hashes to exactly that. `now` is the clock,
+/// passed in rather than read.
+///
+/// The version is refused if it is already installed — a caller that wants
+/// installing to be idempotent checks first, so that "already there" can be
+/// answered without downloading anything.
+pub fn install(
+    dirs: &Dirs,
+    version: &Version,
+    platform: &str,
+    asset: &str,
+    archive: &[u8],
+    expected: Option<&str>,
+    now: i64,
+) -> Result<Metadata, Error> {
+    if dirs.metadata(version).exists() {
+        return Err(Error::Installed {
+            version: version.clone(),
+        });
+    }
+
+    let asset_sha256 = sha256_hex(archive);
+    if let Some(expected) = expected {
+        if expected != asset_sha256 {
+            return Err(Error::Hash {
+                expected: expected.to_string(),
+                found: asset_sha256,
+            });
+        }
+    }
+
+    let extracted = extract(archive)?;
+    let binary_sha256 = sha256_hex(&extracted.binary);
+
+    let staging = stage(dirs, version);
+
+    // One operation with one outcome: whatever fails inside here, nothing of the
+    // half-built version is left beside the ones that work.
+    let built = (|| -> Result<Metadata, Error> {
+        let bin = staging.join("bin");
+        create_dir(&bin, "the version's own directory")?;
+
+        write(&bin.join(BINARY), &extracted.binary, true)?;
+        write(&bin.join(LICENSE), &extracted.license, false)?;
+
+        let schema = staging.join("schema.json");
+        let metadata = Metadata {
+            version: version.clone(),
+            tag: version.tag(),
+            asset: asset.to_string(),
+            platform: platform.to_string(),
+            asset_sha256,
+            binary_sha256,
+            schema_sha256: generate_schema(&bin.join(BINARY), &schema)?,
+            installed_at: now,
+        };
+
+        let record = serde_json::to_vec_pretty(&metadata).map_err(|_| Error::Files {
+            at: "the version's record",
+            reason: "it does not serialise",
+        })?;
+        write(&staging.join("metadata.json"), &record, false)?;
+
+        // The version appears here, and only here.
+        fs::rename(&staging, dirs.version(version)).map_err(|error| Error::Files {
+            at: "putting the version in place",
+            reason: reason_of(&error),
+        })?;
+
+        Ok(metadata)
+    })();
+
+    if built.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    built
+}
+
+/// Where a version is built before it exists.
+///
+/// Beside the versions rather than anywhere else, because a rename only replaces
+/// what it can reach in one directory.
+fn stage(dirs: &Dirs, version: &Version) -> PathBuf {
+    dirs.versions().join(format!(
+        ".{}.{}-staging",
+        version.as_str(),
+        std::process::id()
+    ))
+}
+
+/// Ask a binary to write its own schema, and measure what it wrote.
+fn generate_schema(binary: &Path, schema: &Path) -> Result<String, Error> {
+    let ran = Command::new(binary)
+        .arg("schema")
+        .arg("-o")
+        .arg(schema)
+        .output()
+        .map_err(|_| Error::Run {
+            reason: "the binary could not be started",
+        })?;
+
+    if !ran.status.success() {
+        return Err(Error::Run {
+            reason: "the binary did not write its schema",
+        });
+    }
+
+    let generated = fs::read(schema).map_err(|error| Error::Files {
+        at: "the schema the binary wrote",
+        reason: reason_of(&error),
+    })?;
+
+    Ok(sha256_hex(&generated))
+}
+
+/// The versions this machine has, oldest name first.
+///
+/// Read from the directories and their records, without running anything: a
+/// version whose record cannot be read is reported rather than left out, because
+/// an installed version that quietly does not appear is a version someone will
+/// install twice.
+pub fn installed(dirs: &Dirs) -> Result<Vec<Metadata>, Error> {
+    let listing = match fs::read_dir(dirs.versions()) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(Error::Files {
+                at: "listing the installed versions",
+                reason: reason_of(&error),
+            })
+        }
+    };
+
+    let mut versions = Vec::new();
+    for entry in listing {
+        let entry = entry.map_err(|error| Error::Files {
+            at: "listing the installed versions",
+            reason: reason_of(&error),
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        // A staging directory is an install that did not finish.
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let record = entry.path().join("metadata.json");
+        let bytes = fs::read(&record).map_err(|error| Error::Record {
+            version: name.clone(),
+            reason: match error.kind() {
+                std::io::ErrorKind::NotFound => "there is no record",
+                _ => "the record cannot be read",
+            },
+        })?;
+        let metadata: Metadata = serde_json::from_slice(&bytes).map_err(|_| Error::Record {
+            version: name.clone(),
+            reason: "the record is not a record",
+        })?;
+
+        versions.push(metadata);
+    }
+
+    versions.sort_by(|one, other| one.version.cmp(&other.version));
+
+    Ok(versions)
+}
+
+/// Which version is current, when one is.
+pub fn current(dirs: &Dirs) -> Result<Option<Version>, Error> {
+    let bytes = match fs::read(dirs.current()) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::Files {
+                at: "the current version",
+                reason: reason_of(&error),
+            })
+        }
+    };
+
+    let current: Current = serde_json::from_slice(&bytes).map_err(|_| Error::Record {
+        version: "current".to_string(),
+        reason: "the current version is not a record",
+    })?;
+
+    Ok(Some(current.version))
+}
+
+/// Make an installed version the current one.
+///
+/// Written beside the file it replaces and renamed onto it, so a reader finds
+/// either the version that was current or the one that is: a half-written file
+/// would make the whole record unreadable.
+pub fn set_current(dirs: &Dirs, version: &Version) -> Result<(), Error> {
+    if !dirs.metadata(version).exists() {
+        return Err(Error::NotInstalled {
+            version: version.clone(),
+        });
+    }
+
+    let record = serde_json::to_vec_pretty(&Current {
+        version: version.clone(),
+    })
+    .map_err(|_| Error::Files {
+        at: "the current version",
+        reason: "it does not serialise",
+    })?;
+
+    let staging = dirs
+        .current()
+        .with_extension(format!("{}.staging", std::process::id()));
+    write(&staging, &record, false)?;
+    fs::rename(&staging, dirs.current()).map_err(|error| Error::Files {
+        at: "the current version",
+        reason: reason_of(&error),
+    })
+}
+
+/// Remove an installed version.
+///
+/// The current version is refused: whichever version is being run, it is the one
+/// a machine falls back to, so removing it is a decision a caller has to make
+/// explicitly by switching first.
+pub fn uninstall(dirs: &Dirs, version: &Version) -> Result<(), Error> {
+    if !dirs.metadata(version).exists() {
+        return Err(Error::NotInstalled {
+            version: version.clone(),
+        });
+    }
+    if current(dirs)?.as_ref() == Some(version) {
+        return Err(Error::Current {
+            version: version.clone(),
+        });
+    }
+
+    fs::remove_dir_all(dirs.version(version)).map_err(|error| Error::Files {
+        at: "removing the version",
+        reason: reason_of(&error),
+    })
+}
+
+/// What a release server lists.
+///
+/// The URL is the caller's: this crate knows the shape of what GitHub's release
+/// API answers, not where to find it.
+pub async fn releases(client: &reqwest::Client, url: &str) -> Result<Vec<Release>, Error> {
+    let answer = client.get(url).send().await.map_err(|_| Error::Network {
+        reason: "the release server could not be reached",
+    })?;
+
+    let status = answer.status();
+    if !status.is_success() {
+        return Err(refused(status.as_u16()));
+    }
+
+    let body = answer.bytes().await.map_err(|_| Error::Network {
+        reason: "the release listing stopped part way",
+    })?;
+
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| Error::Release {
+        field: "the listing",
+    })?;
+    let listed = value.as_array().ok_or(Error::Release {
+        field: "the listing",
+    })?;
+
+    listed.iter().map(Release::from_json).collect()
+}
+
+/// The bytes of one release asset.
+pub async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Error> {
+    let answer = client.get(url).send().await.map_err(|_| Error::Network {
+        reason: "the release server could not be reached",
+    })?;
+
+    let status = answer.status();
+    if !status.is_success() {
+        return Err(refused(status.as_u16()));
+    }
+
+    if answer
+        .content_length()
+        .is_some_and(|length| length > MAX_ASSET_BYTES)
+    {
+        return Err(Error::Archive {
+            reason: "the asset is larger than this build reads",
+        });
+    }
+
+    let body = answer.bytes().await.map_err(|_| Error::Network {
+        reason: "the download stopped part way",
+    })?;
+
+    if body.len() as u64 > MAX_ASSET_BYTES {
+        return Err(Error::Archive {
+            reason: "the asset is larger than this build reads",
+        });
+    }
+
+    Ok(body.to_vec())
+}
+
+/// What to say about a status a release server answered with.
+///
+/// A 403 from GitHub's API is almost always its rate limit, which a token lifts;
+/// saying so is the difference between a caller waiting and a caller fixing it.
+fn refused(status: u16) -> Error {
+    Error::Refused {
+        status,
+        hint: match status {
+            403 | 429 => {
+                "the release server is rate limiting anonymous requests; a token lifts this"
+            }
+            _ => "the release server refused the request",
+        },
+    }
+}
+
+fn create_dir(path: &Path, at: &'static str) -> Result<(), Error> {
+    fs::create_dir_all(path).map_err(|error| Error::Files {
+        at,
+        reason: reason_of(&error),
+    })
+}
+
+fn write(path: &Path, bytes: &[u8], executable: bool) -> Result<(), Error> {
+    fs::write(path, bytes).map_err(|error| Error::Files {
+        at: "a file of the version",
+        reason: reason_of(&error),
+    })?;
+
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).map_err(|error| {
+            Error::Files {
+                at: "the binary's permissions",
+                reason: reason_of(&error),
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
+/// What went wrong, in a word.
+///
+/// The kind rather than the message: an `io::Error`'s own text carries the path
+/// it was working on, and a path is a caller's detail rather than something an
+/// error body should hand back.
+fn reason_of(error: &std::io::Error) -> &'static str {
+    use std::io::ErrorKind as Kind;
+
+    match error.kind() {
+        Kind::NotFound => "it is not there",
+        Kind::PermissionDenied => "it is not permitted",
+        Kind::AlreadyExists => "it is already there",
+        Kind::InvalidInput => "the name is not usable",
+        _ => "the filesystem refused it",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::Version;
+
+    /// A release archive with a binary that writes a schema when asked — the one
+    /// thing an install needs a real binary for.
+    fn archive(schema: &str) -> Vec<u8> {
+        let binary = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = schema ] && [ \"$2\" = -o ]; then\n\
+             \tprintf '%s' '{schema}' > \"$3\"\n\
+             \texit 0\n\
+             fi\n\
+             exit 1\n"
+        );
+
+        members(&[
+            ("release/sing-box", binary.as_bytes()),
+            ("release/LICENSE", b"a licence"),
+        ])
+    }
+
+    /// A release archive with a binary that refuses to do anything.
+    fn broken_archive() -> Vec<u8> {
+        members(&[
+            ("release/sing-box", b"#!/bin/sh\nexit 1\n"),
+            ("release/LICENSE", b"a licence"),
+        ])
+    }
+
+    fn members(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::fast(),
+        ));
+
+        for (name, bytes) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, std::io::Cursor::new(bytes))
+                .expect("a member");
+        }
+
+        builder
+            .into_inner()
+            .expect("the encoder")
+            .finish()
+            .expect("gzip")
+    }
+
+    fn dirs() -> (Scratch, Dirs) {
+        let scratch = Scratch::new();
+        let dirs = Dirs::new(&scratch.0);
+
+        (scratch, dirs)
+    }
+
+    /// A directory of this test's own, removed when the test ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+            let path = std::env::temp_dir().join(format!(
+                "suba-singbox-install-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("a temporary directory");
+
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn install_one(dirs: &Dirs, version: &str) {
+        let version = Version::from_tag(version);
+
+        install(
+            dirs,
+            &version,
+            "linux-amd64",
+            &format!("sing-box-{version}-linux-amd64.tar.gz"),
+            &archive(r#"{"$defs":{}}"#),
+            None,
+            1_700_000_000,
+        )
+        .expect("an install");
+    }
+
+    #[test]
+    fn a_release_lands_complete_and_says_what_it_measured() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+        let metadata = install(
+            &dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive(r#"{"$defs":{}}"#),
+            None,
+            1_700_000_000,
+        )
+        .expect("an install");
+
+        assert_eq!(metadata.version, version);
+        assert_eq!(metadata.tag, "v1.14.2");
+        assert_eq!(metadata.platform, "linux-amd64");
+        assert_eq!(metadata.installed_at, 1_700_000_000);
+        assert_eq!(
+            metadata.asset_sha256,
+            sha256_hex(&archive(r#"{"$defs":{}}"#))
+        );
+        assert_eq!(metadata.schema_sha256, sha256_hex(br#"{"$defs":{}}"#));
+
+        let record: Metadata =
+            serde_json::from_slice(&fs::read(dirs.metadata(&version)).expect("a record"))
+                .expect("a readable record");
+        assert_eq!(record, metadata);
+
+        // The schema on disk is the one the record measured, and the binary is
+        // the one that wrote it.
+        assert_eq!(
+            sha256_hex(&fs::read(dirs.schema(&version)).expect("a schema")),
+            metadata.schema_sha256
+        );
+        assert_eq!(
+            sha256_hex(&fs::read(dirs.binary(&version)).expect("a binary")),
+            metadata.binary_sha256
+        );
+        assert!(dirs.license(&version).exists());
+
+        // Nothing half-built is left beside it.
+        let names: Vec<String> = fs::read_dir(dirs.versions())
+            .expect("the versions directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["1.14.2"]);
+    }
+
+    #[test]
+    fn an_archive_that_does_not_hash_to_what_was_promised_leaves_nothing() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+        let promised = sha256_hex(b"something else entirely");
+
+        let refused = install(
+            &dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive(r#"{"$defs":{}}"#),
+            Some(&promised),
+            1_700_000_000,
+        );
+
+        assert_eq!(
+            refused,
+            Err(Error::Hash {
+                expected: promised,
+                found: sha256_hex(&archive(r#"{"$defs":{}}"#)),
+            })
+        );
+        assert!(!dirs.version(&version).exists());
+        assert!(!dirs.versions().exists());
+    }
+
+    /// A digest that matches is recorded as given: it came from whoever
+    /// published the release, and it is the one a second install has to match.
+    #[test]
+    fn a_digest_that_matches_is_the_one_recorded() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+        let archive = archive(r#"{"$defs":{}}"#);
+        let digest = sha256_hex(&archive);
+
+        let metadata = install(
+            &dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive,
+            Some(&digest),
+            1_700_000_000,
+        )
+        .expect("an install");
+
+        assert_eq!(metadata.asset_sha256, digest);
+    }
+
+    #[test]
+    fn a_binary_that_will_not_write_its_schema_leaves_nothing() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+
+        let refused = install(
+            &dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &broken_archive(),
+            None,
+            1_700_000_000,
+        );
+
+        assert_eq!(
+            refused,
+            Err(Error::Run {
+                reason: "the binary did not write its schema",
+            })
+        );
+        assert!(!dirs.version(&version).exists());
+        let left: Vec<String> = fs::read_dir(dirs.versions())
+            .expect("the versions directory")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(left.is_empty(), "a failed install leaves nothing: {left:?}");
+    }
+
+    #[test]
+    fn installing_a_version_that_is_already_there_is_refused() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+        install_one(&dirs, "v1.14.2");
+        let before = fs::read(dirs.metadata(&version)).expect("the record");
+
+        let refused = install(
+            &dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive(r#"{"$defs":{}}"#),
+            None,
+            1_700_000_001,
+        );
+
+        assert_eq!(refused, Err(Error::Installed { version }));
+        assert_eq!(
+            fs::read(dirs.metadata(&Version::from_tag("v1.14.2"))).expect("the record"),
+            before
+        );
+    }
+
+    #[test]
+    fn the_versions_this_machine_has_are_listed_oldest_name_first() {
+        let (_root, dirs) = dirs();
+        install_one(&dirs, "v1.14.2");
+        install_one(&dirs, "v1.13.9");
+        install_one(&dirs, "v1.15.0-alpha.1");
+
+        let listed = installed(&dirs).expect("the installed versions");
+        let names: Vec<&str> = listed
+            .iter()
+            .map(|metadata| metadata.version.as_str())
+            .collect();
+
+        // An alpha sorts before the release it precedes, and 1.13.9 before both.
+        assert_eq!(names, ["1.13.9", "1.14.2", "1.15.0-alpha.1"]);
+    }
+
+    #[test]
+    fn a_version_with_no_record_is_reported_rather_than_left_out() {
+        let (_root, dirs) = dirs();
+        install_one(&dirs, "v1.14.2");
+        create_dir(&dirs.versions().join("1.13.9"), "a test directory").expect("a directory");
+
+        let refused = installed(&dirs);
+
+        assert_eq!(
+            refused,
+            Err(Error::Record {
+                version: "1.13.9".to_string(),
+                reason: "there is no record",
+            })
+        );
+    }
+
+    #[test]
+    fn the_current_version_is_the_one_that_was_set() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+
+        assert_eq!(current(&dirs).expect("a look"), None);
+
+        install_one(&dirs, "v1.14.2");
+        set_current(&dirs, &version).expect("a current version");
+
+        assert_eq!(current(&dirs).expect("a look"), Some(version));
+    }
+
+    #[test]
+    fn a_version_that_is_not_installed_cannot_be_made_current() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+
+        assert_eq!(
+            set_current(&dirs, &version),
+            Err(Error::NotInstalled { version })
+        );
+    }
+
+    #[test]
+    fn the_current_version_is_not_removable() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+        install_one(&dirs, "v1.14.2");
+        set_current(&dirs, &version).expect("a current version");
+
+        assert_eq!(uninstall(&dirs, &version), Err(Error::Current { version }));
+        assert!(dirs.version(&Version::from_tag("v1.14.2")).exists());
+
+        // And the other one is.
+        install_one(&dirs, "v1.13.9");
+        uninstall(&dirs, &Version::from_tag("v1.13.9")).expect("a removal");
+        assert_eq!(installed(&dirs).expect("the installed versions").len(), 1);
+    }
+}
