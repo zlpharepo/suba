@@ -11,14 +11,14 @@
 //! anything above it either.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     response::IntoResponse,
 };
 use http::{HeaderMap, StatusCode};
 
 use crate::{
     error::Error,
-    handlers::collections::{artifact_headers, artifact_of, Narrowing},
+    handlers::collections::{artifact_headers, artifact_of},
     tracing, AppState,
 };
 
@@ -26,9 +26,8 @@ use crate::{
 pub async fn serve(
     State(state): State<AppState>,
     Path((prefix, token)): Path<(String, String)>,
-    Query(narrowing): Query<Narrowing>,
 ) -> Result<impl IntoResponse, Error> {
-    let (headers, body) = deliver(&state, &prefix, &token, &narrowing).await?;
+    let (headers, body) = deliver(&state, &prefix, &token).await?;
 
     Ok((StatusCode::OK, headers, body))
 }
@@ -38,7 +37,6 @@ async fn deliver(
     state: &AppState,
     prefix: &str,
     token: &str,
-    narrowing: &Narrowing,
 ) -> Result<(HeaderMap, String), Error> {
     // A prefix this instance cannot use makes every delivery address nothing,
     // which is exactly what a wrong prefix means from outside — but the operator
@@ -64,7 +62,7 @@ async fn deliver(
 
     // The collection can go away between the lookup and the render; that is the
     // delivery's 404 too, never a message naming it.
-    let artifact = artifact_of(state, &name, narrowing)
+    let artifact = artifact_of(state, &name)
         .await
         .map_err(|error| match error {
             Error::CollectionNotFound(_) => Error::NoSuchDelivery,
@@ -155,9 +153,7 @@ mod tests {
         served(&state).await;
 
         let token = state.collections().mint_token("main").await.unwrap();
-        let (_, body) = deliver(&state, "s", &token, &Narrowing::default())
-            .await
-            .unwrap();
+        let (_, body) = deliver(&state, "s", &token).await.unwrap();
 
         assert!(body.contains("#US-01"), "{body}");
     }
@@ -168,13 +164,7 @@ mod tests {
         served(&state).await;
 
         assert!(matches!(
-            deliver(
-                &state,
-                "sub",
-                "0".repeat(64).as_str(),
-                &Narrowing::default()
-            )
-            .await,
+            deliver(&state, "sub", "0".repeat(64).as_str()).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -189,7 +179,7 @@ mod tests {
         let token = state.collections().mint_token("main").await.unwrap();
 
         assert!(matches!(
-            deliver(&state, "elsewhere", &token, &Narrowing::default()).await,
+            deliver(&state, "elsewhere", &token).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -203,7 +193,7 @@ mod tests {
         state.collections().revoke_token("main").await.unwrap();
 
         assert!(matches!(
-            deliver(&state, "s", &token, &Narrowing::default()).await,
+            deliver(&state, "s", &token).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -217,11 +207,9 @@ mod tests {
 
         let token = state.collections().mint_token("main").await.unwrap();
 
-        assert!(deliver(&state, "proxy", &token, &Narrowing::default())
-            .await
-            .is_ok());
+        assert!(deliver(&state, "proxy", &token).await.is_ok());
         assert!(matches!(
-            deliver(&state, "s", &token, &Narrowing::default()).await,
+            deliver(&state, "s", &token).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -237,11 +225,9 @@ mod tests {
 
         assert_ne!(old, new);
         assert!(matches!(
-            deliver(&state, "s", &old, &Narrowing::default()).await,
+            deliver(&state, "s", &old).await,
             Err(Error::NoSuchDelivery)
         ));
-        assert!(deliver(&state, "s", &new, &Narrowing::default())
-            .await
-            .is_ok());
+        assert!(deliver(&state, "s", &new).await.is_ok());
     }
 }

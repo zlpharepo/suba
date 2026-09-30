@@ -96,16 +96,6 @@ pub enum Error {
     #[error("subscription prefix: {reason}")]
     Prefix { reason: &'static str },
 
-    /// A query parameter this instance will not accept.
-    ///
-    /// The text is the parameter's name and a static reason, never the value,
-    /// which is operator data.
-    #[error("{parameter}: {reason}")]
-    Parameter {
-        parameter: &'static str,
-        reason: &'static str,
-    },
-
     /// The sing-box module refused something.
     #[cfg(feature = "singbox-core")]
     #[error(transparent)]
@@ -272,10 +262,6 @@ impl IntoHttpError for Error {
                     message: "Internal server error".to_string(),
                 }
             }
-            Error::Parameter { parameter, reason } => HttpError {
-                status_code: StatusCode::UNPROCESSABLE_ENTITY,
-                message: format!("{parameter}: {reason}"),
-            },
             Error::Request(_) => HttpError {
                 status_code: StatusCode::BAD_GATEWAY,
                 message: "Upstream request failed".to_string(),

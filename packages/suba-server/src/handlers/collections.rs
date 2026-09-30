@@ -3,7 +3,7 @@
 use std::{collections::BTreeMap, path::Path as StdPath};
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     response::IntoResponse,
     Json,
 };
@@ -158,45 +158,6 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// What a caller may narrow an artifact by.
-///
-/// Narrowing only: a request can say which of the nodes the collection serves it
-/// wants, never which format or direction — that is what the collection's own
-/// document declares, and letting a URL choose would make the URL a second
-/// source of truth for the same decision.
-#[derive(Debug, Default, Deserialize)]
-pub struct Narrowing {
-    /// Only these nodes, by identity, comma separated.
-    ///
-    /// An id the collection does not serve is not an error: it is simply not in
-    /// the answer, so a client holding a list that has moved on gets what is
-    /// still there.
-    pub ids: Option<String>,
-}
-
-impl Narrowing {
-    /// The identities asked for, when the request asked for any.
-    fn ids(&self) -> Result<Option<Vec<&str>>, Error> {
-        let Some(ids) = self.ids.as_deref() else {
-            return Ok(None);
-        };
-
-        let ids: Vec<&str> = ids
-            .split(',')
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .collect();
-
-        match ids.is_empty() {
-            true => Err(Error::Parameter {
-                parameter: "ids",
-                reason: "the value is empty",
-            }),
-            false => Ok(Some(ids)),
-        }
-    }
-}
-
 /// The delivery token, as the caller mints it.
 #[derive(Debug, Serialize)]
 pub struct Minted {
@@ -246,26 +207,17 @@ pub async fn revoke_token(
 pub(crate) async fn artifact_of(
     state: &AppState,
     name: &str,
-    narrowing: &Narrowing,
 ) -> Result<std::sync::Arc<Artifact>, Error> {
     let collection = state
         .collections()
         .get(name)
         .await
         .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
-    let only = narrowing.ids()?;
 
     let observations = state.providers().observations().await?;
     let declared = state.providers().formats().await;
 
-    let key = address(
-        state,
-        &collection,
-        &observations,
-        &declared,
-        only.as_deref(),
-    )
-    .await?;
+    let key = address(state, &collection, &observations, &declared).await?;
 
     if let Some(artifact) = state.rendered().get(&key) {
         return Ok(artifact);
@@ -293,14 +245,7 @@ pub(crate) async fn artifact_of(
         View::default(),
     );
 
-    let nodes: Vec<&IndexEntry> = match only.as_deref() {
-        Some(only) => resolved
-            .nodes
-            .into_iter()
-            .filter(|entry| only.contains(&entry.id.to_string().as_str()))
-            .collect(),
-        None => resolved.nodes,
-    };
+    let nodes = resolved.nodes;
 
     // The direction is asked for explicitly, and today every compiled format
     // writes the client one; a format that grew a server direction would have to
@@ -329,7 +274,6 @@ async fn address(
     collection: &Collection,
     observations: &BTreeMap<String, Observation>,
     declared: &BTreeMap<String, suba_core::subscription::DeclaredFormat>,
-    only: Option<&[&str]>,
 ) -> Result<String, Error> {
     let mut key = String::new();
 
@@ -352,15 +296,6 @@ async fn address(
         }
     }
 
-    if let Some(only) = only {
-        let mut only = only.to_vec();
-        only.sort_unstable();
-
-        for id in only {
-            key.push_str(id);
-        }
-    }
-
     Ok(suba_core::checksum::sha256_hex(key.as_bytes()))
 }
 
@@ -377,9 +312,8 @@ pub async fn content(
     _auth: Authenticated,
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Query(narrowing): Query<Narrowing>,
 ) -> ResponseResult<impl IntoResponse> {
-    let artifact = artifact_of(&state, &name, &narrowing).await?;
+    let artifact = artifact_of(&state, &name).await?;
 
     Ok((artifact_headers(&artifact), artifact.body.to_string()))
 }
@@ -472,26 +406,13 @@ mod artifact_tests {
         state.collections().insert(name, collection).await.unwrap();
     }
 
-    fn narrowing(ids: Option<&str>) -> Narrowing {
-        Narrowing {
-            ids: ids.map(str::to_owned),
-        }
-    }
-
-    /// The identity of the one node a payload serves.
-    async fn id_of(state: &AppState, collection: &str) -> String {
-        let Nodes { nodes, .. } = nodes_of(state, collection).await.unwrap();
-
-        nodes[0].id.clone()
-    }
-
     #[tokio::test]
     async fn the_artifact_is_what_the_payloads_hold() {
         let state = state().await;
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"], Format::Links).await;
 
-        let artifact = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        let artifact = artifact_of(&state, "main").await.unwrap();
 
         assert_eq!(artifact.nodes, 1);
         assert_eq!(artifact.skipped, 0);
@@ -510,7 +431,7 @@ mod artifact_tests {
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"], Format::Clash).await;
 
-        let artifact = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        let artifact = artifact_of(&state, "main").await.unwrap();
 
         assert!(
             artifact.body.contains("proxies:"),
@@ -528,8 +449,8 @@ mod artifact_tests {
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"], Format::Links).await;
 
-        let once = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
-        let twice = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        let once = artifact_of(&state, "main").await.unwrap();
+        let twice = artifact_of(&state, "main").await.unwrap();
 
         assert_eq!(once.body, twice.body);
         assert!(std::sync::Arc::ptr_eq(&once, &twice), "the same artifact");
@@ -549,68 +470,11 @@ mod artifact_tests {
         collection(&state, "main", &["alpha"], Format::Links).await;
 
         let before = std::fs::read_dir(state.data_dir()).map(Iterator::count);
-        artifact_of(&state, "main", &narrowing(None)).await.unwrap();
-        artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        artifact_of(&state, "main").await.unwrap();
+        artifact_of(&state, "main").await.unwrap();
         let after = std::fs::read_dir(state.data_dir()).map(Iterator::count);
 
         assert_eq!(before.unwrap(), after.unwrap(), "two renders add no files");
-    }
-
-    #[tokio::test]
-    async fn a_request_can_only_narrow_what_it_is_served() {
-        let state = state().await;
-        inline(
-            &state,
-            "alpha",
-            &format!(
-                "{}{}",
-                link("alpha.example.com", "US-01"),
-                link("beta.example.com", "JP-01")
-            ),
-        )
-        .await;
-        collection(&state, "main", &["alpha"], Format::Links).await;
-
-        let all = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
-        assert!(all.body.contains("#US-01") && all.body.contains("#JP-01"));
-
-        let one = id_of(&state, "main").await;
-        let narrowed = artifact_of(&state, "main", &narrowing(Some(&one)))
-            .await
-            .unwrap();
-
-        assert!(narrowed.body.contains("#US-01"));
-        assert!(!narrowed.body.contains("#JP-01"), "{}", narrowed.body);
-        assert_eq!(narrowed.nodes, 1);
-
-        // An id nobody serves is not an error and not an answer: nothing comes
-        // back, and nothing else the collection holds comes with it either.
-        let none = artifact_of(&state, "main", &narrowing(Some("not-a-node")))
-            .await
-            .unwrap();
-
-        assert!(none.body.is_empty(), "{}", none.body);
-        assert_eq!(none.nodes, 0);
-    }
-
-    #[tokio::test]
-    async fn an_empty_narrowing_is_refused_rather_than_guessed() {
-        assert!(matches!(
-            narrowing(Some("")).ids(),
-            Err(Error::Parameter {
-                parameter: "ids",
-                ..
-            })
-        ));
-        assert!(matches!(
-            narrowing(Some(" , ")).ids(),
-            Err(Error::Parameter {
-                parameter: "ids",
-                ..
-            })
-        ));
-        assert!(narrowing(None).ids().unwrap().is_none());
-        assert_eq!(narrowing(Some("a, b")).ids().unwrap().unwrap(), ["a", "b"]);
     }
 }
 
