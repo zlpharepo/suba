@@ -12,7 +12,7 @@ default = ["render"]
 render = []
 # Knowing and installing the sing-box versions this machine can run. Needs the
 # network, the filesystem and processes; needs nothing from `render` to do it.
-core = ["dep:regex", "dep:reqwest"]
+core = ["dep:regex", "dep:reqwest", "dep:rustix"]
 
 [dependencies]
 suba-proto = { workspace = true }
@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 flate2 = { workspace = true }
 regex = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 tar.workspace = true

@@ -25,6 +25,9 @@ pub mod core;
 #[cfg(feature = "core")]
 pub mod install;
 
+#[cfg(all(feature = "core", unix))]
+pub mod run;
+
 #[cfg(feature = "core")]
 pub mod schema;
 

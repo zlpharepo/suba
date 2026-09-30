@@ -95,8 +95,11 @@ pub enum Error {
         reason: &'static str,
     },
     /// The binary was asked to write its own schema and did not.
-    #[error("the schema could not be generated: {reason}")]
+    #[error("the process did not do what it was asked: {reason}")]
     Run { reason: &'static str },
+    /// A process is already running, and there is one at a time.
+    #[error("a process is already running as {pid}")]
+    Running { pid: u32 },
     /// A release server answered with an error status.
     #[error("the release server answered {status}: {hint}")]
     Refused { status: u16, hint: &'static str },
