@@ -16,10 +16,11 @@
 //! must not turn a name into a pattern: `keyword:` and `regex:` are opt-in.
 //!
 //! Patterns inside one list are alternatives. [`NodeFilter`] holds the two
-//! lists: a name survives when `include` admits it (or there is no `include`)
-//! and `exclude` does not. `exclude` wins, because the two lists are written for
-//! different reasons — one says what the operator wants, the other what they
-//! never want.
+//! lists and applies them in one order: exclusion first, then inclusion. A name
+//! the `exclude` list matches is dropped there and then, so a name matching both
+//! lists is out — the lists are written for different reasons (one says what the
+//! operator wants, the other what they never want), and "never" is the one that
+//! has to survive a `keep` pattern that is broader than intended.
 //!
 //! Matching is case-sensitive, as the names are: two nodes differing only in
 //! case are two names, and folding them would make the outcome depend on the
@@ -51,17 +52,22 @@ impl NodeFilter {
     }
 
     /// Whether a node with this name survives the filter.
+    ///
+    /// Exclusion first, then inclusion: a name the operator asked to drop is
+    /// dropped before the allowlist is even consulted, so a name matching both
+    /// lists is out. The other order would let "keep" override "drop", which is
+    /// the wrong way round for a list of things the operator never wants.
     pub fn admits(&self, name: &str) -> bool {
-        let allowed = match &self.include {
-            Some(set) => set.is_match(name),
-            None => true,
-        };
-        let denied = match &self.exclude {
-            Some(set) => set.is_match(name),
-            None => false,
-        };
+        if let Some(exclude) = &self.exclude {
+            if exclude.is_match(name) {
+                return false;
+            }
+        }
 
-        allowed && !denied
+        match &self.include {
+            Some(include) => include.is_match(name),
+            None => true,
+        }
     }
 
     /// Whether this filter keeps everything, so a caller can skip it.
