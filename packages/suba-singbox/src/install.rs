@@ -352,16 +352,153 @@ pub async fn download(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, Er
     Ok(body.to_vec())
 }
 
+/// What a caller may ask the core to generate.
+///
+/// A whitelist, and not one the core enforces: measured on 1.14.2,
+/// `sing-box generate <anything>` **exits 0** and prints its usage, so a build
+/// that passed a caller's string through would report success for a command that
+/// never ran. Every argument below is this module's, never the caller's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+pub enum Generate {
+    /// `generate ech-keypair <server name>`
+    #[serde(rename = "ech-keypair")]
+    EchKeyPair,
+    /// `generate rand [--hex] <length>`
+    #[serde(rename = "rand")]
+    Rand,
+    /// `generate reality-keypair`
+    #[serde(rename = "reality-keypair")]
+    RealityKeyPair,
+    /// `generate tls-keypair <server name>`
+    #[serde(rename = "tls-keypair")]
+    TlsKeyPair,
+    /// `generate uuid`
+    #[serde(rename = "uuid")]
+    Uuid,
+    /// `generate vapid-keypair`
+    #[serde(rename = "vapid-keypair")]
+    VapidKeyPair,
+    /// `generate wg-keypair`
+    #[serde(rename = "wg-keypair")]
+    WgKeyPair,
+}
+
+impl Generate {
+    /// The subcommand, as the core spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Generate::EchKeyPair => "ech-keypair",
+            Generate::Rand => "rand",
+            Generate::RealityKeyPair => "reality-keypair",
+            Generate::TlsKeyPair => "tls-keypair",
+            Generate::Uuid => "uuid",
+            Generate::VapidKeyPair => "vapid-keypair",
+            Generate::WgKeyPair => "wg-keypair",
+        }
+    }
+
+    /// What it needs beside its own name.
+    pub fn needs(self) -> Needs {
+        match self {
+            Generate::EchKeyPair | Generate::TlsKeyPair => Needs::Name,
+            Generate::Rand => Needs::Length,
+            _ => Needs::Nothing,
+        }
+    }
+}
+
+/// What a subcommand needs from a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Needs {
+    Nothing,
+    /// A name the certificate or the ECH configuration is for.
+    Name,
+    /// How many bytes of randomness to generate.
+    Length,
+}
+
+/// The longest name this build passes on: a host name cannot be longer.
+const MAX_NAME: usize = 253;
+
+/// The most randomness this build asks for: a core printing more than this on
+/// one call is not something a request should be able to do.
+const MAX_LENGTH: u32 = 4096;
+
+/// Ask the installed binary for something it generates.
+///
+/// What comes back is a credential — a private key, a uuid — so it is handed to
+/// the caller as it came and written nowhere else: not a log, not a file, and
+/// never into an error. The caller names one of [`Generate`]; the arguments are
+/// built here.
+pub fn generate(
+    dirs: &Dirs,
+    version: &Version,
+    kind: Generate,
+    argument: Option<&str>,
+) -> Result<String, Error> {
+    let mut command = Command::new(dirs.binary(version));
+    command.arg("generate").arg(kind.as_str());
+
+    match kind.needs() {
+        Needs::Nothing => {}
+        Needs::Length => {
+            let length = argument
+                .and_then(|text| text.parse::<u32>().ok())
+                .filter(|length| (1..=MAX_LENGTH).contains(length))
+                .ok_or(Error::Generate {
+                    command: kind.as_str(),
+                    reason: "that is not a length this build asks for",
+                })?;
+
+            // Hex, because the text goes into a configuration and a mixture of
+            // bytes would not: this is the one spelling of `rand` that is text.
+            command.arg("--hex").arg(length.to_string());
+        }
+        Needs::Name => {
+            let name = argument
+                .filter(|name| {
+                    !name.is_empty()
+                        && name.len() <= MAX_NAME
+                        && !name.starts_with('-')
+                        && !name.contains('\0')
+                        && !name.contains('\n')
+                })
+                .ok_or(Error::Generate {
+                    command: kind.as_str(),
+                    reason: "that is not a name this build passes on",
+                })?;
+
+            command.arg(name);
+        }
+    }
+
+    let ran = command.output().map_err(|_| Error::Generate {
+        command: kind.as_str(),
+        reason: "the binary could not be started",
+    })?;
+
+    if !ran.status.success() {
+        return Err(Error::Generate {
+            command: kind.as_str(),
+            reason: "the binary refused to generate anything",
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&ran.stdout).trim_end().to_string())
+}
+
 /// What to say about a status a release server answered with.
 ///
-/// A 403 from GitHub's API is almost always its rate limit, which a token lifts;
-/// saying so is the difference between a caller waiting and a caller fixing it.
+/// A `403` or `429` is usually a limit on this instance rather than a mistake in
+/// the request, and saying so is the difference between a caller waiting and a
+/// caller looking elsewhere. What this module cannot do is lift the limit, so
+/// the hint does not pretend that it can.
 fn refused(status: u16) -> Error {
     Error::Refused {
         status,
         hint: match status {
             403 | 429 => {
-                "the release server is rate limiting anonymous requests; a token lifts this"
+                "the release server is refusing requests from this instance, which is how it limits them"
             }
             _ => "the release server refused the request",
         },
@@ -434,6 +571,42 @@ mod tests {
             ("release/sing-box", binary.as_bytes()),
             ("release/LICENSE", b"a licence"),
         ])
+    }
+
+    /// A release archive whose binary writes its schema and then does whatever
+    /// the test told it to.
+    fn archive_running(script: &str) -> Vec<u8> {
+        let binary = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = schema ] && [ \"$2\" = -o ]; then\n\
+             \tprintf '%s' '{{\"$defs\":{{}}}}' > \"$3\"\n\
+             \texit 0\n\
+             fi\n\
+             {script}"
+        );
+
+        members(&[
+            ("release/sing-box", binary.as_bytes()),
+            ("release/LICENSE", b"a licence"),
+        ])
+    }
+
+    /// Install a version whose binary runs `script` for anything but `schema`.
+    fn install_script(dirs: &Dirs, script: &str) -> Version {
+        let version = Version::from_tag("v1.14.2");
+
+        install(
+            dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &archive_running(script),
+            None,
+            1_700_000_000,
+        )
+        .expect("an install");
+
+        version
     }
 
     /// A release archive with a binary that refuses to do anything.
@@ -654,6 +827,156 @@ mod tests {
             })
             .collect();
         assert!(left.is_empty(), "a failed install leaves nothing: {left:?}");
+    }
+
+    #[test]
+    fn a_generate_command_is_named_the_way_the_binary_names_it() {
+        // The wire name and the subcommand are the same word: a request says
+        // what it wants run, and a name this enum misspells would be a name the
+        // binary refuses at run time rather than one refused here. The list is
+        // what `sing-box generate` answers to, read off the binary itself.
+        let known = [
+            "ech-keypair",
+            "rand",
+            "reality-keypair",
+            "tls-keypair",
+            "uuid",
+            "vapid-keypair",
+            "wg-keypair",
+        ];
+        let mut named = Vec::new();
+
+        for kind in [
+            Generate::EchKeyPair,
+            Generate::Rand,
+            Generate::RealityKeyPair,
+            Generate::TlsKeyPair,
+            Generate::Uuid,
+            Generate::VapidKeyPair,
+            Generate::WgKeyPair,
+        ] {
+            let wire = serde_json::to_string(kind.as_str()).expect("a string");
+
+            assert_eq!(
+                serde_json::from_str::<Generate>(&wire).unwrap_or_else(|_| panic!(
+                    "{} is not a name this enum answers to",
+                    kind.as_str()
+                )),
+                kind
+            );
+            named.push(kind.as_str());
+        }
+
+        named.sort_unstable();
+
+        assert_eq!(named, known);
+    }
+
+    #[test]
+    fn a_generate_command_says_what_the_core_printed() {
+        let (_root, dirs) = dirs();
+        let version = install_script(&dirs, "echo 'PrivateKey: abc'; echo 'PublicKey: def'\n");
+
+        let printed =
+            generate(&dirs, &version, Generate::RealityKeyPair, None).expect("a key pair");
+
+        assert_eq!(printed, "PrivateKey: abc\nPublicKey: def");
+    }
+
+    #[test]
+    fn a_generate_command_that_refuses_is_refused() {
+        let (_root, dirs) = dirs();
+        let version = install_script(&dirs, "exit 1\n");
+
+        assert_eq!(
+            generate(&dirs, &version, Generate::Uuid, None),
+            Err(Error::Generate {
+                command: "uuid",
+                reason: "the binary refused to generate anything",
+            })
+        );
+    }
+
+    /// What these commands print is a credential, so a failure must not carry
+    /// it — an error that quoted the output would put a private key in a log.
+    #[test]
+    fn what_a_generate_command_printed_is_not_in_what_it_failed_with() {
+        const SENTINEL: &str = "SENTINELPRIVATEKEY";
+
+        let (_root, dirs) = dirs();
+        let version = install_script(
+            &dirs,
+            &format!(
+                "echo '{SENTINEL}'; exit 1
+"
+            ),
+        );
+        let error = generate(&dirs, &version, Generate::RealityKeyPair, None)
+            .expect_err("the script exits non-zero");
+        let printed = error.to_string();
+
+        assert!(
+            !printed.contains(SENTINEL),
+            "the failure quoted what was printed: {printed}"
+        );
+        assert_eq!(
+            error,
+            Error::Generate {
+                command: "reality-keypair",
+                reason: "the binary refused to generate anything",
+            }
+        );
+    }
+
+    /// The whole command line is this module's: what a caller may add is one
+    /// length or one name, and neither is passed on unread.
+    #[test]
+    fn the_arguments_a_generate_command_takes_are_this_builds() {
+        let (_root, dirs) = dirs();
+        let version = install_script(&dirs, "printf '%s\\n' \"$@\"\n");
+
+        let printed = generate(&dirs, &version, Generate::Rand, Some("8")).expect("randomness");
+        assert_eq!(
+            printed.lines().collect::<Vec<_>>(),
+            ["generate", "rand", "--hex", "8"]
+        );
+
+        for refused in [Some("0"), Some("99999"), Some("8; rm -rf /"), None] {
+            assert!(
+                matches!(
+                    generate(&dirs, &version, Generate::Rand, refused),
+                    Err(Error::Generate {
+                        command: "rand",
+                        ..
+                    })
+                ),
+                "rand takes a length, and only a length this build asks for: {refused:?}"
+            );
+        }
+
+        let printed =
+            generate(&dirs, &version, Generate::TlsKeyPair, Some("example.com")).expect("a name");
+        assert_eq!(
+            printed.lines().collect::<Vec<_>>(),
+            ["generate", "tls-keypair", "example.com"]
+        );
+
+        for refused in [Some("--help"), Some(""), None] {
+            assert!(
+                matches!(
+                    generate(&dirs, &version, Generate::TlsKeyPair, refused),
+                    Err(Error::Generate {
+                        command: "tls-keypair",
+                        ..
+                    })
+                ),
+                "tls-keypair takes one name, and not one that is really a flag: {refused:?}"
+            );
+        }
+
+        // And one that takes nothing takes nothing, whatever a caller sends.
+        let printed = generate(&dirs, &version, Generate::Uuid, Some("--version")).expect("a uuid");
+        assert_eq!(printed.lines().collect::<Vec<_>>(), ["generate", "uuid"]);
     }
 
     #[test]

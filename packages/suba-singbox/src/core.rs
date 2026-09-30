@@ -75,9 +75,15 @@ pub enum Error {
     /// The version is not on this machine.
     #[error("{version} is not installed")]
     NotInstalled { version: Version },
+    /// The version is not one the release server publishes.
+    #[error("{version} is not a version the release server publishes")]
+    Unpublished { version: Version },
     /// The version is the current one, which is not removed from under it.
     #[error("{version} is the current version")]
     Current { version: Version },
+    /// The version is the one running, which is not removed from under it.
+    #[error("{version} is the version that is running")]
+    RunningVersion { version: Version },
     /// A file this module owns could not be read or written.
     ///
     /// Where it happened is this module's own description, and the reason is the
@@ -97,6 +103,15 @@ pub enum Error {
     /// The binary was asked to write its own schema and did not.
     #[error("the process did not do what it was asked: {reason}")]
     Run { reason: &'static str },
+    /// The core was asked to generate something and did not.
+    ///
+    /// The subcommand is named, and nothing it printed is: what it prints here
+    /// is a credential.
+    #[error("{command}: {reason}")]
+    Generate {
+        command: &'static str,
+        reason: &'static str,
+    },
     /// A process is already running, and there is one at a time.
     #[error("a process is already running as {pid}")]
     Running { pid: u32 },

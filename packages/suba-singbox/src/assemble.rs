@@ -175,6 +175,30 @@ pub fn assemble(
     fragments: &BTreeMap<String, Vec<u8>>,
     generated: &[Value],
 ) -> Result<Assembled, Unfit> {
+    let config = document(fragments, generated)?;
+
+    let links = scan(&config)?;
+    repeated(&links)?;
+    resolve(&links)?;
+    acyclic(&links)?;
+
+    Ok(Assembled {
+        config,
+        unchecked: UNCHECKED,
+    })
+}
+
+/// The document the fragments and the generated outbounds make, without asking
+/// whether it holds up.
+///
+/// A form has to be able to list the tags that exist while the operator is still
+/// writing the document that will use them, so the merge is available on its
+/// own. Everything it refuses is about the fragments as JSON — a section that is
+/// not JSON, or not an object or an array.
+pub fn document(
+    fragments: &BTreeMap<String, Vec<u8>>,
+    generated: &[Value],
+) -> Result<Value, Unfit> {
     let mut sections: BTreeMap<String, Value> = BTreeMap::new();
     for (section, bytes) in fragments {
         sections.insert(section.clone(), parse(section, bytes)?);
@@ -186,17 +210,8 @@ pub fn assemble(
     if !outbounds.is_empty() {
         sections.insert(OUTBOUNDS.to_string(), Value::Array(outbounds));
     }
-    let config = Value::Object(sections);
 
-    let links = scan(&config)?;
-    repeated(&links)?;
-    resolve(&links)?;
-    acyclic(&links)?;
-
-    Ok(Assembled {
-        config,
-        unchecked: UNCHECKED,
-    })
+    Ok(Value::Object(sections))
 }
 
 /// One fragment, read as its section's value.
@@ -1103,6 +1118,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_document_is_the_one_the_checks_run_on() {
+        let fragments = written(&[("outbounds", r#"[{"type":"direct","tag":"x"}]"#)]);
+        let generated = vec![outbound("node 1")];
+
+        let merged = document(&fragments, &generated).expect("a document");
+        let assembled = assemble(&fragments, &generated).expect("an assembly");
+
+        assert_eq!(merged, assembled.config);
+
+        // And it is there before the document holds up: a reference with nothing
+        // behind it is worth reporting, but it is not a reason for a form to have
+        // no tags to offer.
+        let broken = written(&[(
+            "outbounds",
+            r#"[{"type":"selector","tag":"s","outbounds":["gone"]}]"#,
+        )]);
+
+        assert!(assemble(&broken, &[]).is_err());
+        assert!(document(&broken, &[]).is_ok());
     }
 
     #[test]
