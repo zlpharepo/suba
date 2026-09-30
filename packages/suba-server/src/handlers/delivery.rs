@@ -14,7 +14,7 @@
 //! operator's business, and this route answers anyone holding a token.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     response::{IntoResponse, Response},
 };
 use http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -22,7 +22,7 @@ use http::{header, HeaderMap, HeaderValue, StatusCode};
 use crate::{
     error::Error,
     handlers::collections::{artifact_headers, artifact_of, attachment, Choice},
-    tracing, AppState,
+    routers, tracing, AppState,
 };
 
 /// Serve the collection this token addresses, to be read where it lands.
@@ -33,9 +33,13 @@ pub async fn serve(
     State(state): State<AppState>,
     Path((prefix, token)): Path<(String, String)>,
     Query(choice): Query<Choice>,
-    request: HeaderMap,
+    request: Request,
 ) -> Response {
-    respond(deliver(&state, &prefix, &token, &choice, &request, false).await)
+    if !addresses_deliveries(&state, &prefix).await {
+        return routers::web_file(&state, request).await;
+    }
+
+    respond(deliver(&state, &prefix, &token, &choice, request.headers(), false).await)
 }
 
 /// Serve the same document as a file, named after the collection.
@@ -43,9 +47,24 @@ pub async fn download(
     State(state): State<AppState>,
     Path((prefix, token)): Path<(String, String)>,
     Query(choice): Query<Choice>,
-    request: HeaderMap,
+    request: Request,
 ) -> Response {
-    respond(deliver(&state, &prefix, &token, &choice, &request, true).await)
+    if !addresses_deliveries(&state, &prefix).await {
+        return routers::web_file(&state, request).await;
+    }
+
+    respond(deliver(&state, &prefix, &token, &choice, request.headers(), true).await)
+}
+
+/// Whether a path's first segment is where deliveries live.
+///
+/// Any other two-segment path is the web UI's (its build writes `/assets/<file>`).
+/// A prefix that cannot be read is answered by [`deliver`], which logs why.
+async fn addresses_deliveries(state: &AppState, prefix: &str) -> bool {
+    match state.settings().subscription_prefix().await {
+        Ok(configured) => configured == prefix,
+        Err(_) => true,
+    }
 }
 
 fn respond(delivered: Result<(HeaderMap, String), Error>) -> Response {

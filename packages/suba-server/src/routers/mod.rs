@@ -7,16 +7,48 @@ mod system;
 
 use std::path::Path;
 
-use axum::{handler::HandlerWithoutStateExt, routing::get, Router};
+use axum::{
+    body::Body,
+    extract::Request,
+    handler::HandlerWithoutStateExt,
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use http::StatusCode;
 use tower_http::services::ServeDir;
 
-use crate::{handlers, AppState};
+use crate::{error::Error, handlers, tracing, AppState};
 
 pub struct AppRouter;
 
 async fn not_found() -> (StatusCode, &'static str) {
     (StatusCode::NOT_FOUND, "Not found")
+}
+
+async fn no_such_delivery() -> Response {
+    Error::NoSuchDelivery.into_response()
+}
+
+fn web_files(web_path: impl AsRef<Path>) -> ServeDir {
+    ServeDir::new(web_path)
+        .precompressed_gzip()
+        .precompressed_br()
+}
+
+/// A web UI file on a path shaped like a delivery; a missing one is answered as
+/// a delivery that is not there, so the two cannot be told apart.
+pub(crate) async fn web_file(state: &AppState, request: Request) -> Response {
+    let mut files = web_files(state.web_dir()).not_found_service(no_such_delivery.into_service());
+
+    match files.try_call(request).await {
+        Ok(response) => response.map(Body::new),
+        Err(error) => {
+            tracing::error!("web UI file could not be read: {error}");
+
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 impl AppRouter {
@@ -31,15 +63,13 @@ impl AppRouter {
         let api_router = api_router.nest("/cores/sing-box", singbox::route());
 
         let not_found_service = not_found.into_service();
-        let web_service = ServeDir::new(web_path)
-            .not_found_service(not_found_service)
-            .precompressed_gzip()
-            .precompressed_br();
+        let web_service = web_files(web_path).not_found_service(not_found_service);
 
         // The delivery route is not under `/api`: what it serves goes to a
         // client's core, not to this instance's own callers, and the token in it
         // is the whole of the authorization. It is merged before the web service,
-        // which is the fallback and would otherwise answer for it.
+        // which is the fallback and would otherwise answer for it; a path whose
+        // first segment is not the prefix is handed back to the web files.
         let delivery = Router::new()
             .route("/{prefix}/{token}", get(handlers::delivery::serve))
             .route(
@@ -207,6 +237,30 @@ mod tests {
             format!("/elsewhere/{token}"),
         ] {
             let missing = server.get(&path).send().await.unwrap();
+            assert_eq!(missing.status(), 404, "{path}");
+            assert_eq!(
+                body(missing).await,
+                json!({"message": "Not found"}),
+                "{path}"
+            );
+        }
+    }
+
+    /// The web UI's build writes `/assets/<file>`, a path shaped like a
+    /// delivery; it is the UI's, and a file that is not there is the same 404.
+    #[tokio::test]
+    async fn the_web_ui_files_are_not_taken_for_deliveries() {
+        let server = Server::start().await;
+        let assets = server.root.join("data/web/assets");
+        crate::fs::ensure_dir(&assets).unwrap();
+        std::fs::write(assets.join("index-example.js"), "export {};\n").unwrap();
+
+        let served = server.get("/assets/index-example.js").send().await.unwrap();
+        assert_eq!(served.status(), 200);
+        assert_eq!(served.text().await.unwrap(), "export {};\n");
+
+        for path in ["/assets/missing.js", "/assets/missing.js/download"] {
+            let missing = server.get(path).send().await.unwrap();
             assert_eq!(missing.status(), 404, "{path}");
             assert_eq!(
                 body(missing).await,
