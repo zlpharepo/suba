@@ -205,6 +205,17 @@ impl SingboxStore {
             return Ok(record);
         }
 
+        // Before the listing and before any download: a version under the floor
+        // is refused by name rather than reported as one nobody publishes,
+        // which would be a different (and untrue) thing to tell a caller.
+        if version < &Version::from_tag(core::MIN_VERSION) {
+            return Err(suba_singbox::core::Error::TooOld {
+                version: version.clone(),
+                floor: core::MIN_VERSION,
+            }
+            .into());
+        }
+
         let platform = core::platform()?;
         let release = self
             .releases()
@@ -580,6 +591,18 @@ mod tests {
 
         assert_eq!(written["log"], serde_json::json!({ "level": "warn" }));
         assert_eq!(written["outbounds"][0]["tag"], "node 1");
+    }
+
+    /// Below the floor there is nothing to install, and that is said before
+    /// anything is fetched or downloaded.
+    #[tokio::test]
+    async fn a_version_below_the_floor_is_refused_by_name() {
+        let (_scratch, store) = store();
+
+        assert!(matches!(
+            store.install(&Version::from_tag("1.13.0")).await,
+            Err(Error::Singbox(suba_singbox::core::Error::TooOld { .. }))
+        ));
     }
 
     #[test]

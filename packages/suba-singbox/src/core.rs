@@ -39,6 +39,16 @@ pub const MAX_LICENSE_BYTES: u64 = 1024 * 1024;
 const BINARY_MEMBER: &str = "sing-box";
 const LICENSE_MEMBER: &str = "LICENSE";
 
+/// The oldest sing-box this build works with.
+///
+/// Below it everything this module knows is a guess: sing-box publishes a schema
+/// per minor release from 1.14 on, and every shape the checks and the runtime
+/// were measured against is that one. A version under the floor is not offered
+/// and not installed; a *pre*-release above it is both, because running an alpha
+/// is the operator's decision — what this build owes them is that the schema it
+/// reads fits the version it reads it from.
+pub const MIN_VERSION: &str = "1.14.0";
+
 /// Something this module refuses.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
@@ -78,6 +88,12 @@ pub enum Error {
     /// The version is not one the release server publishes.
     #[error("{version} is not a version the release server publishes")]
     Unpublished { version: Version },
+    /// The version is older than this build works with.
+    #[error("{version} is older than {floor}, which is the oldest this build works with")]
+    TooOld {
+        version: Version,
+        floor: &'static str,
+    },
     /// The version is the current one, which is not removed from under it.
     #[error("{version} is the current version")]
     Current { version: Version },
@@ -326,15 +342,23 @@ impl Release {
         })
     }
 
-    /// The newest stable release in a list, which is the version to offer first.
+    /// The releases this build will install, newest first.
     ///
-    /// Drafts are not released and pre-releases are not what a default should
-    /// be; what is left is compared as versions, not as text.
-    pub fn newest_stable(releases: &[Self]) -> Option<&Self> {
-        releases
+    /// The floor is the only filter: a pre-release above it stays in the list,
+    /// and whether to run one is the caller's decision. Whether a version is a
+    /// pre-release is read from its own spelling rather than from the flag, so
+    /// the same list comes out of the API and out of the atom feed, which has no
+    /// flag.
+    pub fn installable(releases: &[Self]) -> Vec<&Self> {
+        let floor = Version::from_tag(MIN_VERSION);
+        let mut installable: Vec<&Self> = releases
             .iter()
-            .filter(|release| !release.draft && !release.prerelease)
-            .max_by(|a, b| a.version.cmp(&b.version))
+            .filter(|release| !release.draft && release.version >= floor)
+            .collect();
+
+        installable.sort_by(|left, right| right.version.cmp(&left.version));
+
+        installable
     }
 
     /// The asset this platform runs, by the name sing-box gives it.
@@ -633,26 +657,55 @@ mod tests {
         assert!(alpha9 < alpha10, "alpha.10 is after alpha.9");
     }
 
-    #[test]
-    fn the_newest_stable_release_is_the_one_not_marked_prerelease() {
-        let alpha: serde_json::Value = serde_json::from_str(
-            r#"{"tag_name": "v1.16.0-alpha.1", "prerelease": true, "assets": []}"#,
-        )
-        .unwrap();
-        let older: serde_json::Value =
-            serde_json::from_str(r#"{"tag_name": "v1.13.0", "prerelease": false, "assets": []}"#)
+    /// A release list as the API would serve it, with the tags named.
+    fn releases(tags: &[&str]) -> Vec<Release> {
+        tags.iter()
+            .map(|tag| {
+                let value: serde_json::Value = serde_json::from_str(&format!(
+                    r#"{{"tag_name": "v{tag}", "prerelease": true, "assets": []}}"#
+                ))
                 .unwrap();
 
-        let releases = vec![
-            Release::from_json(&alpha).unwrap(),
-            release(),
-            Release::from_json(&older).unwrap(),
-        ];
+                Release::from_json(&value).unwrap()
+            })
+            .collect()
+    }
+
+    /// What is offered is what can be installed: everything from the floor up,
+    /// pre-releases included, newest first.
+    #[test]
+    fn the_installable_releases_start_at_the_floor() {
+        let listed = releases(&["1.13.21", "1.15.0-alpha.9", "1.14.0", "1.13.0", "1.14.2"]);
+        let installable = Release::installable(&listed);
+        let versions: Vec<&str> = installable
+            .iter()
+            .map(|release| release.version.as_str())
+            .collect();
 
         assert_eq!(
-            Release::newest_stable(&releases).map(|release| release.version.clone()),
-            Some(Version::from_tag("v1.14.2"))
+            versions,
+            ["1.15.0-alpha.9", "1.14.2", "1.14.0"],
+            "below the floor is dropped, a pre-release above it is not, and the order \
+             is newest first however the list arrived"
         );
+    }
+
+    /// A draft is a release nobody outside the project can see.
+    #[test]
+    fn a_draft_release_is_not_offered() {
+        let mut listed = releases(&["1.14.2"]);
+        listed[0].draft = true;
+
+        assert!(Release::installable(&listed).is_empty());
+    }
+
+    /// The floor is compared as a version, not as text.
+    #[test]
+    fn the_floor_is_a_version_and_not_a_string() {
+        assert_eq!(MIN_VERSION, "1.14.0");
+        assert!(Version::from_tag("1.9.0") < Version::from_tag(MIN_VERSION));
+        assert!(Version::from_tag("1.14.0-alpha.1") < Version::from_tag(MIN_VERSION));
+        assert!(Version::from_tag("1.14.0") >= Version::from_tag(MIN_VERSION));
     }
 
     #[test]

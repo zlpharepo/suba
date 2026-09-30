@@ -380,62 +380,134 @@ pub async fn delete_version(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A release, as the release server describes it.
-#[derive(Debug, Serialize)]
-pub struct ReleaseView {
-    pub version: String,
-    pub tag: String,
-    pub page: String,
-    pub assets: Vec<AssetView>,
-}
-
-/// One asset of a release.
-#[derive(Debug, Serialize)]
-pub struct AssetView {
-    pub name: String,
-    pub size: u64,
-}
-
-/// What the release server has, split the way a caller decides with.
+/// The versions this build can install, as a caller picks between them.
+///
+/// Pre-releases are in the list: running one is the operator's decision, and
+/// what this build insists on is only that the version is one whose schema it
+/// can read. Below [`MIN_VERSION`] there is nothing to offer, which is why the
+/// list starts where it does rather than being filtered afterwards.
 #[derive(Debug, Serialize)]
 pub struct Releases {
-    /// The newest release that is not a pre-release, when there is one.
-    pub newest_stable: Option<String>,
-    pub stable: Vec<ReleaseView>,
-    pub prerelease: Vec<ReleaseView>,
+    /// The newest version that is not a pre-release, when there is one.
+    pub stable: Option<String>,
+    /// The newest version of all, pre-releases included.
+    pub latest: Option<String>,
+    /// Every version this build will install, newest first.
+    pub versions: Vec<ReleaseView>,
 }
 
-/// The versions the release server has.
+/// One version, as a caller picks it out of the list.
+#[derive(Debug, Serialize)]
+pub struct ReleaseView {
+    /// The version, spelled the way the rest of this API spells versions — and
+    /// the way it is addressed when it is installed.
+    pub version: String,
+    /// The tag it is published under, which is what a release URL needs.
+    pub tag: String,
+    /// Where the release page is, when the release server names one.
+    pub page: Option<String>,
+}
+
+/// What a caller sees of a release list.
+fn offered(installable: &[&Release]) -> Releases {
+    let view = |release: &&Release| ReleaseView {
+        version: release.version.as_str().to_string(),
+        tag: release.version.tag(),
+        page: release.html_url.clone(),
+    };
+
+    Releases {
+        stable: installable
+            .iter()
+            .find(|release| !release.version.is_prerelease())
+            .map(|release| release.version.as_str().to_string()),
+        latest: installable
+            .first()
+            .map(|release| release.version.as_str().to_string()),
+        versions: installable.iter().map(view).collect(),
+    }
+}
+
+/// The versions this build can install.
 pub async fn releases(
     State(state): State<AppState>,
     _auth: Authenticated,
 ) -> ResponseResult<Json<Releases>> {
     let store = state.singbox();
     let listed = store.releases().await?;
-    let newest_stable = Release::newest_stable(&listed).map(|release| release.version.tag());
+    let installable = Release::installable(&listed);
 
-    let view = |release: &Release| ReleaseView {
-        version: release.version.as_str().to_string(),
-        tag: release.version.tag(),
-        page: release.html_url.clone().unwrap_or_default(),
-        assets: release
-            .assets
-            .iter()
-            .map(|asset| AssetView {
-                name: asset.name.clone(),
-                size: asset.size,
-            })
-            .collect(),
-    };
+    Ok(Json(offered(&installable)))
+}
 
-    let (stable, prerelease): (Vec<&Release>, Vec<&Release>) =
-        listed.iter().partition(|release| !release.prerelease);
+#[cfg(test)]
+mod releases_tests {
+    use super::*;
 
-    Ok(Json(Releases {
-        newest_stable,
-        stable: stable.iter().map(|release| view(release)).collect(),
-        prerelease: prerelease.iter().map(|release| view(release)).collect(),
-    }))
+    fn release(tag: &str) -> Release {
+        let value = serde_json::json!({
+            "tag_name": format!("v{tag}"),
+            "prerelease": tag.contains('-'),
+            "assets": [],
+        });
+
+        Release::from_json(&value).unwrap()
+    }
+
+    /// What a caller sees: the two versions to pick between, and the whole list.
+    #[test]
+    fn a_list_is_offered_as_the_versions_that_can_be_installed() {
+        let listed = [
+            release("1.13.21"),
+            release("1.15.0-alpha.9"),
+            release("1.14.0"),
+            release("1.14.2"),
+        ];
+        let offered = offered(&Release::installable(&listed));
+
+        assert_eq!(
+            offered
+                .versions
+                .iter()
+                .map(|release| release.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.15.0-alpha.9", "1.14.2", "1.14.0"]
+        );
+        assert_eq!(
+            offered.versions[1].tag, "v1.14.2",
+            "the tag is what a release URL is built from"
+        );
+        assert_eq!(
+            offered.latest.as_deref(),
+            Some("1.15.0-alpha.9"),
+            "the newest of all, pre-release or not"
+        );
+        assert_eq!(
+            offered.stable.as_deref(),
+            Some("1.14.2"),
+            "and the newest one that is not a pre-release"
+        );
+    }
+
+    /// A list with nothing but pre-releases has no stable version to name, and
+    /// says so rather than naming one that is not stable.
+    #[test]
+    fn a_pre_release_only_list_has_no_stable_version() {
+        let offered = offered(&Release::installable(&[release("1.15.0-alpha.9")]));
+
+        assert_eq!(offered.stable, None);
+        assert_eq!(offered.latest.as_deref(), Some("1.15.0-alpha.9"));
+    }
+
+    /// The list is never empty behind a version that is named.
+    #[test]
+    fn an_empty_list_names_nothing() {
+        let offered = offered(&Release::installable(&[]));
+
+        assert_eq!(offered.stable, None);
+        assert_eq!(offered.latest, None);
+        assert!(offered.versions.is_empty());
+    }
 }
 
 /// The schema of the version in use: the whole document, as it was written by

@@ -296,7 +296,7 @@ impl IntoHttpError for Error {
                     | Core::RunningVersion { .. }
                     | Core::Hash { .. }
                     | Core::Running { .. } => StatusCode::CONFLICT,
-                    Core::Generate { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+                    Core::Generate { .. } | Core::TooOld { .. } => StatusCode::UNPROCESSABLE_ENTITY,
                     Core::Refused { .. } | Core::Network { .. } => StatusCode::BAD_GATEWAY,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
