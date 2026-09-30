@@ -6,9 +6,12 @@ authors.workspace = true
 license.workspace = true
 
 [features]
+# Both capabilities are on by default: this crate is used by a build that ships
+# them together. Either alone is `--no-default-features --features render` or
+# `--features core`, which is how the two are proven independent.
+default = ["render", "core"]
 # Writing nodes as the documents sing-box reads. Pure: no clock, no file, no
 # socket, and no installed core.
-default = ["render"]
 render = []
 # Knowing and installing the sing-box versions this machine can run. Needs the
 # network, the filesystem and processes; needs nothing from `render` to do it.

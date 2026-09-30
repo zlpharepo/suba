@@ -6,7 +6,9 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-default = ["toml"]
+# The same four as the binary's (see `packages/suba/Cargo.toml`): the default
+# build is the full one, and a partial one is `--no-default-features`.
+default = ["toml", "singbox", "singbox-core", "clash"]
 toml = ["dep:toml"]
 json = []
 singbox = ["suba-core/singbox"]
@@ -14,8 +16,12 @@ singbox-core = ["suba-core/singbox-core", "dep:suba-singbox"]
 clash = ["suba-core/clash"]
 
 [dependencies]
-suba-core = { workspace = true }
-suba-singbox = { workspace = true, optional = true }
+# Without default features: what this server can do is what its own features say,
+# not what the crate underneath happens to default to. `singbox-core` is the one
+# that needs the dialect crate directly, and it asks that crate for `core` only —
+# a build that runs a core does not have to be able to render one.
+suba-core = { workspace = true, default-features = false }
+suba-singbox = { workspace = true, optional = true, default-features = false }
 
 argon2 = { workspace = true }
 axum = { workspace = true }

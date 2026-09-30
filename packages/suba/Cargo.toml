@@ -9,18 +9,24 @@ license.workspace = true
 # `toml`/`json` pick the configuration file format and are mutually exclusive.
 # `singbox` adds the sing-box document format: it links the dialect crate, and
 # the dialect is called from the format registry that the capability list reads.
+# `singbox-core` adds running the core itself: installing a version, assembling
+# the configuration and starting the process.
 # `clash` adds the clash document format the same way.
-default = ["toml"]
+#
+# All four are on by default: this is the build that is meant to ship. A build
+# that leaves one out is asking a question — "what happens without this?" — and
+# is made with `--no-default-features --features …`.
+default = ["toml", "singbox", "singbox-core", "clash"]
 toml = ["suba-server/toml"]
 json = ["suba-server/json"]
 singbox = ["suba-server/singbox"]
-# `singbox-core` adds running the core itself: installing a version, assembling
-# the configuration and starting the process.
 singbox-core = ["suba-server/singbox-core"]
 clash = ["suba-server/clash"]
 
 [dependencies]
-suba-server = { workspace = true }
+# The default features below are this crate's to choose, so the server is taken
+# without any: every one of them is forwarded explicitly above.
+suba-server = { workspace = true, default-features = false }
 
 clap = { version = "4.5.41", features = ["derive"] }
 tokio = { workspace = true }

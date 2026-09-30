@@ -10,11 +10,15 @@ authors = ["ZLPHA"]
 license = "GPL-3.0"
 
 [workspace.dependencies]
-suba-core = { path = "packages/suba-core" }
+# Every one of these is taken without default features, and each member says
+# which features it wants: a workspace member's `default-features = false` is
+# IGNORED unless the workspace says it too, which would make a build that thinks
+# it is minimal quietly full.
+suba-core = { path = "packages/suba-core", default-features = false }
 suba-server = { path = "packages/suba-server", default-features = false }
 suba-proto = { path = "packages/suba-proto" }
-suba-clash = { path = "packages/suba-clash" }
-suba-singbox = { path = "packages/suba-singbox" }
+suba-clash = { path = "packages/suba-clash", default-features = false }
+suba-singbox = { path = "packages/suba-singbox", default-features = false }
 
 argon2 = "0.6.0"
 axum = { version = "0.8.9", features = ["macros"] }

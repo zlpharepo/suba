@@ -6,14 +6,17 @@ authors.workspace = true
 license.workspace = true
 
 [features]
+default = ["singbox", "singbox-core", "clash"]
 singbox = ["dep:suba-singbox", "suba-singbox/render", "dep:serde_json"]
 singbox-core = ["dep:suba-singbox", "suba-singbox/core"]
 clash = ["dep:suba-clash"]
 
 [dependencies]
 suba-proto = { workspace = true }
-suba-singbox = { workspace = true, optional = true }
-suba-clash = { workspace = true, optional = true }
+# Taken without defaults, so that `singbox` means render and `singbox-core` means
+# core: neither drags the other in.
+suba-singbox = { workspace = true, optional = true, default-features = false }
+suba-clash = { workspace = true, optional = true, default-features = false }
 
 regex = { workspace = true }
 serde = { workspace = true }
