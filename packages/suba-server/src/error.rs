@@ -72,6 +72,22 @@ pub enum Error {
     #[error(transparent)]
     Render(#[from] suba_core::RenderError),
 
+    /// The operating system would not give random bytes.
+    ///
+    /// Its own problem: a token or a key pair cannot be made without entropy, and
+    /// nothing a caller sent has anything to do with it.
+    #[error("the operating system would not provide randomness: {0}")]
+    Entropy(String),
+
+    /// No delivery is addressed by this URL.
+    ///
+    /// One answer for every way that can be true — an unknown token, a revoked
+    /// one, a prefix this instance does not use — and the text names nothing: a
+    /// caller looking for a token that works learns nothing from a 404 that is
+    /// the same everywhere.
+    #[error("not found")]
+    NoSuchDelivery,
+
     /// A query parameter this instance will not accept.
     ///
     /// The text is the parameter's name and a static reason, never the value,
@@ -226,6 +242,18 @@ impl IntoHttpError for Error {
             }
             Error::Render(error) => {
                 tracing::error!("render error: {error}");
+
+                HttpError {
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "Internal server error".to_string(),
+                }
+            }
+            Error::NoSuchDelivery => HttpError {
+                status_code: StatusCode::NOT_FOUND,
+                message: "Not found".to_string(),
+            },
+            Error::Entropy(reason) => {
+                tracing::error!("entropy error: {reason}");
 
                 HttpError {
                     status_code: StatusCode::INTERNAL_SERVER_ERROR,

@@ -8,6 +8,9 @@ use crate::{
 
 use super::persisted::Persisted;
 
+/// Where a subscription URL starts when the operator has not said otherwise.
+const DEFAULT_PREFIX: &str = "sub";
+
 /// The instance settings: the administrator account and the key pair that
 /// signs sessions.
 pub(crate) struct SettingsStore {
@@ -19,6 +22,18 @@ impl SettingsStore {
         Ok(Self {
             file: Persisted::load(config_dir, APP_CONFIG_BASENAME)?,
         })
+    }
+
+    /// The path prefix a subscription URL starts with.
+    ///
+    /// Configurable because an instance behind a proxy may want the deliveries
+    /// somewhere specific; `sub` when the operator has not said.
+    pub(crate) async fn subscription_prefix(&self) -> String {
+        self.file
+            .read(|config| config.subscription_prefix.clone())
+            .await
+            .and_then(|subscription| subscription.prefix)
+            .unwrap_or_else(|| DEFAULT_PREFIX.to_string())
     }
 
     /// The registered administrator, if the instance has been claimed.

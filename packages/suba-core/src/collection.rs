@@ -63,6 +63,15 @@ pub struct Collection {
     /// the shape every client reads.
     #[serde(default = "links", skip_serializing_if = "is_links")]
     pub format: Format,
+
+    /// The delivery token, as a hash.
+    ///
+    /// The token itself is handed to whoever minted it and is never written
+    /// down: what is kept is the sha256 of it, so a copied configuration file is
+    /// not a set of working subscription URLs. Recognising a token that comes
+    /// back in a URL needs nothing but the hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// The format a collection serves in when its document does not say.
@@ -82,6 +91,7 @@ impl Default for Collection {
             includes: Vec::new(),
             excludes: Vec::new(),
             format: Format::Links,
+            token: None,
         }
     }
 }

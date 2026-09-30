@@ -14,12 +14,20 @@
 
 use std::{collections::HashMap, path::Path};
 
+use getrandom::fill;
 use serde::{Deserialize, Serialize};
+use suba_core::checksum::sha256_hex;
 use suba_core::Collection;
 
 use crate::{config::ConfigError, error::Error};
 
 use super::persisted::Persisted;
+
+/// How many random bytes a delivery token is made of.
+///
+/// A URL that hands out a subscription is a credential, so it is drawn from the
+/// operating system's entropy and long enough that guessing is not a strategy.
+const TOKEN_BYTES: usize = 32;
 /// The file the collection definitions live in, without the format extension.
 pub(crate) const COLLECTIONS_BASENAME: &str = "collections";
 
@@ -75,6 +83,69 @@ impl CollectionStore {
         locked.commit(config).await?;
 
         Ok(())
+    }
+
+    /// Give `name` a new delivery token, and answer the token itself.
+    ///
+    /// Minting replaces whatever token the collection had: there is one URL per
+    /// collection, and rotating it is how a leaked one is taken out of service.
+    /// The token is answered once and only its hash is stored, so this call is
+    /// the only chance to read it.
+    pub(crate) async fn mint_token(&self, name: &str) -> Result<String, Error> {
+        let mut bytes = [0u8; TOKEN_BYTES];
+        fill(&mut bytes).map_err(|error| Error::Entropy(error.to_string()))?;
+
+        let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let hash = sha256_hex(token.as_bytes());
+
+        let locked = self.file.lock().await;
+        let mut config = locked.get().clone();
+        let collection = config
+            .collections
+            .get_mut(name)
+            .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
+
+        collection.token = Some(hash);
+        locked.commit(config).await?;
+
+        Ok(token)
+    }
+
+    /// Take the collection's delivery token out of service.
+    ///
+    /// A collection that has no token is not an error: revoking is asked for by
+    /// the state the caller wants to be in, not by the state it found.
+    pub(crate) async fn revoke_token(&self, name: &str) -> Result<(), Error> {
+        let locked = self.file.lock().await;
+        let mut config = locked.get().clone();
+        let collection = config
+            .collections
+            .get_mut(name)
+            .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
+
+        collection.token = None;
+        locked.commit(config).await?;
+
+        Ok(())
+    }
+
+    /// The collection a token addresses, and its name.
+    ///
+    /// Compared as hashes: what a caller holds is the token, and what is stored
+    /// is the hash of it, so a comparison that is not constant time leaks bits
+    /// of a value the caller cannot use.
+    pub(crate) async fn by_token(&self, token: &str) -> Option<(String, Collection)> {
+        let hash = sha256_hex(token.as_bytes());
+
+        self.file
+            .read(|config| {
+                config
+                    .collections
+                    .iter()
+                    .find(|(_, collection)| collection.token.as_deref() == Some(hash.as_str()))
+                    .map(|(name, collection)| (name.clone(), collection.clone()))
+            })
+            .await
     }
 }
 
@@ -163,6 +234,49 @@ mod tests {
         assert!(store.get("main").await.is_none());
 
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    /// What is written down is a hash, never the token itself: a copied
+    /// configuration file is not a set of working subscription URLs.
+    #[tokio::test]
+    async fn a_token_is_stored_as_a_hash() {
+        let dir = scratch("token");
+        let store = load(&dir);
+        store
+            .insert("main", collection(&["airport"]))
+            .await
+            .unwrap();
+
+        let token = store.mint_token("main").await.unwrap();
+        let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
+
+        assert!(!written.contains(&token), "the token itself: {written}");
+        assert!(
+            written.contains(&sha256_hex(token.as_bytes())),
+            "the hash of it: {written}"
+        );
+        assert_eq!(store.by_token(&token).await.unwrap().0, "main");
+        assert!(store.by_token("not-a-token").await.is_none());
+
+        store.revoke_token("main").await.unwrap();
+
+        assert!(store.by_token(&token).await.is_none());
+        let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
+        assert!(!written.contains("token"), "{written}");
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// A collection nobody has minted a token for is not an error to revoke.
+    #[tokio::test]
+    async fn revoking_a_token_that_was_never_minted_is_nothing() {
+        let dir = scratch("no-token");
+        let store = load(&dir);
+        store.insert("main", collection(&[])).await.unwrap();
+
+        store.revoke_token("main").await.unwrap();
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 
     /// The format a collection declares survives the document, and the default

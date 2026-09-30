@@ -1,5 +1,5 @@
 use axum::{
-    routing::{delete, get, put},
+    routing::{delete, get, post, put},
     Router,
 };
 
@@ -13,4 +13,6 @@ pub fn route() -> Router<AppState> {
         .route("/{name}", put(collections::insert))
         .route("/{name}/nodes", get(collections::nodes))
         .route("/{name}/content", get(collections::content))
+        .route("/{name}/tokens", post(collections::mint_token))
+        .route("/{name}/tokens", delete(collections::revoke_token))
 }

@@ -202,6 +202,51 @@ impl Narrowing {
     }
 }
 
+/// The delivery token, as the caller mints it.
+#[derive(Debug, Serialize)]
+pub struct Minted {
+    /// The token itself. It is answered once: only its hash is kept, so this is
+    /// the only chance to read it.
+    pub token: String,
+    /// Where a client asks for the subscription, as this instance is configured
+    /// now. The token outlives a change of prefix, this path does not.
+    pub path: String,
+}
+
+/// Give a collection a new delivery token.
+///
+/// Minting again rotates: the URL that was handed out stops working, which is
+/// what a leaked token needs.
+pub async fn mint_token(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ResponseResult<impl IntoResponse> {
+    let token = state.collections().mint_token(&name).await?;
+    let path = format!(
+        "/{}/{}",
+        state.settings().subscription_prefix().await,
+        token
+    );
+
+    // The collection is named, the token never is.
+    tracing::debug!("Minted a delivery token for collection '{name}'");
+
+    Ok((StatusCode::CREATED, Json(Minted { token, path })))
+}
+
+/// Take a collection's delivery token out of service.
+pub async fn revoke_token(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ResponseResult<impl IntoResponse> {
+    state.collections().revoke_token(&name).await?;
+    tracing::debug!("Revoked the delivery token of collection '{name}'");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The artifact this collection serves.
 ///
 /// The one path a subscription comes out of: the management route previews it
@@ -352,7 +397,7 @@ pub async fn content(
 ///
 /// What was left out is reported here rather than in the body: the body belongs
 /// to the client's core, and a comment it did not ask for would be an edit to it.
-fn artifact_headers(artifact: &Artifact) -> HeaderMap {
+pub(crate) fn artifact_headers(artifact: &Artifact) -> HeaderMap {
     let mut headers = HeaderMap::new();
 
     headers.insert(

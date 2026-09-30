@@ -7,11 +7,11 @@ mod system;
 
 use std::path::Path;
 
-use axum::{handler::HandlerWithoutStateExt, Router};
+use axum::{handler::HandlerWithoutStateExt, routing::get, Router};
 use http::StatusCode;
 use tower_http::services::ServeDir;
 
-use crate::AppState;
+use crate::{handlers, AppState};
 
 pub struct AppRouter;
 
@@ -36,8 +36,15 @@ impl AppRouter {
             .precompressed_gzip()
             .precompressed_br();
 
+        // The delivery route is not under `/api`: what it serves goes to a
+        // client's core, not to this instance's own callers, and the token in it
+        // is the whole of the authorization. It is merged before the web service,
+        // which is the fallback and would otherwise answer for it.
+        let delivery = Router::new().route("/{prefix}/{token}", get(handlers::delivery::serve));
+
         Router::new()
             .nest("/api", api_router)
+            .merge(delivery)
             .fallback_service(web_service)
     }
 }
