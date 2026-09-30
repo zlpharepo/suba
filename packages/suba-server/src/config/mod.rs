@@ -21,7 +21,8 @@ pub struct AppConfig {
     pub administrator: Option<Administrator>,
     #[serde(rename = "ed25519")]
     pub key_pair: Option<KeyPair>,
-    pub subscription_prefix: Option<SubscriptionConfig>,
+    /// Where subscriptions are handed out from, when the operator says.
+    pub subscription: Option<SubscriptionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +90,7 @@ mod tests {
     async fn an_app_config_round_trips() {
         let path = test_path();
         let app = AppConfig {
-            subscription_prefix: Some(SubscriptionConfig {
+            subscription: Some(SubscriptionConfig {
                 prefix: Some("/s".to_string()),
             }),
             ..AppConfig::default()
@@ -101,11 +102,7 @@ mod tests {
 
         assert!(config_path(&path, APP_CONFIG_BASENAME).is_file());
         assert_eq!(
-            load_app(&path)
-                .subscription_prefix
-                .unwrap()
-                .prefix
-                .as_deref(),
+            load_app(&path).subscription.unwrap().prefix.as_deref(),
             Some("/s")
         );
 

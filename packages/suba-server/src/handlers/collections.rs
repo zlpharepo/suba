@@ -223,11 +223,7 @@ pub async fn mint_token(
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
     let token = state.collections().mint_token(&name).await?;
-    let path = format!(
-        "/{}/{}",
-        state.settings().subscription_prefix().await,
-        token
-    );
+    let path = format!("/{}/{token}", state.settings().subscription_prefix().await?);
 
     // The collection is named, the token never is.
     tracing::debug!("Minted a delivery token for collection '{name}'");

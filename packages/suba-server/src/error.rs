@@ -88,6 +88,14 @@ pub enum Error {
     #[error("not found")]
     NoSuchDelivery,
 
+    /// The configured delivery prefix cannot be used.
+    ///
+    /// Said out loud because an operator can fix it: a prefix that is not one
+    /// path segment addresses nothing, and a URL that silently answers 404 for
+    /// that reason is the kind of failure nobody can find.
+    #[error("subscription prefix: {reason}")]
+    Prefix { reason: &'static str },
+
     /// A query parameter this instance will not accept.
     ///
     /// The text is the parameter's name and a static reason, never the value,
@@ -248,6 +256,10 @@ impl IntoHttpError for Error {
                     message: "Internal server error".to_string(),
                 }
             }
+            Error::Prefix { reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("subscription prefix: {reason}"),
+            },
             Error::NoSuchDelivery => HttpError {
                 status_code: StatusCode::NOT_FOUND,
                 message: "Not found".to_string(),

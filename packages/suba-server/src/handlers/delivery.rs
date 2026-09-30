@@ -19,7 +19,7 @@ use http::{HeaderMap, StatusCode};
 use crate::{
     error::Error,
     handlers::collections::{artifact_headers, artifact_of, Narrowing},
-    AppState,
+    tracing, AppState,
 };
 
 /// Serve the collection this token addresses.
@@ -40,7 +40,19 @@ async fn deliver(
     token: &str,
     narrowing: &Narrowing,
 ) -> Result<(HeaderMap, String), Error> {
-    if prefix != state.settings().subscription_prefix().await {
+    // A prefix this instance cannot use makes every delivery address nothing,
+    // which is exactly what a wrong prefix means from outside — but the operator
+    // is told, once per request, in the log.
+    let configured = match state.settings().subscription_prefix().await {
+        Ok(configured) => configured,
+        Err(error) => {
+            tracing::error!("deliveries cannot be addressed: {error}");
+
+            return Err(Error::NoSuchDelivery);
+        }
+    };
+
+    if prefix != configured {
         return Err(Error::NoSuchDelivery);
     }
 
@@ -78,6 +90,11 @@ mod tests {
     }
 
     async fn state() -> AppState {
+        state_with(None).await
+    }
+
+    /// A state whose instance document says where deliveries live.
+    async fn state_with(prefix: Option<&str>) -> AppState {
         let root = temp_dir();
         let config = ServerConfig {
             listen: "127.0.0.1".parse().unwrap(),
@@ -85,6 +102,22 @@ mod tests {
             config_dir: root.join("config"),
             data_dir: root.join("data"),
         };
+
+        if let Some(prefix) = prefix {
+            crate::fs::ensure_dir(&config.config_dir).unwrap();
+            crate::config::write_config(
+                config.config_dir.to_str().unwrap(),
+                crate::config::APP_CONFIG_BASENAME,
+                &crate::config::AppConfig {
+                    subscription: Some(crate::config::SubscriptionConfig {
+                        prefix: Some(prefix.to_string()),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
 
         AppState::build(&config).await.unwrap()
     }
@@ -122,7 +155,7 @@ mod tests {
         served(&state).await;
 
         let token = state.collections().mint_token("main").await.unwrap();
-        let (_, body) = deliver(&state, "sub", &token, &Narrowing::default())
+        let (_, body) = deliver(&state, "s", &token, &Narrowing::default())
             .await
             .unwrap();
 
@@ -170,7 +203,25 @@ mod tests {
         state.collections().revoke_token("main").await.unwrap();
 
         assert!(matches!(
-            deliver(&state, "sub", &token, &Narrowing::default()).await,
+            deliver(&state, "s", &token, &Narrowing::default()).await,
+            Err(Error::NoSuchDelivery)
+        ));
+    }
+
+    /// The prefix the instance is configured with is the one that serves, and
+    /// the leading slash an operator writes is not part of it.
+    #[tokio::test]
+    async fn the_configured_prefix_is_the_one_that_serves() {
+        let state = state_with(Some("/proxy")).await;
+        served(&state).await;
+
+        let token = state.collections().mint_token("main").await.unwrap();
+
+        assert!(deliver(&state, "proxy", &token, &Narrowing::default())
+            .await
+            .is_ok());
+        assert!(matches!(
+            deliver(&state, "s", &token, &Narrowing::default()).await,
             Err(Error::NoSuchDelivery)
         ));
     }
@@ -186,10 +237,10 @@ mod tests {
 
         assert_ne!(old, new);
         assert!(matches!(
-            deliver(&state, "sub", &old, &Narrowing::default()).await,
+            deliver(&state, "s", &old, &Narrowing::default()).await,
             Err(Error::NoSuchDelivery)
         ));
-        assert!(deliver(&state, "sub", &new, &Narrowing::default())
+        assert!(deliver(&state, "s", &new, &Narrowing::default())
             .await
             .is_ok());
     }

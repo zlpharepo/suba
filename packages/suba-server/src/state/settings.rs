@@ -9,7 +9,7 @@ use crate::{
 use super::persisted::Persisted;
 
 /// Where a subscription URL starts when the operator has not said otherwise.
-const DEFAULT_PREFIX: &str = "sub";
+const DEFAULT_PREFIX: &str = "s";
 
 /// The instance settings: the administrator account and the key pair that
 /// signs sessions.
@@ -24,16 +24,28 @@ impl SettingsStore {
         })
     }
 
-    /// The path prefix a subscription URL starts with.
+    /// The path segment a subscription URL starts with.
     ///
-    /// Configurable because an instance behind a proxy may want the deliveries
-    /// somewhere specific; `sub` when the operator has not said.
-    pub(crate) async fn subscription_prefix(&self) -> String {
-        self.file
-            .read(|config| config.subscription_prefix.clone())
+    /// Written with or without its leading slash — `/s` and `s` are the same
+    /// prefix — and `s` when the operator has not said, so a delivery is at
+    /// `/s/<token>`. One segment, because a prefix with a slash in it addresses
+    /// a path nothing routes to, and a URL that cannot work should be refused
+    /// where it is configured rather than answered with a 404 nobody can explain.
+    pub(crate) async fn subscription_prefix(&self) -> Result<String, Error> {
+        let written = self
+            .file
+            .read(|config| config.subscription.clone())
             .await
             .and_then(|subscription| subscription.prefix)
-            .unwrap_or_else(|| DEFAULT_PREFIX.to_string())
+            .unwrap_or_else(|| DEFAULT_PREFIX.to_string());
+        let prefix = written.trim_matches('/').to_string();
+
+        match prefix.is_empty() || prefix.contains('/') {
+            true => Err(Error::Prefix {
+                reason: "a prefix is one path segment",
+            }),
+            false => Ok(prefix),
+        }
     }
 
     /// The registered administrator, if the instance has been claimed.
@@ -82,12 +94,78 @@ impl SettingsStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::config::SubscriptionConfig;
 
     fn test_dir() -> PathBuf {
         std::env::temp_dir().join(format!("suba-settings-{}", uuid::Uuid::now_v7()))
+    }
+
+    /// Write the instance document with this delivery prefix in it.
+    async fn write_prefix(dir: &Path, prefix: &str) {
+        let app = AppConfig {
+            subscription: Some(SubscriptionConfig {
+                prefix: Some(prefix.to_string()),
+            }),
+            ..AppConfig::default()
+        };
+
+        crate::config::write_config(dir.to_str().unwrap(), APP_CONFIG_BASENAME, &app)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_prefix_is_read_with_or_without_its_leading_slash() {
+        let dir = test_dir();
+
+        assert_eq!(
+            SettingsStore::load(&dir)
+                .unwrap()
+                .subscription_prefix()
+                .await
+                .unwrap(),
+            "s",
+            "where a delivery is when nobody has said"
+        );
+
+        for written in ["/s", "s", "/s/"] {
+            write_prefix(&dir, written).await;
+
+            assert_eq!(
+                SettingsStore::load(&dir)
+                    .unwrap()
+                    .subscription_prefix()
+                    .await
+                    .unwrap(),
+                "s",
+                "{written} is the same prefix"
+            );
+        }
+    }
+
+    /// A prefix that is not one path segment addresses nothing, so it is refused
+    /// where it is configured rather than answered with a 404 nobody can explain.
+    #[tokio::test]
+    async fn a_prefix_that_is_not_one_segment_is_refused() {
+        let dir = test_dir();
+
+        for written in ["", "/", "a/b", "//"] {
+            write_prefix(&dir, written).await;
+
+            assert!(
+                matches!(
+                    SettingsStore::load(&dir)
+                        .unwrap()
+                        .subscription_prefix()
+                        .await,
+                    Err(Error::Prefix { .. })
+                ),
+                "{written:?} was accepted"
+            );
+        }
     }
 
     #[tokio::test]
