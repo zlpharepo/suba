@@ -218,11 +218,16 @@ impl IntoHttpError for Error {
                 // What the client can act on is answered as itself; everything
                 // else is this instance's own problem and stays internal.
                 let status_code = match &error {
-                    Core::NotInstalled { .. } | Core::NoAsset { .. } => StatusCode::NOT_FOUND,
+                    Core::NotInstalled { .. }
+                    | Core::Unpublished { .. }
+                    | Core::NoAsset { .. }
+                    | Core::Platform { .. } => StatusCode::NOT_FOUND,
                     Core::Installed { .. }
                     | Core::Current { .. }
+                    | Core::RunningVersion { .. }
                     | Core::Hash { .. }
                     | Core::Running { .. } => StatusCode::CONFLICT,
+                    Core::Generate { .. } => StatusCode::UNPROCESSABLE_ENTITY,
                     Core::Refused { .. } | Core::Network { .. } => StatusCode::BAD_GATEWAY,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
@@ -275,5 +280,83 @@ impl IntoHttpError for Error {
                 message: "Internal server error".to_string(),
             },
         }
+    }
+}
+
+#[cfg(all(test, feature = "singbox-core"))]
+mod tests {
+    use super::*;
+    use suba_singbox::core::{Error as Core, Version};
+
+    fn status(error: Error) -> StatusCode {
+        error.into_http_error().status_code
+    }
+
+    #[test]
+    fn what_a_caller_can_act_on_is_answered_as_itself() {
+        let version = Version::from_tag("v1.14.2");
+
+        // A version this instance does not have, a version nobody publishes,
+        // and a platform nothing is built for are all "what you asked for is
+        // not here".
+        for absent in [
+            Core::NotInstalled {
+                version: version.clone(),
+            },
+            Core::Unpublished {
+                version: version.clone(),
+            },
+            Core::NoAsset {
+                name: "sing-box-1.14.2-linux-mips.tar.gz".to_string(),
+            },
+            Core::Platform {
+                os: "linux",
+                arch: "mips",
+            },
+        ] {
+            assert_eq!(status(Error::Singbox(absent)), StatusCode::NOT_FOUND);
+        }
+
+        // Removing what is in use, or what is running, is refused rather than
+        // done.
+        for in_use in [
+            Core::Current {
+                version: version.clone(),
+            },
+            Core::RunningVersion {
+                version: version.clone(),
+            },
+            Core::Installed {
+                version: version.clone(),
+            },
+            Core::Running { pid: 1 },
+        ] {
+            assert_eq!(status(Error::Singbox(in_use)), StatusCode::CONFLICT);
+        }
+
+        assert_eq!(
+            status(Error::Singbox(Core::Generate {
+                command: "rand",
+                reason: "the binary refused to generate anything",
+            })),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(
+            status(Error::Singbox(Core::Refused {
+                status: 403,
+                hint: "the release server refused the request",
+            })),
+            StatusCode::BAD_GATEWAY
+        );
+
+        // Anything else is this instance's own problem, and its own text.
+        let internal = Error::Singbox(Core::Files {
+            at: "a file",
+            reason: "the file could not be read",
+        });
+        let answer = internal.into_http_error();
+
+        assert_eq!(answer.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(answer.message, "Internal server error");
     }
 }

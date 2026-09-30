@@ -17,8 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use suba_singbox::assemble::{self, Assembled};
-use suba_singbox::core::{Dirs, Metadata, Version};
+use suba_singbox::assemble::{self, Assembled, Tag};
+use suba_singbox::core::{self, Dirs, Metadata, Release, Version};
+use suba_singbox::install::{self, Generate};
 use suba_singbox::run::{self, Runner, Status};
 use suba_singbox::schema::{Schema, Verdict};
 
@@ -33,6 +34,20 @@ const EXTENSION: &str = "json";
 /// The assembled configuration, named as the core is pointed at it.
 pub(crate) const CONFIG: &str = "config.json";
 
+/// Where sing-box's releases are listed.
+///
+/// The dialect crate knows the shape of what this API answers; where that API
+/// lives is this instance's choice, which is why the address is here and not
+/// there.
+const RELEASES: &str = "https://api.github.com/repos/SagerNet/sing-box/releases?per_page=30";
+
+/// A schema, as it was read: which version's, which bytes, and their hash.
+pub(crate) struct SchemaBytes {
+    pub version: Version,
+    pub sha256: String,
+    pub body: Vec<u8>,
+}
+
 /// The sing-box module.
 pub(crate) struct SingboxStore {
     /// `<config>/sing-box`: one file per section, which this server writes but
@@ -40,8 +55,12 @@ pub(crate) struct SingboxStore {
     fragment_dir: PathBuf,
     /// The module's own directories under the data directory.
     dirs: Dirs,
+    /// The instance's HTTP client, which fetching a release goes through.
+    http: reqwest::Client,
     /// The process, which outlives any request that touched it.
     runner: Arc<Runner>,
+    /// Which version was started, while that process is the one in the runner.
+    started: Mutex<Option<Version>>,
     /// The last schema read, with the hash it was read at.
     ///
     /// A schema is addressed by its bytes (I3), so holding one costs nothing but
@@ -50,11 +69,13 @@ pub(crate) struct SingboxStore {
 }
 
 impl SingboxStore {
-    pub(crate) fn new(config_dir: &Path, data_dir: &Path) -> Self {
+    pub(crate) fn new(config_dir: &Path, data_dir: &Path, http: reqwest::Client) -> Self {
         Self {
             fragment_dir: config_dir.join(FRAGMENTS),
             dirs: Dirs::new(data_dir),
+            http,
             runner: Arc::new(Runner::new()),
+            started: Mutex::new(None),
             schemas: Mutex::new(None),
         }
     }
@@ -117,7 +138,7 @@ impl SingboxStore {
     /// type or a field this version does not have is refused here, with the
     /// field path, instead of becoming a core that will not start.
     pub(crate) fn write_fragment(&self, section: &str, value: &Value) -> Result<Verdict, Error> {
-        let (schema, _) = self.schema()?;
+        let (schema, _) = self.parsed_schema()?;
 
         // As if it were the whole configuration with this one section in it,
         // which is what it would be.
@@ -145,17 +166,106 @@ impl SingboxStore {
         Ok(suba_singbox::install::current(&self.dirs)?)
     }
 
-    /// The schema of the version in use, with the bytes it was read from.
+    /// The versions this machine has.
+    pub(crate) fn versions(&self) -> Result<Vec<Metadata>, Error> {
+        Ok(install::installed(&self.dirs)?)
+    }
+
+    /// A version's record, when it is installed.
+    pub(crate) fn installed_record(&self, version: &Version) -> Result<Option<Metadata>, Error> {
+        Ok(self
+            .versions()?
+            .into_iter()
+            .find(|metadata| &metadata.version == version))
+    }
+
+    /// Which version the running process is, when one is running.
+    pub(crate) fn running_version(&self) -> Option<Version> {
+        let started = self.started.lock().expect("the started version");
+
+        match self.runner.status().running {
+            true => started.clone(),
+            false => None,
+        }
+    }
+
+    /// What the release server lists.
+    pub(crate) async fn releases(&self) -> Result<Vec<Release>, Error> {
+        install::releases(&self.http, RELEASES)
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Install a version, or answer with the one that is already there.
     ///
-    /// The bytes are checked against the version's own record first: a schema
-    /// that changed behind the record is exactly what the record is for, and a
-    /// version whose schema does not match it is not one this instance will
-    /// write documents against.
-    pub(crate) fn schema(&self) -> Result<(Arc<Schema>, Vec<u8>), Error> {
+    /// Already installed means nothing is downloaded: the record on disk is the
+    /// answer, and the bytes it was made from are not fetched again.
+    pub(crate) async fn install(&self, version: &Version) -> Result<Metadata, Error> {
+        if let Some(record) = self.installed_record(version)? {
+            return Ok(record);
+        }
+
+        let platform = core::platform()?;
+        let release = self
+            .releases()
+            .await?
+            .into_iter()
+            .find(|release| &release.version == version)
+            .ok_or_else(|| suba_singbox::core::Error::Unpublished {
+                version: version.clone(),
+            })?;
+        let asset = release.asset_for(platform)?;
+        let archive = install::download(&self.http, &asset.url).await?;
+
+        let dirs = self.dirs.clone();
+        let version = version.clone();
+        let name = asset.name.clone();
+        let expected = asset.sha256.clone();
+        let platform = platform.to_string();
+        let now = chrono::Utc::now().timestamp();
+
+        Ok(tokio::task::spawn_blocking(move || {
+            install::install(
+                &dirs,
+                &version,
+                &platform,
+                &name,
+                &archive,
+                expected.as_deref(),
+                now,
+            )
+        })
+        .await??)
+    }
+
+    /// Remove an installed version.
+    pub(crate) fn uninstall(&self, version: &Version) -> Result<(), Error> {
+        if self.running_version().as_ref() == Some(version) {
+            return Err(Error::Singbox(suba_singbox::core::Error::RunningVersion {
+                version: version.clone(),
+            }));
+        }
+
+        Ok(install::uninstall(&self.dirs, version)?)
+    }
+
+    /// Make an installed version the one in use.
+    pub(crate) fn set_current(&self, version: &Version) -> Result<(), Error> {
+        Ok(install::set_current(&self.dirs, version)?)
+    }
+
+    /// Ask the version in use for something it generates.
+    pub(crate) fn generate(&self, kind: Generate, argument: Option<&str>) -> Result<String, Error> {
         let version = self.current()?.ok_or(Error::NoVersion)?;
 
-        let bytes = std::fs::read(self.dirs.schema(&version))?;
-        let sha256 = suba_singbox::core::sha256_hex(&bytes);
+        Ok(install::generate(&self.dirs, &version, kind, argument)?)
+    }
+
+    /// The schema of the version in use, as it is on disk.
+    pub(crate) fn schema_bytes(&self) -> Result<SchemaBytes, Error> {
+        let version = self.current()?.ok_or(Error::NoVersion)?;
+        let body = std::fs::read(self.dirs.schema(&version))?;
+        let sha256 = core::sha256_hex(&body);
 
         let record = self.record(&version)?;
         if record.schema_sha256 != sha256 {
@@ -165,19 +275,45 @@ impl SingboxStore {
             }));
         }
 
+        Ok(SchemaBytes {
+            version,
+            sha256,
+            body,
+        })
+    }
+
+    /// The tags a form can offer as references.
+    ///
+    /// Read from the document the fragments make, without requiring it to hold
+    /// up: the operator is still writing it, and the tags that exist so far are
+    /// exactly what the next field needs.
+    pub(crate) fn references(&self, generated: &[Value]) -> Result<Vec<Tag>, Error> {
+        let document = assemble::document(&self.fragments()?, generated)
+            .map_err(|unfit| Error::Document(unfit.to_string()))?;
+
+        assemble::tags(&document).map_err(|unfit| Error::Document(unfit.to_string()))
+    }
+
+    /// The schema of the version in use, parsed, with the bytes it came from.
+    ///
+    /// Held by the hash it was read at: a schema is addressed by its bytes (I3),
+    /// so every caller after the first pays nothing to have it.
+    pub(crate) fn parsed_schema(&self) -> Result<(Arc<Schema>, Vec<u8>), Error> {
+        let file = self.schema_bytes()?;
+
         let mut held = self.schemas.lock().expect("the schema");
         if let Some((hash, schema)) = held.as_ref() {
-            if hash == &sha256 {
-                return Ok((Arc::clone(schema), bytes));
+            if hash == &file.sha256 {
+                return Ok((Arc::clone(schema), file.body));
             }
         }
 
         let schema = Arc::new(
-            Schema::read(&bytes).map_err(|unreadable| Error::Schema(unreadable.to_string()))?,
+            Schema::read(&file.body).map_err(|unreadable| Error::Schema(unreadable.to_string()))?,
         );
-        *held = Some((sha256, Arc::clone(&schema)));
+        *held = Some((file.sha256, Arc::clone(&schema)));
 
-        Ok((schema, bytes))
+        Ok((schema, file.body))
     }
 
     /// The configuration the core would run: the fragments, and whatever a
@@ -216,7 +352,7 @@ impl SingboxStore {
         let version = self.current()?.ok_or(Error::NoVersion)?;
 
         let assembled = self.assemble(generated)?;
-        let (schema, _) = self.schema()?;
+        let (schema, _) = self.parsed_schema()?;
         if let Verdict::Failed(fault) = schema.validate(&assembled.config) {
             return Err(Error::Document(format!("{}: {}", fault.path, fault.reason)));
         }
@@ -249,14 +385,11 @@ impl SingboxStore {
 
     /// A version's record, as it was written when it was installed.
     fn record(&self, version: &Version) -> Result<Metadata, Error> {
-        suba_singbox::install::installed(&self.dirs)?
-            .into_iter()
-            .find(|metadata| &metadata.version == version)
-            .ok_or_else(|| {
-                Error::Singbox(suba_singbox::core::Error::NotInstalled {
-                    version: version.clone(),
-                })
+        self.installed_record(version)?.ok_or_else(|| {
+            Error::Singbox(suba_singbox::core::Error::NotInstalled {
+                version: version.clone(),
             })
+        })
     }
 }
 
@@ -340,7 +473,11 @@ mod tests {
     /// A store over a scratch directory, with one version installed and current.
     fn store() -> (Scratch, SingboxStore) {
         let scratch = Scratch::new();
-        let store = SingboxStore::new(&scratch.0.join("config"), &scratch.0.join("data"));
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+        );
 
         let version = Version::from_tag("v1.14.2");
         suba_singbox::install::install(
@@ -448,7 +585,11 @@ mod tests {
     #[test]
     fn starting_without_a_version_is_refused() {
         let scratch = Scratch::new();
-        let store = SingboxStore::new(&scratch.0.join("config"), &scratch.0.join("data"));
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+        );
 
         assert!(matches!(store.start(&[]), Err(Error::NoVersion)));
         assert!(!store.assembled());

@@ -42,15 +42,28 @@ struct Inner {
 impl AppState {
     /// Load every store and build the shared HTTP client.
     pub async fn build(config: &ServerConfig) -> Result<Self, Error> {
+        // One client for the instance: subscriptions and releases both go out
+        // through it, so connection reuse and timeouts are the same everywhere.
+        // A user agent is not decoration: the release API answers `403` to a
+        // request without one, and an instance that cannot fetch a release is
+        // an instance that cannot install a core.
+        let http = Client::builder()
+            .user_agent(concat!("suba/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+
         Ok(Self(Arc::new(Inner {
             data_dir: config.data_dir.clone(),
-            http: Client::builder().build()?,
+            http: http.clone(),
             settings: SettingsStore::load(&config.config_dir)?,
             providers: Arc::new(ProviderStore::load(&config.config_dir, &config.data_dir)?),
             collections: CollectionStore::load(&config.config_dir)?,
             sessions: SessionStore::load(&config.data_dir)?,
             #[cfg(feature = "singbox-core")]
-            singbox: Arc::new(SingboxStore::new(&config.config_dir, &config.data_dir)),
+            singbox: Arc::new(SingboxStore::new(
+                &config.config_dir,
+                &config.data_dir,
+                http.clone(),
+            )),
         })))
     }
 
