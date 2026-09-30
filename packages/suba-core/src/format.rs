@@ -38,6 +38,8 @@ use crate::proto::{Client, Node};
 pub enum Format {
     /// The share links themselves, one per line.
     Links,
+    /// The same link list, wrapped in base64: what a subscription URL serves.
+    Base64,
     /// A sing-box configuration, with one outbound per node.
     #[cfg(feature = "singbox")]
     Singbox,
@@ -54,13 +56,13 @@ impl Format {
     /// that" a fact rather than a runtime check somebody can forget to perform.
     pub fn all() -> &'static [Self] {
         #[cfg(all(feature = "singbox", feature = "clash"))]
-        let formats: &'static [Self] = &[Self::Links, Self::Singbox, Self::Clash];
+        let formats: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox, Self::Clash];
         #[cfg(all(feature = "singbox", not(feature = "clash")))]
-        let formats: &'static [Self] = &[Self::Links, Self::Singbox];
+        let formats: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox];
         #[cfg(all(feature = "clash", not(feature = "singbox")))]
-        let formats: &'static [Self] = &[Self::Links, Self::Clash];
+        let formats: &'static [Self] = &[Self::Links, Self::Base64, Self::Clash];
         #[cfg(not(any(feature = "singbox", feature = "clash")))]
-        let formats: &'static [Self] = &[Self::Links];
+        let formats: &'static [Self] = &[Self::Links, Self::Base64];
 
         formats
     }
@@ -69,6 +71,7 @@ impl Format {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Links => "links",
+            Self::Base64 => "base64",
             #[cfg(feature = "singbox")]
             Self::Singbox => "singbox",
             #[cfg(feature = "clash")]
@@ -79,7 +82,7 @@ impl Format {
     /// What it can express, before anything is rendered.
     pub const fn descriptor(self) -> FormatDescriptor {
         match self {
-            Self::Links => FormatDescriptor {
+            Self::Links | Self::Base64 => FormatDescriptor {
                 format: self,
                 intents: &[RenderIntent::Client],
                 // A link is what the model is parsed *from*: whatever a provider
@@ -126,6 +129,10 @@ impl Format {
 
         match self {
             Self::Links => rendered.body = self.render_links(nodes, &mut rendered.skipped),
+            Self::Base64 => {
+                rendered.body =
+                    proto::base64::encode_standard(self.render_links(nodes, &mut rendered.skipped))
+            }
             #[cfg(feature = "singbox")]
             Self::Singbox => rendered.body = self.render_singbox(nodes, &mut rendered.skipped),
             #[cfg(feature = "clash")]
@@ -623,6 +630,26 @@ mod tests {
         assert_eq!(rendered.body.matches('\n').count(), 2);
     }
 
+    /// Base64 is the link list, wrapped: decoded, it is the links document byte
+    /// for byte, and what one leaves out the other leaves out too.
+    #[test]
+    fn base64_is_the_link_list_wrapped() {
+        let index = index(&links()[..2]);
+        let links = Format::Links
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+        let wrapped = Format::Base64
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+
+        assert!(!wrapped.body.contains("://"), "{}", wrapped.body);
+        assert_eq!(
+            proto::base64::decode_to_string(wrapped.body.as_bytes()).unwrap(),
+            links.body
+        );
+        assert_eq!(wrapped.skipped, links.skipped);
+    }
+
     /// A node nothing serves has no content, so no document can contain it.
     #[test]
     fn a_node_nobody_serves_is_left_out_with_its_reason() {
@@ -743,13 +770,13 @@ mod tests {
         let names: Vec<&str> = Format::all().iter().map(|format| format.as_str()).collect();
 
         #[cfg(all(feature = "singbox", feature = "clash"))]
-        assert_eq!(names, ["links", "singbox", "clash"]);
+        assert_eq!(names, ["links", "base64", "singbox", "clash"]);
         #[cfg(all(feature = "singbox", not(feature = "clash")))]
-        assert_eq!(names, ["links", "singbox"]);
+        assert_eq!(names, ["links", "base64", "singbox"]);
         #[cfg(all(feature = "clash", not(feature = "singbox")))]
-        assert_eq!(names, ["links", "clash"]);
+        assert_eq!(names, ["links", "base64", "clash"]);
         #[cfg(not(any(feature = "singbox", feature = "clash")))]
-        assert_eq!(names, ["links"]);
+        assert_eq!(names, ["links", "base64"]);
     }
 
     /// A node the dialect has no outbound for is left out of the document and

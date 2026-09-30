@@ -58,10 +58,10 @@ pub struct Collection {
     /// The format this collection's artifact is written in.
     ///
     /// Declared, not guessed: whoever subscribes to the URL gets what this says,
-    /// and a client that wants something else is asking the wrong URL. Links by
-    /// default, because a collection hands out a subscription and a link list is
-    /// the shape every client reads.
-    #[serde(default = "links", skip_serializing_if = "is_links")]
+    /// and a client that wants something else is asking the wrong URL. Base64
+    /// by default, because a collection hands out a subscription and a base64
+    /// link list is the shape every client reads.
+    #[serde(default = "base64", skip_serializing_if = "is_base64")]
     pub format: Format,
 
     /// The delivery token, as a hash.
@@ -75,13 +75,13 @@ pub struct Collection {
 }
 
 /// The format a collection serves in when its document does not say.
-fn links() -> Format {
-    Format::Links
+fn base64() -> Format {
+    Format::Base64
 }
 
 /// Whether a collection is written in the format a subscription is in anyway.
-fn is_links(format: &Format) -> bool {
-    *format == Format::Links
+fn is_base64(format: &Format) -> bool {
+    *format == Format::Base64
 }
 
 impl Default for Collection {
@@ -90,7 +90,7 @@ impl Default for Collection {
             providers: Vec::new(),
             includes: Vec::new(),
             excludes: Vec::new(),
-            format: Format::Links,
+            format: Format::Base64,
             token: None,
         }
     }

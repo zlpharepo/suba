@@ -14,10 +14,15 @@ use base64::Engine as _;
 
 use crate::error::{Error, ErrorKind, Result};
 
-/// Encode to URL-safe base64 without padding: what a subscription body is
-/// wrapped in, and what SIP002 asks for.
+/// Encode to URL-safe base64 without padding: what SIP002 asks for.
 pub fn encode(bytes: impl AsRef<[u8]>) -> String {
     URL_SAFE_NO_PAD.encode(bytes.as_ref())
+}
+
+/// Encode to standard base64 with padding: what a subscription body is wrapped
+/// in, because some clients decode that alphabet only.
+pub fn encode_standard(bytes: impl AsRef<[u8]>) -> String {
+    STANDARD.encode(bytes.as_ref())
 }
 
 /// Decode base64 written in any of the four dialects, with or without padding.
@@ -104,6 +109,13 @@ mod tests {
     fn encodes_url_safe_without_padding() {
         assert_eq!(encode(b"hello"), "aGVsbG8");
         assert_eq!(decode(encode(b"hello").as_bytes()).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn a_subscription_body_is_standard_and_padded() {
+        // `>>?` is where the two alphabets differ; one byte short of a block pads.
+        assert_eq!(encode_standard(b">>?"), "Pj4/");
+        assert_eq!(encode_standard(b"hello"), "aGVsbG8=");
     }
 
     #[test]

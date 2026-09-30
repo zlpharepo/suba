@@ -155,7 +155,10 @@ mod tests {
         let token = state.collections().mint_token("main").await.unwrap();
         let (_, body) = deliver(&state, "s", &token).await.unwrap();
 
-        assert!(body.contains("#US-01"), "{body}");
+        // A collection that declares nothing is served base64-wrapped.
+        let links = suba_core::proto::base64::decode_to_string(body.as_bytes()).unwrap();
+        assert!(!body.contains("://"), "{body}");
+        assert!(links.contains("#US-01"), "{links}");
     }
 
     #[tokio::test]

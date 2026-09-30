@@ -294,11 +294,11 @@ mod tests {
         let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
         assert!(
             !written.contains("format"),
-            "a link list is what a subscription is, and saying so adds nothing: {written}"
+            "base64 is what a subscription is, and saying so adds nothing: {written}"
         );
         assert_eq!(
             load(&dir).get("main").await.unwrap().format,
-            Format::Links,
+            Format::Base64,
             "and reading it back gives the default"
         );
 
