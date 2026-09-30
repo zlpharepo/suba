@@ -12,4 +12,5 @@ pub fn route() -> Router<AppState> {
         .route("/{name}", delete(collections::delete))
         .route("/{name}", put(collections::insert))
         .route("/{name}/nodes", get(collections::nodes))
+        .route("/{name}/content", get(collections::content))
 }

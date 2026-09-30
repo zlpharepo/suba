@@ -27,10 +27,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::filter::{FilterError, NodeFilter};
+use crate::format::Format;
 use crate::index::{IndexEntry, NodeIndex};
 
 /// A collection: which providers it serves from, and what it filters out.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Collection {
     /// The providers it is assembled from, by the names their own document
     /// uses.
@@ -53,6 +54,36 @@ pub struct Collection {
     /// [`includes`](Self::includes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<String>,
+
+    /// The format this collection's artifact is written in.
+    ///
+    /// Declared, not guessed: whoever subscribes to the URL gets what this says,
+    /// and a client that wants something else is asking the wrong URL. Links by
+    /// default, because a collection hands out a subscription and a link list is
+    /// the shape every client reads.
+    #[serde(default = "links", skip_serializing_if = "is_links")]
+    pub format: Format,
+}
+
+/// The format a collection serves in when its document does not say.
+fn links() -> Format {
+    Format::Links
+}
+
+/// Whether a collection is written in the format a subscription is in anyway.
+fn is_links(format: &Format) -> bool {
+    *format == Format::Links
+}
+
+impl Default for Collection {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            includes: Vec::new(),
+            excludes: Vec::new(),
+            format: Format::Links,
+        }
+    }
 }
 
 impl Collection {
@@ -598,7 +629,7 @@ mod tests {
         let broken = Collection {
             providers: vec!["alpha".to_string()],
             includes: vec!["regex:(".to_string()],
-            excludes: Vec::new(),
+            ..Collection::default()
         };
 
         assert!(matches!(broken.filter(), Err(FilterError::Pattern { .. })));

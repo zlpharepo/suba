@@ -83,6 +83,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use suba_core::Format;
+
     use crate::config::{config_path, read_config, APP_CONFIG_BASENAME};
     use crate::provider::PROVIDERS_BASENAME;
 
@@ -151,7 +153,7 @@ mod tests {
         let broken = Collection {
             providers: vec!["airport".to_string()],
             includes: vec!["regex:(".to_string()],
-            excludes: Vec::new(),
+            ..Collection::default()
         };
 
         assert!(matches!(
@@ -161,6 +163,61 @@ mod tests {
         assert!(store.get("main").await.is_none());
 
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    /// The format a collection declares survives the document, and the default
+    /// is left unsaid.
+    #[tokio::test]
+    async fn the_default_format_is_not_written_down() {
+        let dir = scratch("format-default");
+        let store = load(&dir);
+
+        store
+            .insert("main", collection(&["airport"]))
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
+        assert!(
+            !written.contains("format"),
+            "a link list is what a subscription is, and saying so adds nothing: {written}"
+        );
+        assert_eq!(
+            load(&dir).get("main").await.unwrap().format,
+            Format::Links,
+            "and reading it back gives the default"
+        );
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    /// A declared format is written, and comes back.
+    #[cfg(feature = "clash")]
+    #[tokio::test]
+    async fn a_collection_keeps_the_format_it_declares() {
+        let dir = scratch("format");
+        let store = load(&dir);
+
+        store
+            .insert(
+                "main",
+                Collection {
+                    format: Format::Clash,
+                    ..collection(&["airport"])
+                },
+            )
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
+        assert!(written.contains("clash"), "{written}");
+        assert_eq!(
+            load(&dir).get("main").await.unwrap().format,
+            Format::Clash,
+            "in either notation"
+        );
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 
     /// The two lists are written under the names an operator edits.
@@ -176,6 +233,7 @@ mod tests {
                     providers: vec!["airport".to_string()],
                     includes: vec!["keyword:US".to_string()],
                     excludes: vec!["keyword:LAX".to_string()],
+                    ..Collection::default()
                 },
             )
             .await

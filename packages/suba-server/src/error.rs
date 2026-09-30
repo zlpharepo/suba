@@ -65,6 +65,23 @@ pub enum Error {
     #[error(transparent)]
     Request(#[from] reqwest::Error),
 
+    /// A document this instance cannot write.
+    ///
+    /// Its own problem, not the caller's: the format and the direction are both
+    /// this instance's choice, made where the collection is written.
+    #[error(transparent)]
+    Render(#[from] suba_core::RenderError),
+
+    /// A query parameter this instance will not accept.
+    ///
+    /// The text is the parameter's name and a static reason, never the value,
+    /// which is operator data.
+    #[error("{parameter}: {reason}")]
+    Parameter {
+        parameter: &'static str,
+        reason: &'static str,
+    },
+
     /// The sing-box module refused something.
     #[cfg(feature = "singbox-core")]
     #[error(transparent)]
@@ -207,6 +224,18 @@ impl IntoHttpError for Error {
                     message: message.to_string(),
                 }
             }
+            Error::Render(error) => {
+                tracing::error!("render error: {error}");
+
+                HttpError {
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "Internal server error".to_string(),
+                }
+            }
+            Error::Parameter { parameter, reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("{parameter}: {reason}"),
+            },
             Error::Request(_) => HttpError {
                 status_code: StatusCode::BAD_GATEWAY,
                 message: "Upstream request failed".to_string(),

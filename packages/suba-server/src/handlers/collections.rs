@@ -1,19 +1,21 @@
 //! The collections of the instance, as HTTP resources.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path as StdPath};
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     response::IntoResponse,
     Json,
 };
-use http::StatusCode;
+use http::{header, HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
-use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Source, View};
+use suba_core::format::RenderIntent;
+use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source, View};
 
 use crate::{
     dto::{Authenticated, ResponseResult},
     error::Error,
+    state::render::Artifact,
     tracing, AppState,
 };
 
@@ -156,6 +158,217 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// What a caller may narrow an artifact by.
+///
+/// Narrowing only: a request can say which of the nodes the collection serves it
+/// wants, never which format or direction — that is what the collection's own
+/// document declares, and letting a URL choose would make the URL a second
+/// source of truth for the same decision.
+///
+/// Unknown parameters are refused rather than ignored: a misspelled one means
+/// the client believes it asked for something it did not, and the worst answer
+/// is not knowing which one it got.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Narrowing {
+    /// Only these nodes, by identity, comma separated.
+    ///
+    /// An id the collection does not serve is not an error: it is simply not in
+    /// the answer, so a client holding a list that has moved on gets what is
+    /// still there.
+    pub ids: Option<String>,
+}
+
+impl Narrowing {
+    /// The identities asked for, when the request asked for any.
+    fn ids(&self) -> Result<Option<Vec<&str>>, Error> {
+        let Some(ids) = self.ids.as_deref() else {
+            return Ok(None);
+        };
+
+        let ids: Vec<&str> = ids
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect();
+
+        match ids.is_empty() {
+            true => Err(Error::Parameter {
+                parameter: "ids",
+                reason: "the value is empty",
+            }),
+            false => Ok(Some(ids)),
+        }
+    }
+}
+
+/// The artifact this collection serves.
+///
+/// The one path a subscription comes out of: the management route previews it
+/// and the delivery route hands it to a client, so the two cannot be two
+/// different documents.
+pub(crate) async fn artifact_of(
+    state: &AppState,
+    name: &str,
+    narrowing: &Narrowing,
+) -> Result<std::sync::Arc<Artifact>, Error> {
+    let collection = state
+        .collections()
+        .get(name)
+        .await
+        .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
+    let only = narrowing.ids()?;
+
+    let observations = state.providers().observations().await?;
+    let declared = state.providers().formats().await;
+
+    let key = address(
+        state,
+        &collection,
+        &observations,
+        &declared,
+        only.as_deref(),
+    )
+    .await?;
+
+    if let Some(artifact) = state.rendered().get(&key) {
+        return Ok(artifact);
+    }
+
+    // The same index the node view is built from, so a preview and a delivery
+    // agree about identity down to the node's name.
+    let index = NodeIndex::from_observations(observations.iter().map(|(name, observation)| {
+        (
+            name.as_str(),
+            declared
+                .get(name)
+                .copied()
+                .unwrap_or(suba_core::subscription::DeclaredFormat::Links),
+            observation,
+        )
+    }));
+
+    let resolved = collection.resolve(
+        &index,
+        &provider_filters(state, &collection).await?,
+        &collection.filter()?,
+        // A delivery carries what is served now: an orphan has no content, so
+        // there is nothing to hand anyone.
+        View::default(),
+    );
+
+    let nodes: Vec<&IndexEntry> = match only.as_deref() {
+        Some(only) => resolved
+            .nodes
+            .into_iter()
+            .filter(|entry| only.contains(&entry.id.to_string().as_str()))
+            .collect(),
+        None => resolved.nodes,
+    };
+
+    // The direction is asked for explicitly, and today every compiled format
+    // writes the client one; a format that grew a server direction would have to
+    // say so in its descriptor first.
+    let rendered = collection.format.render(&nodes, RenderIntent::Client)?;
+    let artifact = std::sync::Arc::new(Artifact {
+        body: rendered.body.into(),
+        format: collection.format,
+        nodes: nodes.len().saturating_sub(rendered.skipped.len()),
+        skipped: rendered.skipped.len(),
+    });
+
+    state.rendered().put(key, std::sync::Arc::clone(&artifact));
+
+    Ok(artifact)
+}
+
+/// Everything that can change an artifact's bytes, as one address.
+///
+/// The collection's own bytes, each definition it names, the hash each payload
+/// was fetched at, and the format. A key built by hand out of the fields that
+/// «should» matter is the kind that goes stale without anyone noticing; these
+/// are the bytes the answer is a function of.
+async fn address(
+    state: &AppState,
+    collection: &Collection,
+    observations: &BTreeMap<String, Observation>,
+    declared: &BTreeMap<String, suba_core::subscription::DeclaredFormat>,
+    only: Option<&[&str]>,
+) -> Result<String, Error> {
+    let mut key = String::new();
+
+    key.push_str(collection.format.as_str());
+    key.push('\n');
+    key.push_str(&encode(collection)?);
+
+    for name in &collection.providers {
+        if let Some(provider) = state.providers().get(name).await {
+            key.push_str(name);
+            key.push_str(&encode(&provider)?);
+        }
+
+        if let Some(observation) = observations.get(name) {
+            key.push_str(observation.content_hash.as_deref().unwrap_or_default());
+        }
+
+        if let Some(declared) = declared.get(name) {
+            key.push_str(declared.as_str());
+        }
+    }
+
+    if let Some(only) = only {
+        let mut only = only.to_vec();
+        only.sort_unstable();
+
+        for id in only {
+            key.push_str(id);
+        }
+    }
+
+    Ok(suba_core::checksum::sha256_hex(key.as_bytes()))
+}
+
+/// A document as the instance's codec writes it, for the address above.
+fn encode<T: Serialize>(value: &T) -> Result<String, Error> {
+    crate::config::codec::encode(value, StdPath::new("render")).map_err(Error::Config)
+}
+
+/// Serve what this collection hands to a subscriber.
+///
+/// The body is the document itself; what was left out is reported in headers
+/// rather than in the body, which belongs to the client's core.
+pub async fn content(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(narrowing): Query<Narrowing>,
+) -> ResponseResult<impl IntoResponse> {
+    let artifact = artifact_of(&state, &name, &narrowing).await?;
+
+    Ok((artifact_headers(&artifact), artifact.body.to_string()))
+}
+
+/// The headers every artifact is served with.
+///
+/// What was left out is reported here rather than in the body: the body belongs
+/// to the client's core, and a comment it did not ask for would be an edit to it.
+fn artifact_headers(artifact: &Artifact) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    headers.insert(
+        "x-suba-format",
+        HeaderValue::from_static(artifact.format.as_str()),
+    );
+    headers.insert("x-suba-nodes", HeaderValue::from(artifact.nodes));
+    headers.insert("x-suba-skipped", HeaderValue::from(artifact.skipped));
+
+    headers
+}
+
 /// The nodes this collection resolves to.
 ///
 /// The structure, not a document a client can subscribe to: what each node is,
@@ -170,6 +383,201 @@ pub async fn nodes(
 }
 
 /// Resolve a collection to the view the API reports.
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+    use suba_core::Format;
+
+    use crate::{
+        config::ServerConfig,
+        provider::{Inline, Provider, SharedFields},
+    };
+
+    fn temp_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("suba-artifact-{}", uuid::Uuid::now_v7()))
+    }
+
+    async fn state() -> AppState {
+        let root = temp_dir();
+        let config = ServerConfig {
+            listen: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: root.join("config"),
+            data_dir: root.join("data"),
+        };
+
+        AppState::build(&config).await.unwrap()
+    }
+
+    fn link(host: &str, name: &str) -> String {
+        format!("trojan://hunter2@{host}:443#{name}\n")
+    }
+
+    async fn inline(state: &AppState, name: &str, payload: &str) {
+        let provider = Provider::Inline(Inline {
+            shared: SharedFields::default(),
+            payload: payload.to_string(),
+        });
+
+        state
+            .providers()
+            .upsert(name, provider, state.http())
+            .await
+            .unwrap();
+    }
+
+    async fn collection(state: &AppState, name: &str, providers: &[&str], format: Format) {
+        let collection = Collection {
+            providers: providers.iter().map(|name| name.to_string()).collect(),
+            format,
+            ..Collection::default()
+        };
+
+        state.collections().insert(name, collection).await.unwrap();
+    }
+
+    fn narrowing(ids: Option<&str>) -> Narrowing {
+        Narrowing {
+            ids: ids.map(str::to_owned),
+        }
+    }
+
+    /// The identity of the one node a payload serves.
+    async fn id_of(state: &AppState, collection: &str) -> String {
+        let Nodes { nodes, .. } = nodes_of(state, collection).await.unwrap();
+
+        nodes[0].id.clone()
+    }
+
+    #[tokio::test]
+    async fn the_artifact_is_what_the_payloads_hold() {
+        let state = state().await;
+        inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
+        collection(&state, "main", &["alpha"], Format::Links).await;
+
+        let artifact = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+
+        assert_eq!(artifact.nodes, 1);
+        assert_eq!(artifact.skipped, 0);
+        assert!(
+            artifact.body.contains("#US-01"),
+            "a link list carries the node: {}",
+            artifact.body
+        );
+    }
+
+    /// The format is the collection's, and the artifact is the shape it names.
+    #[cfg(feature = "clash")]
+    #[tokio::test]
+    async fn the_artifact_is_written_in_the_declared_format() {
+        let state = state().await;
+        inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
+        collection(&state, "main", &["alpha"], Format::Clash).await;
+
+        let artifact = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+
+        assert!(
+            artifact.body.contains("proxies:"),
+            "a clash document: {}",
+            artifact.body
+        );
+        assert!(!artifact.body.contains("#US-01"), "and not a link list");
+    }
+
+    /// A second request for the same thing is the artifact rendered the first
+    /// time.
+    #[tokio::test]
+    async fn the_same_request_is_rendered_once() {
+        let state = state().await;
+        inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
+        collection(&state, "main", &["alpha"], Format::Links).await;
+
+        let once = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        let twice = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+
+        assert_eq!(once.body, twice.body);
+        assert!(std::sync::Arc::ptr_eq(&once, &twice), "the same artifact");
+        assert_eq!(
+            state.rendered().len(),
+            1,
+            "and it was rendered once, not twice"
+        );
+    }
+
+    /// Rendered content is derived, so it stays in memory: two requests cost
+    /// memory and no disk at all.
+    #[tokio::test]
+    async fn rendering_writes_nothing_down() {
+        let state = state().await;
+        inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
+        collection(&state, "main", &["alpha"], Format::Links).await;
+
+        let before = std::fs::read_dir(state.data_dir()).map(Iterator::count);
+        artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        let after = std::fs::read_dir(state.data_dir()).map(Iterator::count);
+
+        assert_eq!(before.unwrap(), after.unwrap(), "two renders add no files");
+    }
+
+    #[tokio::test]
+    async fn a_request_can_only_narrow_what_it_is_served() {
+        let state = state().await;
+        inline(
+            &state,
+            "alpha",
+            &format!(
+                "{}{}",
+                link("alpha.example.com", "US-01"),
+                link("beta.example.com", "JP-01")
+            ),
+        )
+        .await;
+        collection(&state, "main", &["alpha"], Format::Links).await;
+
+        let all = artifact_of(&state, "main", &narrowing(None)).await.unwrap();
+        assert!(all.body.contains("#US-01") && all.body.contains("#JP-01"));
+
+        let one = id_of(&state, "main").await;
+        let narrowed = artifact_of(&state, "main", &narrowing(Some(&one)))
+            .await
+            .unwrap();
+
+        assert!(narrowed.body.contains("#US-01"));
+        assert!(!narrowed.body.contains("#JP-01"), "{}", narrowed.body);
+        assert_eq!(narrowed.nodes, 1);
+
+        // An id nobody serves is not an error and not an answer: nothing comes
+        // back, and nothing else the collection holds comes with it either.
+        let none = artifact_of(&state, "main", &narrowing(Some("not-a-node")))
+            .await
+            .unwrap();
+
+        assert!(none.body.is_empty(), "{}", none.body);
+        assert_eq!(none.nodes, 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_narrowing_is_refused_rather_than_guessed() {
+        assert!(matches!(
+            narrowing(Some("")).ids(),
+            Err(Error::Parameter {
+                parameter: "ids",
+                ..
+            })
+        ));
+        assert!(matches!(
+            narrowing(Some(" , ")).ids(),
+            Err(Error::Parameter {
+                parameter: "ids",
+                ..
+            })
+        ));
+        assert!(narrowing(None).ids().unwrap().is_none());
+        assert_eq!(narrowing(Some("a, b")).ids().unwrap().unwrap(), ["a", "b"]);
+    }
+}
+
 async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
     let collection = state
         .collections()

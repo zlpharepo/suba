@@ -1,6 +1,7 @@
 mod collections;
 mod persisted;
 pub(crate) mod providers;
+pub(crate) mod render;
 mod scheduler;
 mod sessions;
 mod settings;
@@ -16,8 +17,8 @@ use crate::{config::ServerConfig, error::Error};
 #[cfg(feature = "singbox-core")]
 use self::singbox::SingboxStore;
 use self::{
-    collections::CollectionStore, providers::ProviderStore, scheduler::Refresher,
-    sessions::SessionStore, settings::SettingsStore,
+    collections::CollectionStore, providers::ProviderStore, render::RenderMemo,
+    scheduler::Refresher, sessions::SessionStore, settings::SettingsStore,
 };
 /// Everything a request handler shares, behind a single reference count.
 ///
@@ -34,6 +35,7 @@ struct Inner {
     /// Shared with the refresher, which outlives any single request.
     providers: Arc<ProviderStore>,
     collections: CollectionStore,
+    rendered: RenderMemo,
     sessions: SessionStore,
     #[cfg(feature = "singbox-core")]
     singbox: Arc<SingboxStore>,
@@ -57,6 +59,7 @@ impl AppState {
             settings: SettingsStore::load(&config.config_dir)?,
             providers: Arc::new(ProviderStore::load(&config.config_dir, &config.data_dir)?),
             collections: CollectionStore::load(&config.config_dir)?,
+            rendered: RenderMemo::new(),
             sessions: SessionStore::load(&config.data_dir)?,
             #[cfg(feature = "singbox-core")]
             singbox: Arc::new(SingboxStore::new(
@@ -80,6 +83,12 @@ impl AppState {
         self.0.data_dir.join("web")
     }
 
+    /// The data directory. Used by tests that assert nothing was written.
+    #[cfg(test)]
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.0.data_dir
+    }
+
     /// The client used for outbound subscription requests.
     pub(crate) fn http(&self) -> &Client {
         &self.0.http
@@ -98,6 +107,11 @@ impl AppState {
     /// The configured collections.
     pub(crate) fn collections(&self) -> &CollectionStore {
         &self.0.collections
+    }
+
+    /// The artifacts rendered so far, by content address.
+    pub(crate) fn rendered(&self) -> &RenderMemo {
+        &self.0.rendered
     }
 
     /// The sessions currently allowed to authenticate.
