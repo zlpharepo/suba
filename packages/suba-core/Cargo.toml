@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [features]
-singbox = ["dep:suba-singbox"]
+singbox = ["dep:suba-singbox", "suba-singbox/render"]
 clash = ["dep:suba-clash"]
 
 [dependencies]

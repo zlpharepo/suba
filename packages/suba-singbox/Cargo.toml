@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 
 [features]
+# Writing nodes as the documents sing-box reads. Pure: no clock, no file, no
+# socket, and no installed core.
+default = ["render"]
+render = []
 
 [dependencies]
 suba-proto = { workspace = true }
