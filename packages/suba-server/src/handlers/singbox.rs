@@ -80,7 +80,6 @@ pub enum Command {
 
 /// The version to make the current one.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Switch {
     pub version: String,
 }
@@ -829,7 +828,6 @@ pub async fn schema(
 
 /// What to ask the core to generate.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Generation {
     pub command: Generate,
     /// The name a certificate or an ECH configuration is for.

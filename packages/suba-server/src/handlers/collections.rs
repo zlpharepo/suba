@@ -164,12 +164,7 @@ pub async fn delete(
 /// wants, never which format or direction — that is what the collection's own
 /// document declares, and letting a URL choose would make the URL a second
 /// source of truth for the same decision.
-///
-/// Unknown parameters are refused rather than ignored: a misspelled one means
-/// the client believes it asked for something it did not, and the worst answer
-/// is not knowing which one it got.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Narrowing {
     /// Only these nodes, by identity, comma separated.
     ///

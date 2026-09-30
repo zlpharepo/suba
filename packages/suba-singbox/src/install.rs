@@ -41,7 +41,6 @@ pub const MAX_ASSET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// What `current.json` holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Current {
     version: Version,
 }

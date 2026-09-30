@@ -577,7 +577,6 @@ impl Dirs {
 /// validates) — those are computed from the schema on demand, so they cannot go
 /// stale behind a file that changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Metadata {
     /// The version.
     pub version: Version,
