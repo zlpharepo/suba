@@ -23,8 +23,8 @@ pub enum Error {
     CollectionNotFound(String),
     #[error("provider '{0}' is disabled")]
     ProviderDisabled(String),
-    #[error("provider '{0}' has no cached contents yet")]
-    ProviderNotCached(String),
+    #[error("provider '{0}' serves no payload yet")]
+    ProviderNoPayload(String),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -150,9 +150,9 @@ impl IntoHttpError for Error {
                 status_code: StatusCode::CONFLICT,
                 message: format!("Provider '{name}' is disabled"),
             },
-            Error::ProviderNotCached(name) => HttpError {
+            Error::ProviderNoPayload(name) => HttpError {
                 status_code: StatusCode::NOT_FOUND,
-                message: format!("Provider '{name}' has no cached contents yet"),
+                message: format!("Provider '{name}' serves no payload yet"),
             },
             Error::Io(_) => HttpError {
                 status_code: StatusCode::INTERNAL_SERVER_ERROR,

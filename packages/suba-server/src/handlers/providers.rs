@@ -16,7 +16,7 @@ use crate::{
     tracing, AppState,
 };
 
-/// The outcome of reading a provider's subscription, without its contents.
+/// The outcome of reading a provider's subscription, without the payload.
 ///
 /// A subscription may carry credentials, so what is reported is how big it is
 /// and what it holds, never the bytes themselves. `status` says which of the
@@ -88,7 +88,7 @@ pub async fn insert(
     Ok((StatusCode::CREATED, Json(Refresh::from(refreshed))))
 }
 
-/// Re-download a provider and replace its cached contents.
+/// Re-download a provider and replace the payload it holds.
 ///
 /// The refresh path is the same one the scheduler follows, so a manual
 /// refresh cannot race an automatic one.
@@ -103,23 +103,23 @@ pub async fn refresh(
     Ok(Json(Refresh::from(refreshed)))
 }
 
-/// The payload last cached for a provider, exactly as it was fetched.
+/// The payload last fetched for a provider, exactly as it arrives.
 ///
 /// It is served as text because a subscription is opaquely shaped from the
-/// server's point of view; conversion into a concrete format is a separate
-/// step.
-pub async fn content(
+/// server's point of view; conversion into nodes is a separate resource, and
+/// into a concrete format a separate step.
+pub async fn payload(
     _auth: Authenticated,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
-    let content = state
+    let payload = state
         .providers()
-        .content(&name)
+        .payload(&name)
         .await?
-        .ok_or_else(|| Error::ProviderNotCached(name.clone()))?;
+        .ok_or_else(|| Error::ProviderNoPayload(name.clone()))?;
 
-    Ok(content)
+    Ok(payload)
 }
 
 pub async fn delete(

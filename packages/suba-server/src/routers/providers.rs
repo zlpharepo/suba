@@ -12,5 +12,5 @@ pub fn route() -> Router<AppState> {
         .route("/{name}", delete(providers::delete))
         .route("/{name}", put(providers::insert))
         .route("/{name}/refresh", post(providers::refresh))
-        .route("/{name}/content", get(providers::content))
+        .route("/{name}/payload", get(providers::payload))
 }

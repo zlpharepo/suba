@@ -21,7 +21,7 @@ use crate::{
 /// credentials**.
 ///
 /// A node carries the secrets a client dials with. A caller that wants those
-/// asks for the provider's content, where they are what was asked for; a view
+/// asks for the provider's payload, where they are what was asked for; a view
 /// that exists to show what a collection contains must not be able to leak
 /// them.
 #[derive(Debug, Serialize, Deserialize)]

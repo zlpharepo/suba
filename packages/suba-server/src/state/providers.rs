@@ -194,7 +194,7 @@ impl ProviderStore {
     ///
     /// A provider that has never been fetched and one whose every fetch has
     /// failed are the same answer here: neither has anything to serve.
-    pub(crate) async fn content(&self, name: &str) -> Result<Option<String>, Error> {
+    pub(crate) async fn payload(&self, name: &str) -> Result<Option<String>, Error> {
         let Some(observation) = self.observation(name).await? else {
             return Ok(None);
         };
@@ -527,10 +527,10 @@ mod tests {
             .upsert("airport", inline(PAYLOAD), &client)
             .await
             .unwrap();
-        assert!(store.content("airport").await.unwrap().is_some());
+        assert!(store.payload("airport").await.unwrap().is_some());
 
         store.remove("airport").await.unwrap();
-        assert_eq!(store.content("airport").await.unwrap(), None);
+        assert_eq!(store.payload("airport").await.unwrap(), None);
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
@@ -546,13 +546,13 @@ mod tests {
             .upsert("airport", inline(PAYLOAD), &Client::new())
             .await
             .unwrap();
-        assert!(store.content("airport").await.unwrap().is_some());
+        assert!(store.payload("airport").await.unwrap().is_some());
 
         store
             .save("airport", inline("vless://x@example.com:443#Other\n"), None)
             .await
             .unwrap();
-        assert_eq!(store.content("airport").await.unwrap(), None);
+        assert_eq!(store.payload("airport").await.unwrap(), None);
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
@@ -599,7 +599,7 @@ mod tests {
             "the report names the shape rather than the body: {refreshed}"
         );
         assert!(
-            store.content("airport").await.unwrap().is_some(),
+            store.payload("airport").await.unwrap().is_some(),
             "what arrived is held even when this build reads none of it"
         );
 
@@ -629,7 +629,7 @@ mod tests {
         // Nothing was stored, and nothing was published: a refused definition
         // does not half-exist.
         assert!(store.get("airport").await.is_none());
-        assert_eq!(store.content("airport").await.unwrap(), None);
+        assert_eq!(store.payload("airport").await.unwrap(), None);
 
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
@@ -699,7 +699,7 @@ mod tests {
         assert_eq!(stored.bytes, PAYLOAD.len());
         assert_eq!(stored.nodes, 1);
         assert_eq!(
-            store.content("airport").await.unwrap().as_deref(),
+            store.payload("airport").await.unwrap().as_deref(),
             Some(PAYLOAD)
         );
 
@@ -777,7 +777,7 @@ mod tests {
 
         assert!(store.refresh("airport", &client).await.is_err());
         assert_eq!(
-            store.content("airport").await.unwrap().as_deref(),
+            store.payload("airport").await.unwrap().as_deref(),
             Some(PAYLOAD),
             "the last good payload is worth more than nothing"
         );
