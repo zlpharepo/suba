@@ -5,6 +5,7 @@ use axum::{
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use suba_core::subscription::Unreadable;
 use suba_core::RefreshStatus;
 
 use crate::{
@@ -30,6 +31,10 @@ pub struct Refresh {
     pub bytes: usize,
     /// How many nodes it holds.
     pub nodes: usize,
+    /// Why none of them came out of the payload, when its declared shape is one
+    /// this build does not read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<Unreadable>,
 }
 
 impl From<Refreshed> for Refresh {
@@ -39,6 +44,7 @@ impl From<Refreshed> for Refresh {
             status: refreshed.status,
             bytes: refreshed.bytes,
             nodes: refreshed.nodes,
+            unreadable: refreshed.unreadable,
         }
     }
 }

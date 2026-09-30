@@ -23,6 +23,7 @@ use std::{
 
 use http::{header, HeaderMap};
 use serde::{Deserialize, Serialize};
+use suba_core::subscription::DeclaredFormat;
 use suba_core::{Fetched, FilterError, NodeFilter};
 
 /// The largest payload this hub will buffer from a provider.
@@ -54,6 +55,19 @@ pub struct SharedFields {
     #[serde(default)]
     pub disabled: bool,
 
+    /// How this provider's payload is to be read.
+    ///
+    /// Declared rather than detected: guessing at a shape works for "a link list
+    /// maybe wrapped in base64" and fails for a document whose `outbounds` mix
+    /// nodes with selectors. A shape whose reader is not compiled in cannot be
+    /// named here at all, and the refresh says which one this build reads
+    /// instead of reporting an empty subscription.
+    ///
+    /// Skipped when it is `links`, so a definition written before this field
+    /// existed means exactly what it meant then.
+    #[serde(default, skip_serializing_if = "is_links")]
+    pub format: DeclaredFormat,
+
     /// Nodes to keep.
     ///
     /// Each entry is a pattern read against a node's name: a bare value is the
@@ -72,6 +86,11 @@ pub struct SharedFields {
     /// both is dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
+}
+
+/// Whether a provider is declared to be a plain link list, which is the default.
+fn is_links(format: &DeclaredFormat) -> bool {
+    *format == DeclaredFormat::Links
 }
 
 impl SharedFields {
@@ -143,6 +162,20 @@ impl Provider {
         }
     }
 
+    /// How this provider's payload is to be read.
+    pub fn format(&self) -> DeclaredFormat {
+        self.shared().format
+    }
+
+    /// The fields every provider has.
+    fn shared(&self) -> &SharedFields {
+        match self {
+            Self::Remote(remote) => &remote.shared,
+            Self::Local(local) => &local.shared,
+            Self::Inline(inline) => &inline.shared,
+        }
+    }
+
     /// Whether every optional field is unset.
     ///
     /// Used by the round-trip test, which exists because an unset optional field
@@ -150,8 +183,9 @@ impl Provider {
     /// read back in one of the two notations.
     #[cfg(test)]
     pub(crate) fn is_none_of_the_optional_fields(&self) -> bool {
-        let unfiltered =
-            |shared: &SharedFields| shared.include.is_empty() && shared.exclude.is_empty();
+        let unfiltered = |shared: &SharedFields| {
+            shared.include.is_empty() && shared.exclude.is_empty() && is_links(&shared.format)
+        };
 
         match self {
             Self::Remote(remote) => {
@@ -610,6 +644,56 @@ mod tests {
         );
     }
 
+    /// The declared shape survives the document, in whichever notation the
+    /// build writes.
+    #[cfg(feature = "clash")]
+    #[tokio::test]
+    async fn a_provider_keeps_the_format_it_declares() {
+        let path = scratch("format");
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "airport".to_string(),
+            Provider::Remote(Remote {
+                shared: SharedFields {
+                    format: DeclaredFormat::Clash,
+                    ..SharedFields::default()
+                },
+                ..remote()
+            }),
+        );
+
+        write_config(path.to_str().unwrap(), PROVIDERS_BASENAME, &config)
+            .await
+            .unwrap();
+
+        let reloaded = load_providers(&path);
+        let stored = reloaded.providers.get("airport").expect("the provider");
+
+        assert_eq!(stored.format(), DeclaredFormat::Clash);
+
+        tokio::fs::remove_dir_all(path).await.unwrap();
+    }
+
+    /// A shape whose reader is not compiled in cannot be declared at all, which
+    /// is the difference between "this build does not read it" and "this build
+    /// treats it as links and says nothing".
+    #[cfg(not(feature = "clash"))]
+    #[test]
+    fn a_clash_declaration_does_not_exist_without_the_reader() {
+        let document = if cfg!(feature = "json") {
+            r#"{"airport": {"type": "inline", "payload": "", "format": "clash"}}"#
+        } else {
+            "[airport]\ntype = \"inline\"\npayload = \"\"\nformat = \"clash\"\n"
+        };
+        let read: Result<ProvidersConfig, _> =
+            crate::config::codec::decode(document, Path::new("providers"));
+
+        assert!(
+            read.is_err(),
+            "a format with no reader must not be declarable"
+        );
+    }
+
     #[tokio::test]
     async fn inline_serves_its_own_payload() {
         let link = "trojan://hunter2@example.com:443#Node\n";
@@ -865,6 +949,7 @@ mod tests {
             Provider::Remote(Remote {
                 shared: SharedFields {
                     disabled: false,
+                    format: DeclaredFormat::Links,
                     include: vec!["^US".to_string(), "^(HK|TW)$".to_string()],
                     exclude: vec!["-2x$".to_string()],
                 },

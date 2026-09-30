@@ -479,7 +479,11 @@ mod tests {
     }
 
     fn index(links: &[String]) -> NodeIndex {
-        NodeIndex::from_observations([("airport", &observation(links))])
+        NodeIndex::from_observations([(
+            "airport",
+            subscription::DeclaredFormat::Links,
+            &observation(links),
+        )])
     }
 
     fn entries(index: &NodeIndex) -> Vec<&IndexEntry> {
@@ -637,7 +641,8 @@ mod tests {
             ..Observation::default()
         };
 
-        let index = NodeIndex::from_observations([("airport", &held)]);
+        let index =
+            NodeIndex::from_observations([("airport", subscription::DeclaredFormat::Links, &held)]);
         let all: Vec<&IndexEntry> = index.entries().iter().collect();
         let rendered = Format::Links
             .render(&all, RenderIntent::Client)
@@ -864,7 +869,12 @@ mod tests {
     #[test]
     fn what_the_subscription_parser_reads_is_what_the_renderer_writes() {
         let fixtures = links();
-        let parsed = subscription::parse(payload(&fixtures).as_bytes(), "airport", 1_700_000_000);
+        let parsed = subscription::parse(
+            payload(&fixtures).as_bytes(),
+            "airport",
+            1_700_000_000,
+            subscription::DeclaredFormat::Links,
+        );
 
         let index = index(&fixtures);
         let rendered = Format::Links

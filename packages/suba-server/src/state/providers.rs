@@ -21,6 +21,7 @@ use std::{
 };
 
 use reqwest::Client;
+use suba_core::subscription::{DeclaredFormat, Unreadable};
 use suba_core::{decide, record_failure, Observation, RefreshPlan, RefreshStatus};
 use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
 
@@ -44,6 +45,9 @@ pub(crate) struct Refreshed {
     pub(crate) bytes: usize,
     /// How many nodes that payload holds.
     pub(crate) nodes: usize,
+    /// Why the payload that is held contributed none of them, when the shape it
+    /// was declared in is one this build does not read.
+    pub(crate) unreadable: Option<Unreadable>,
 }
 
 impl Refreshed {
@@ -60,6 +64,7 @@ impl Refreshed {
                 .map(|observation| observation.payload.len())
                 .unwrap_or_default(),
             nodes: plan.len(),
+            unreadable: plan.unreadable,
         }
     }
 }
@@ -73,7 +78,15 @@ impl std::fmt::Display for Refreshed {
             formatter,
             "{:?}, {} bytes, {} nodes",
             self.status, self.bytes, self.nodes
-        )
+        )?;
+
+        // Said out loud rather than left to "0 nodes": an operator who declared
+        // a format this build cannot read has to be told which one.
+        if let Some(reason) = self.unreadable {
+            write!(formatter, ", unreadable: {reason}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -133,6 +146,24 @@ impl ProviderStore {
 
     pub(crate) async fn list(&self) -> HashMap<String, Provider> {
         self.file.read(|config| config.providers.clone()).await
+    }
+
+    /// How every provider's payload is declared to be read.
+    ///
+    /// The node index reads payloads itself, and it must read them the way they
+    /// were fetched: a provider whose declared shape this build cannot read
+    /// contributes nothing, and a second reading that guessed would contradict
+    /// the refresh that said so.
+    pub(crate) async fn formats(&self) -> BTreeMap<String, DeclaredFormat> {
+        self.file
+            .read(|config| {
+                config
+                    .providers
+                    .iter()
+                    .map(|(name, provider)| (name.clone(), provider.format()))
+                    .collect()
+            })
+            .await
     }
 
     pub(crate) async fn get(&self, name: &str) -> Option<Provider> {
@@ -238,7 +269,13 @@ impl ProviderStore {
         // Nothing is asked conditionally here: whatever this hub held belonged
         // to the definition being replaced.
         let fetched = provider.fetch(client, &self.config_dir, None).await?;
-        let plan = decide(name, self.observation(name).await?.as_ref(), fetched, now());
+        let plan = decide(
+            name,
+            self.observation(name).await?.as_ref(),
+            fetched,
+            now(),
+            provider.format(),
+        );
 
         self.save(name, provider, plan.observation.as_ref()).await?;
 
@@ -283,7 +320,7 @@ impl ProviderStore {
             }
         };
 
-        let plan = decide(name, previous.as_ref(), fetched, now());
+        let plan = decide(name, previous.as_ref(), fetched, now(), provider.format());
         if let Some(observation) = plan.observation.as_ref() {
             self.write_observation(name, observation).await?;
         }
@@ -536,6 +573,39 @@ mod tests {
     ///
     /// Storing it would leave a provider whose definition says one thing and
     /// whose behaviour does another; the operator would have no way to tell
+    /// A payload whose declared shape this build cannot read is reported as
+    /// such — and is still kept, because the bytes are the record of what the
+    /// provider served and a build that can read them may come later.
+    #[cfg(feature = "clash")]
+    #[tokio::test]
+    async fn a_refresh_says_which_shape_this_build_cannot_read() {
+        let dir = test_dir();
+        let store = load(&dir);
+        let client = Client::new();
+
+        let declared = Provider::Inline(Inline {
+            shared: SharedFields {
+                format: DeclaredFormat::Clash,
+                ..SharedFields::default()
+            },
+            payload: PAYLOAD.to_string(),
+        });
+        let refreshed = store.upsert("airport", declared, &client).await.unwrap();
+
+        assert_eq!(refreshed.nodes, 0);
+        assert_eq!(refreshed.unreadable, Some(Unreadable::Clash));
+        assert!(
+            refreshed.to_string().contains("clash"),
+            "the report names the shape rather than the body: {refreshed}"
+        );
+        assert!(
+            store.content("airport").await.unwrap().is_some(),
+            "what arrived is held even when this build reads none of it"
+        );
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
     /// which had happened.
     #[tokio::test]
     async fn a_provider_with_an_unusable_filter_is_refused() {

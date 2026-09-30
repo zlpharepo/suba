@@ -182,11 +182,20 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
     // instance, and a view assembled from a subset would disagree with the
     // others about the same node.
     let observations = state.providers().observations().await?;
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
+    let declared = state.providers().formats().await;
+    let index = NodeIndex::from_observations(observations.iter().map(|(name, observation)| {
+        // A provider nobody defines any more has no declaration to read by:
+        // it contributes nothing either way, and links is what a body with
+        // no definition was read as when it was fetched.
+        (
+            name.as_str(),
+            declared
+                .get(name)
+                .copied()
+                .unwrap_or(suba_core::subscription::DeclaredFormat::Links),
+            observation,
+        )
+    }));
 
     let filter = collection.filter()?;
     let resolved = collection.resolve(

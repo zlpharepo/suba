@@ -36,6 +36,91 @@ pub enum SourceFormat {
     Clash,
 }
 
+/// The shape a provider says its payload is in.
+///
+/// Declared, not detected — [`SourceFormat`] is what a body turned out to be.
+/// A declaration picks the reader instead of guessing at one, and a shape whose
+/// reader is not compiled in does not exist here at all (I4), so choosing it is
+/// a refusal rather than a silently different reading.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeclaredFormat {
+    /// Share links, one per line, optionally wrapped in base64.
+    #[default]
+    Links,
+    /// A clash/mihomo document.
+    #[cfg(feature = "clash")]
+    Clash,
+    /// A sing-box configuration document.
+    #[cfg(feature = "singbox")]
+    Singbox,
+}
+
+impl DeclaredFormat {
+    /// The word this is written as, which is also how a reason names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Links => "links",
+            #[cfg(feature = "clash")]
+            Self::Clash => "clash",
+            #[cfg(feature = "singbox")]
+            Self::Singbox => "singbox",
+        }
+    }
+
+    /// Why this build reads nothing of this shape, or `None` when it reads it.
+    ///
+    /// Both document shapes are declared but not readable yet — a reader is its
+    /// writer's inverse and lands later — and until then a declaration is
+    /// answered with this instead of an empty subscription. An operator who
+    /// declared a format must not be told "0 nodes" as if the body were at
+    /// fault.
+    pub fn unreadable(self) -> Option<Unreadable> {
+        match self {
+            Self::Links => None,
+            #[cfg(feature = "clash")]
+            Self::Clash => Some(Unreadable::Clash),
+            #[cfg(feature = "singbox")]
+            Self::Singbox => Some(Unreadable::Singbox),
+        }
+    }
+}
+
+/// Why a body contributed no nodes at all.
+///
+/// Static, and chosen by the reader: a body carries credentials, so nothing
+/// that came out of it may be quoted back. This is a classified answer, not a
+/// message — a caller that must tell the cases apart matches on it rather than
+/// on the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Unreadable {
+    /// It was declared a clash document, and this build reads none.
+    #[cfg(feature = "clash")]
+    Clash,
+    /// It was declared a sing-box document, and this build reads none.
+    #[cfg(feature = "singbox")]
+    Singbox,
+    /// It was declared links, and it is a clash document.
+    LooksLikeClash,
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            #[cfg(feature = "clash")]
+            Self::Clash => "the provider declares a clash document, and this build reads none",
+            #[cfg(feature = "singbox")]
+            Self::Singbox => "the provider declares a sing-box document, and this build reads none",
+            Self::LooksLikeClash => {
+                "the body is a clash document, and this build reads none of those"
+            }
+        };
+
+        formatter.write_str(text)
+    }
+}
+
 /// A line the reader could not use, and why.
 ///
 /// The reason is written when the reader is written, so it never quotes the
@@ -51,7 +136,9 @@ pub struct SkippedLine {
 /// What a payload turned out to contain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Subscription {
-    pub format: SourceFormat,
+    /// What the body was recognised as. `None` when nothing was: a shape this
+    /// build cannot read is not a shape it can name.
+    pub format: Option<SourceFormat>,
     /// The nodes, in the order they appeared, deduplicated by identity.
     pub nodes: Vec<NodeRecord>,
     /// How many entries collapsed into a node that was already seen.
@@ -62,6 +149,12 @@ pub struct Subscription {
     /// How many reasons were dropped past the limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub skipped_omitted: usize,
+    /// Why nothing was read at all, when the whole body is beyond this build.
+    ///
+    /// Distinct from an empty `nodes` with no reason: that one is a body whose
+    /// lines were all unusable, which is a different thing to tell an operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<Unreadable>,
 }
 
 impl Subscription {
@@ -87,9 +180,14 @@ fn is_zero(count: &usize) -> bool {
 
 /// Read a subscription payload.
 ///
-/// Detects the shape, then reads it. The link is kept as it arrived, so what a
-/// provider served can be audited and re-exported without a second parse.
-pub fn parse(payload: &[u8], provider: &str, now: i64) -> Subscription {
+/// `declared` is how the provider says it is to be read; within links, the
+/// shape is still detected, because one layer of base64 around the same lines
+/// is the same subscription. The link is kept as it arrived, so what a provider
+/// served can be audited and re-exported without a second parse.
+pub fn parse(payload: &[u8], provider: &str, now: i64, declared: DeclaredFormat) -> Subscription {
+    if let Some(reason) = declared.unreadable() {
+        return Subscription::unreadable(None, reason);
+    }
     // A body that is base64 of a link list is the common case for a provider;
     // anything else is read as the text it is.
     let (text, format) = match proto::base64::decode_if_text(payload) {
@@ -101,7 +199,9 @@ pub fn parse(payload: &[u8], provider: &str, now: i64) -> Subscription {
     };
 
     if looks_like_clash(&text) {
-        return clash_not_supported(&text);
+        // The declaration said links and the body disagrees. Read as links, this
+        // becomes one skipped reason per line — noise about the wrong problem.
+        return Subscription::unreadable(Some(SourceFormat::Clash), Unreadable::LooksLikeClash);
     }
 
     read_links(&text, format, provider, now)
@@ -139,14 +239,17 @@ fn looks_like_clash(text: &str) -> bool {
     })
 }
 
-/// A clash document was recognised and this build cannot read it.
-fn clash_not_supported(_text: &str) -> Subscription {
-    Subscription {
-        format: SourceFormat::Clash,
-        nodes: Vec::new(),
-        duplicates: 0,
-        skipped: Vec::new(),
-        skipped_omitted: 0,
+impl Subscription {
+    /// A body this build read nothing out of, and the reason why.
+    fn unreadable(format: Option<SourceFormat>, why: Unreadable) -> Self {
+        Self {
+            format,
+            nodes: Vec::new(),
+            duplicates: 0,
+            skipped: Vec::new(),
+            skipped_omitted: 0,
+            unreadable: Some(why),
+        }
     }
 }
 
@@ -220,11 +323,12 @@ impl<'a> Reader<'a> {
 
     fn finish(self) -> Subscription {
         Subscription {
-            format: self.format,
+            format: Some(self.format),
             nodes: self.nodes,
             duplicates: self.duplicates,
             skipped: self.skipped,
             skipped_omitted: self.skipped_omitted,
+            unreadable: None,
         }
     }
 }
@@ -238,14 +342,15 @@ mod tests {
     const VLESS: &str = "vless://11111111-2222-3333-4444-555555555555@example.com:443#Second";
 
     fn read(text: &str) -> Subscription {
-        parse(text.as_bytes(), "primary", NOW)
+        parse(text.as_bytes(), "primary", NOW, DeclaredFormat::Links)
     }
 
     #[test]
     fn a_link_list_reads_every_line() {
         let subscription = read(&format!("{TROJAN}\n{VLESS}\n"));
 
-        assert_eq!(subscription.format, SourceFormat::Links);
+        assert_eq!(subscription.format, Some(SourceFormat::Links));
+        assert_eq!(subscription.unreadable, None);
         assert_eq!(subscription.len(), 2);
         assert_eq!(subscription.nodes[0].name(), "First");
         assert_eq!(subscription.nodes[1].name(), "Second");
@@ -258,7 +363,7 @@ mod tests {
 
         let subscription = read(&body);
 
-        assert_eq!(subscription.format, SourceFormat::Base64);
+        assert_eq!(subscription.format, Some(SourceFormat::Base64));
         assert_eq!(subscription.len(), 2, "the decoded body is the same list");
     }
 
@@ -336,17 +441,70 @@ mod tests {
     }
 
     #[test]
-    fn a_clash_document_is_recognised_and_reported_as_unsupported() {
+    fn a_body_that_is_a_clash_document_is_recognised_and_named() {
         let subscription = read("proxies:\n  - name: node\n    type: ss\n");
 
         assert_eq!(
             subscription.format,
-            SourceFormat::Clash,
+            Some(SourceFormat::Clash),
             "recognised, not misread as links"
         );
+        assert_eq!(subscription.unreadable, Some(Unreadable::LooksLikeClash));
         assert!(
             subscription.is_empty(),
             "this build has no clash reader yet"
+        );
+    }
+
+    /// A shape the provider declared and this build cannot read is named.
+    ///
+    /// The declaration decides, so the body is never even looked at: a body that
+    /// happens to hold links must not be read by a provider that said it holds
+    /// something else, or the same declaration would mean two things.
+    #[cfg(feature = "clash")]
+    #[test]
+    fn a_declared_clash_body_is_refused_by_name() {
+        let subscription = parse(
+            format!("{TROJAN}\n").as_bytes(),
+            "primary",
+            NOW,
+            DeclaredFormat::Clash,
+        );
+
+        assert!(subscription.is_empty(), "nothing was read");
+        assert_eq!(subscription.format, None, "and nothing was recognised");
+        assert_eq!(subscription.unreadable, Some(Unreadable::Clash));
+        assert!(
+            subscription.skipped.is_empty(),
+            "one reason, not one per line of something we never read"
+        );
+    }
+
+    #[cfg(feature = "singbox")]
+    #[test]
+    fn a_declared_singbox_body_is_refused_by_name() {
+        let subscription = parse(
+            br#"{"outbounds": []}"#,
+            "primary",
+            NOW,
+            DeclaredFormat::Singbox,
+        );
+
+        assert!(subscription.is_empty());
+        assert_eq!(subscription.format, None);
+        assert_eq!(subscription.unreadable, Some(Unreadable::Singbox));
+    }
+
+    /// What the reason says is static, so it can be shown to an operator.
+    #[test]
+    fn a_reason_names_the_format_and_not_the_body() {
+        assert_eq!(
+            Unreadable::LooksLikeClash.to_string(),
+            "the body is a clash document, and this build reads none of those"
+        );
+        assert!(
+            !Unreadable::LooksLikeClash.to_string().contains(TROJAN),
+            "a reason never quotes what it read"
         );
     }
 
@@ -354,7 +512,7 @@ mod tests {
     fn a_link_list_that_mentions_proxies_is_still_a_link_list() {
         let subscription = read(&format!("# proxies: are served elsewhere\n{TROJAN}\n"));
 
-        assert_eq!(subscription.format, SourceFormat::Links);
+        assert_eq!(subscription.format, Some(SourceFormat::Links));
         assert_eq!(subscription.len(), 1);
     }
 

@@ -231,7 +231,15 @@ mod tests {
     }
 
     fn index(observations: &[(&str, &Observation)]) -> NodeIndex {
-        NodeIndex::from_observations(observations.iter().copied())
+        // These fixtures are all link lists; which shapes a build can read is
+        // not what this module is about.
+        let links = crate::subscription::DeclaredFormat::Links;
+
+        NodeIndex::from_observations(
+            observations
+                .iter()
+                .map(|(provider, observation)| (*provider, links, *observation)),
+        )
     }
 
     fn filter(include: &[&str], exclude: &[&str]) -> NodeFilter {

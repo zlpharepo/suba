@@ -1,5 +1,5 @@
 mod administrator;
-mod codec;
+pub(crate) mod codec;
 mod error;
 mod key_pair;
 mod server;

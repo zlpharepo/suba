@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::node::NodeRecord;
 use crate::observation::Observation;
-use crate::subscription::{self, SkippedLine, SourceFormat};
+use crate::subscription::{self, DeclaredFormat, SkippedLine, SourceFormat, Unreadable};
 
 /// What a fetch produced, before anything was decided about it.
 ///
@@ -104,7 +104,8 @@ pub enum RefreshStatus {
 /// themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PayloadReport {
-    pub format: SourceFormat,
+    /// What the body was recognised as, when it was recognised at all.
+    pub format: Option<SourceFormat>,
     pub bytes: usize,
     pub nodes: usize,
     pub duplicates: usize,
@@ -121,6 +122,13 @@ pub struct PayloadReport {
 pub struct RefreshPlan {
     /// How the refresh went, for the report and the log.
     pub status: RefreshStatus,
+    /// Why the payload that is held now contributes no nodes at all, when it is
+    /// beyond this build.
+    ///
+    /// On the plan rather than only on the report: a `304` carries no report,
+    /// and "this provider serves nothing" is worth saying even when the body
+    /// did not arrive this time.
+    pub unreadable: Option<Unreadable>,
     /// The nodes the payload currently serves.
     pub nodes: Vec<NodeRecord>,
     /// What arrived, when something did.
@@ -151,6 +159,7 @@ pub fn decide(
     previous: Option<&Observation>,
     fetched: Fetched,
     now: i64,
+    declared: DeclaredFormat,
 ) -> RefreshPlan {
     let previous = previous.cloned().unwrap_or_default();
 
@@ -167,11 +176,12 @@ pub fn decide(
             // The nodes are what the held payload parses to, reported so the
             // caller can answer "how many nodes does this provider have"
             // without a second read.
-            let nodes = subscription::parse(previous.payload.as_bytes(), provider, now).nodes;
+            let parsed = subscription::parse(previous.payload.as_bytes(), provider, now, declared);
 
             RefreshPlan {
                 status: RefreshStatus::NotModified,
-                nodes,
+                nodes: parsed.nodes,
+                unreadable: parsed.unreadable,
                 payload: None,
                 observation: Some(observation),
             }
@@ -182,7 +192,7 @@ pub fn decide(
             last_modified,
         } => {
             let digest = crate::checksum::sha256_hex(payload.as_bytes());
-            let parsed = subscription::parse(payload.as_bytes(), provider, now);
+            let parsed = subscription::parse(payload.as_bytes(), provider, now, declared);
 
             // A provider with no validators serves the same bytes every time.
             // Rewriting an identical payload on every interval would churn the
@@ -212,6 +222,7 @@ pub fn decide(
                 return RefreshPlan {
                     status: RefreshStatus::Unchanged,
                     nodes: parsed.nodes,
+                    unreadable: parsed.unreadable,
                     payload: Some(report),
                     observation: Some(observation),
                 };
@@ -234,6 +245,7 @@ pub fn decide(
             RefreshPlan {
                 status: RefreshStatus::Fetched,
                 nodes: parsed.nodes,
+                unreadable: parsed.unreadable,
                 payload: Some(report),
                 observation: Some(observation),
             }
@@ -296,9 +308,49 @@ mod tests {
         format!("{text}\n")
     }
 
+    /// A declared shape this build cannot read is reported, and what arrived
+    /// is still kept: a later build reads it, and until then the bytes are the
+    /// only record of what the provider served.
+    #[cfg(feature = "clash")]
+    #[test]
+    fn a_declared_shape_this_build_cannot_read_is_reported() {
+        let plan = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Clash,
+        );
+
+        assert_eq!(plan.status, RefreshStatus::Fetched);
+        assert_eq!(plan.unreadable, Some(Unreadable::Clash));
+        assert!(
+            plan.is_empty(),
+            "no node can come out of a body we did not read"
+        );
+        assert_eq!(
+            plan.payload.expect("it arrived").format,
+            None,
+            "and nothing was recognised either"
+        );
+        assert!(
+            plan.observation
+                .expect("kept")
+                .payload
+                .contains("trojan://"),
+            "the body is held even when this build cannot read it"
+        );
+    }
+
     #[test]
     fn a_first_fetch_writes_a_payload_and_its_validators() {
-        let plan = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let plan = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
 
         assert_eq!(plan.status, RefreshStatus::Fetched);
         assert_eq!(plan.len(), 1);
@@ -322,14 +374,20 @@ mod tests {
         // Whitespace, a trailing newline, an unusual line ending: all of it is
         // what the provider served.
         let body = "  trojan://hunter2@example.com:443#Node  \r\n\r\n";
-        let plan = decide("primary", None, modified(body), NOW);
+        let plan = decide("primary", None, modified(body), NOW, DeclaredFormat::Links);
 
         assert_eq!(plan.observation.unwrap().payload, body);
     }
 
     #[test]
     fn a_304_moves_the_check_time_and_leaves_the_payload_alone() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let first = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
         let held = first.observation.unwrap();
 
         let later = NOW + 3_600;
@@ -338,6 +396,7 @@ mod tests {
             Some(&held),
             Fetched::NotModified { etag: None },
             later,
+            DeclaredFormat::Links,
         );
 
         assert_eq!(plan.status, RefreshStatus::NotModified);
@@ -359,7 +418,13 @@ mod tests {
 
     #[test]
     fn a_304_may_rotate_the_validator_it_sends() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let first = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
         let held = first.observation.unwrap();
 
         let plan = decide(
@@ -369,6 +434,7 @@ mod tests {
                 etag: Some("\"v2\"".to_string()),
             },
             NOW + 1,
+            DeclaredFormat::Links,
         );
 
         assert_eq!(plan.observation.unwrap().etag.as_deref(), Some("\"v2\""));
@@ -376,7 +442,13 @@ mod tests {
 
     #[test]
     fn identical_bytes_without_a_304_are_not_written_again() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let first = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
         let held = first.observation.unwrap();
 
         // A provider with no validators serves the same bytes again.
@@ -386,7 +458,7 @@ mod tests {
             last_modified: None,
         };
         let later = NOW + 3_600;
-        let plan = decide("primary", Some(&held), again, later);
+        let plan = decide("primary", Some(&held), again, later, DeclaredFormat::Links);
 
         assert_eq!(plan.status, RefreshStatus::Unchanged);
         let observation = plan.observation.unwrap();
@@ -400,11 +472,23 @@ mod tests {
 
     #[test]
     fn changed_bytes_replace_the_payload() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let first = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
         let held = first.observation.unwrap();
 
         let changed = payload_of(VLESS);
-        let plan = decide("primary", Some(&held), modified(&changed), NOW + 3_600);
+        let plan = decide(
+            "primary",
+            Some(&held),
+            modified(&changed),
+            NOW + 3_600,
+            DeclaredFormat::Links,
+        );
 
         assert_eq!(plan.status, RefreshStatus::Fetched);
         let observation = plan.observation.unwrap();
@@ -415,7 +499,13 @@ mod tests {
 
     #[test]
     fn a_node_the_provider_no_longer_serves_keeps_the_time_it_was_first_seen() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let first = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
         let held = first.observation.unwrap();
         let gone = held.remembered().next().unwrap();
 
@@ -424,6 +514,7 @@ mod tests {
             Some(&held),
             modified(&payload_of(VLESS)),
             NOW + 3_600,
+            DeclaredFormat::Links,
         );
 
         let observation = plan.observation.unwrap();
@@ -435,7 +526,13 @@ mod tests {
 
     #[test]
     fn a_first_fetch_has_no_previous_to_merge_from() {
-        let plan = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let plan = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
 
         assert_eq!(plan.observation.unwrap().sighting.len(), 1);
     }
@@ -444,7 +541,13 @@ mod tests {
     fn a_payload_with_no_usable_nodes_is_still_kept() {
         // What the provider served is a fact even when it is useless: an
         // operator needs to see it, and the next fetch can compare against it.
-        let plan = decide("primary", None, modified("not a link\n"), NOW);
+        let plan = decide(
+            "primary",
+            None,
+            modified("not a link\n"),
+            NOW,
+            DeclaredFormat::Links,
+        );
 
         assert_eq!(plan.status, RefreshStatus::Fetched);
         assert!(plan.is_empty(), "no nodes");
@@ -454,7 +557,13 @@ mod tests {
 
     #[test]
     fn a_failure_records_why_and_leaves_the_payload_exactly_as_it_was() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let first = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
         let held = first.observation.unwrap();
 
         let later = NOW + 600;
@@ -499,7 +608,13 @@ mod tests {
 
     #[test]
     fn the_sighting_a_node_keeps_is_the_first_time_this_hub_saw_it() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
+        let first = decide(
+            "primary",
+            None,
+            modified(&payload_of(TROJAN)),
+            NOW,
+            DeclaredFormat::Links,
+        );
         let held = first.observation.unwrap();
         let id = held.remembered().next().unwrap();
 
@@ -510,6 +625,7 @@ mod tests {
             Some(&held),
             modified(&format!("{TROJAN}\n{VLESS}\n")),
             NOW + 3_600,
+            DeclaredFormat::Links,
         );
 
         assert_eq!(plan.observation.unwrap().sighting[&id], NOW);
