@@ -158,7 +158,7 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Which format a caller asks an artifact in, instead of the collection's.
+/// Which format a caller asks an artifact in.
 #[derive(Debug, Default, Deserialize)]
 pub struct Choice {
     pub format: Option<String>,
@@ -166,16 +166,17 @@ pub struct Choice {
 
 impl Choice {
     /// The format asked for by name, then by the client's `User-Agent`, then
-    /// the one the collection declares.
-    pub(crate) fn resolve(&self, headers: &HeaderMap) -> Result<Option<Format>, Error> {
+    /// base64: a link list in base64 is the shape every client reads.
+    pub(crate) fn resolve(&self, headers: &HeaderMap) -> Result<Format, Error> {
         if let Some(name) = self.format.as_deref() {
-            return Format::named(name).map(Some).ok_or(Error::UnknownFormat);
+            return Format::named(name).ok_or(Error::UnknownFormat);
         }
 
         Ok(headers
             .get(header::USER_AGENT)
             .and_then(|agent| agent.to_str().ok())
-            .and_then(Format::for_user_agent))
+            .and_then(Format::for_user_agent)
+            .unwrap_or(Format::Base64))
     }
 }
 
@@ -236,12 +237,11 @@ pub async fn revoke_token(
 /// and the delivery route hands it to a client, so the two cannot be two
 /// different documents.
 ///
-/// `format` overrides the collection's declaration for this one request. The
-/// answer says whether the artifact was already rendered.
+/// The answer says whether the artifact was already rendered.
 pub(crate) async fn artifact_of(
     state: &AppState,
     name: &str,
-    format: Option<Format>,
+    format: Format,
 ) -> Result<(std::sync::Arc<Artifact>, bool), Error> {
     let mut collection = state
         .collections()
@@ -249,17 +249,12 @@ pub(crate) async fn artifact_of(
         .await
         .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
 
-    if let Some(format) = format {
-        collection.format = format;
-    }
-
     // Tokens do not change the document, so they do not change its address.
     collection.tokens.clear();
 
     let observations = state.providers().observations().await?;
-    let declared = state.providers().formats().await;
 
-    let key = address(state, &collection, &observations, &declared).await?;
+    let key = address(state, &collection, &observations, format).await?;
 
     if let Some(artifact) = state.rendered().get(&key) {
         return Ok((artifact, true));
@@ -267,16 +262,11 @@ pub(crate) async fn artifact_of(
 
     // The same index the node view is built from, so a preview and a delivery
     // agree about identity down to the node's name.
-    let index = NodeIndex::from_observations(observations.iter().map(|(name, observation)| {
-        (
-            name.as_str(),
-            declared
-                .get(name)
-                .copied()
-                .unwrap_or(suba_core::subscription::DeclaredFormat::Links),
-            observation,
-        )
-    }));
+    let index = NodeIndex::from_observations(
+        observations
+            .iter()
+            .map(|(name, observation)| (name.as_str(), observation)),
+    );
 
     let resolved = collection.resolve(
         &index,
@@ -292,10 +282,10 @@ pub(crate) async fn artifact_of(
     // The direction is asked for explicitly, and today every compiled format
     // writes the client one; a format that grew a server direction would have to
     // say so in its descriptor first.
-    let rendered = collection.format.render(&nodes, RenderIntent::Client)?;
+    let rendered = format.render(&nodes, RenderIntent::Client)?;
     let artifact = std::sync::Arc::new(Artifact {
         body: rendered.body.into(),
-        format: collection.format,
+        format,
         nodes: nodes.len().saturating_sub(rendered.skipped.len()),
         skipped: rendered.skipped.len(),
         update_hours: update_hours(state, &collection).await,
@@ -316,11 +306,11 @@ async fn address(
     state: &AppState,
     collection: &Collection,
     observations: &BTreeMap<String, Observation>,
-    declared: &BTreeMap<String, suba_core::subscription::DeclaredFormat>,
+    format: Format,
 ) -> Result<String, Error> {
     let mut key = String::new();
 
-    key.push_str(collection.format.as_str());
+    key.push_str(format.as_str());
     key.push('\n');
     key.push_str(&encode(collection)?);
 
@@ -332,10 +322,6 @@ async fn address(
 
         if let Some(observation) = observations.get(name) {
             key.push_str(observation.content_hash.as_deref().unwrap_or_default());
-        }
-
-        if let Some(declared) = declared.get(name) {
-            key.push_str(declared.as_str());
         }
     }
 
@@ -486,10 +472,9 @@ mod artifact_tests {
             .unwrap();
     }
 
-    async fn collection(state: &AppState, name: &str, providers: &[&str], format: Format) {
+    async fn collection(state: &AppState, name: &str, providers: &[&str]) {
         let collection = Collection {
             providers: providers.iter().map(|name| name.to_string()).collect(),
-            format,
             ..Collection::default()
         };
 
@@ -500,9 +485,9 @@ mod artifact_tests {
     async fn the_artifact_is_what_the_payloads_hold() {
         let state = state().await;
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
-        collection(&state, "main", &["alpha"], Format::Links).await;
+        collection(&state, "main", &["alpha"]).await;
 
-        let artifact = artifact_of(&state, "main", None).await.unwrap().0;
+        let artifact = artifact_of(&state, "main", Format::Links).await.unwrap().0;
 
         assert_eq!(artifact.nodes, 1);
         assert_eq!(artifact.skipped, 0);
@@ -513,22 +498,25 @@ mod artifact_tests {
         );
     }
 
-    /// The format is the collection's, and the artifact is the shape it names.
+    /// The artifact is the shape the request names, and two shapes of one
+    /// collection are two artifacts.
     #[cfg(feature = "clash")]
     #[tokio::test]
-    async fn the_artifact_is_written_in_the_declared_format() {
+    async fn the_artifact_is_written_in_the_format_asked_for() {
         let state = state().await;
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
-        collection(&state, "main", &["alpha"], Format::Clash).await;
+        collection(&state, "main", &["alpha"]).await;
 
-        let artifact = artifact_of(&state, "main", None).await.unwrap().0;
+        let clash = artifact_of(&state, "main", Format::Clash).await.unwrap().0;
+        let links = artifact_of(&state, "main", Format::Links).await.unwrap().0;
 
         assert!(
-            artifact.body.contains("proxies:"),
+            clash.body.contains("proxies:"),
             "a clash document: {}",
-            artifact.body
+            clash.body
         );
-        assert!(!artifact.body.contains("#US-01"), "and not a link list");
+        assert!(!clash.body.contains("#US-01"), "and not a link list");
+        assert!(links.body.contains("#US-01"), "{}", links.body);
     }
 
     /// A second request for the same thing is the artifact rendered the first
@@ -537,10 +525,10 @@ mod artifact_tests {
     async fn the_same_request_is_rendered_once() {
         let state = state().await;
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
-        collection(&state, "main", &["alpha"], Format::Links).await;
+        collection(&state, "main", &["alpha"]).await;
 
-        let once = artifact_of(&state, "main", None).await.unwrap().0;
-        let twice = artifact_of(&state, "main", None).await.unwrap().0;
+        let once = artifact_of(&state, "main", Format::Links).await.unwrap().0;
+        let twice = artifact_of(&state, "main", Format::Links).await.unwrap().0;
 
         assert_eq!(once.body, twice.body);
         assert!(std::sync::Arc::ptr_eq(&once, &twice), "the same artifact");
@@ -557,11 +545,11 @@ mod artifact_tests {
     async fn rendering_writes_nothing_down() {
         let state = state().await;
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
-        collection(&state, "main", &["alpha"], Format::Links).await;
+        collection(&state, "main", &["alpha"]).await;
 
         let before = std::fs::read_dir(state.data_dir()).map(Iterator::count);
-        artifact_of(&state, "main", None).await.unwrap();
-        artifact_of(&state, "main", None).await.unwrap();
+        artifact_of(&state, "main", Format::Links).await.unwrap();
+        artifact_of(&state, "main", Format::Links).await.unwrap();
         let after = std::fs::read_dir(state.data_dir()).map(Iterator::count);
 
         assert_eq!(before.unwrap(), after.unwrap(), "two renders add no files");
@@ -583,8 +571,8 @@ mod artifact_tests {
             ),
         )
         .await;
-        collection(&state, "main", &["alpha"], Format::Links).await;
-        collection(&state, "again", &["alpha"], Format::Links).await;
+        collection(&state, "main", &["alpha"]).await;
+        collection(&state, "again", &["alpha"]).await;
 
         let outbounds = outbounds_of(&state, &["main".to_string(), "again".to_string()])
             .await
@@ -614,20 +602,11 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
     // instance, and a view assembled from a subset would disagree with the
     // others about the same node.
     let observations = state.providers().observations().await?;
-    let declared = state.providers().formats().await;
-    let index = NodeIndex::from_observations(observations.iter().map(|(name, observation)| {
-        // A provider nobody defines any more has no declaration to read by:
-        // it contributes nothing either way, and links is what a body with
-        // no definition was read as when it was fetched.
-        (
-            name.as_str(),
-            declared
-                .get(name)
-                .copied()
-                .unwrap_or(suba_core::subscription::DeclaredFormat::Links),
-            observation,
-        )
-    }));
+    let index = NodeIndex::from_observations(
+        observations
+            .iter()
+            .map(|(name, observation)| (name.as_str(), observation)),
+    );
 
     let filter = collection.filter()?;
     let resolved = collection.resolve(
@@ -664,17 +643,11 @@ pub(crate) async fn outbounds_of(
     names: &[String],
 ) -> Result<Vec<serde_json::Value>, Error> {
     let observations = state.providers().observations().await?;
-    let declared = state.providers().formats().await;
-    let index = NodeIndex::from_observations(observations.iter().map(|(name, observation)| {
-        (
-            name.as_str(),
-            declared
-                .get(name)
-                .copied()
-                .unwrap_or(suba_core::subscription::DeclaredFormat::Links),
-            observation,
-        )
-    }));
+    let index = NodeIndex::from_observations(
+        observations
+            .iter()
+            .map(|(name, observation)| (name.as_str(), observation)),
+    );
 
     let mut nodes: Vec<&IndexEntry> = Vec::new();
     for name in names {

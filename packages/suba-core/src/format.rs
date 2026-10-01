@@ -113,7 +113,7 @@ impl Format {
     ///
     /// Only the shapes a client cannot read otherwise are recognised: a
     /// sing-box or clash client asked for a document it can load, and anything
-    /// else is left to what the collection declares. Matched without regard to
+    /// else gets the default. Matched without regard to
     /// case, because the clients spell themselves inconsistently.
     pub fn for_user_agent(agent: &str) -> Option<Self> {
         let agent = agent.to_ascii_lowercase();
@@ -545,11 +545,7 @@ mod tests {
     }
 
     fn index(links: &[String]) -> NodeIndex {
-        NodeIndex::from_observations([(
-            "airport",
-            subscription::DeclaredFormat::Links,
-            &observation(links),
-        )])
+        NodeIndex::from_observations([("airport", &observation(links))])
     }
 
     fn entries(index: &NodeIndex) -> Vec<&IndexEntry> {
@@ -727,8 +723,7 @@ mod tests {
             ..Observation::default()
         };
 
-        let index =
-            NodeIndex::from_observations([("airport", subscription::DeclaredFormat::Links, &held)]);
+        let index = NodeIndex::from_observations([("airport", &held)]);
         let all: Vec<&IndexEntry> = index.entries().iter().collect();
         let rendered = Format::Links
             .render(&all, RenderIntent::Client)
@@ -750,7 +745,7 @@ mod tests {
     }
 
     /// A client that can only read one shape is recognised; a browser, a curl
-    /// and a v2ray client are left to the collection's declaration.
+    /// and a v2ray client are left to the default.
     #[test]
     fn a_client_is_served_the_shape_it_reads() {
         #[cfg(feature = "singbox")]
@@ -993,12 +988,7 @@ mod tests {
     #[test]
     fn what_the_subscription_parser_reads_is_what_the_renderer_writes() {
         let fixtures = links();
-        let parsed = subscription::parse(
-            payload(&fixtures).as_bytes(),
-            "airport",
-            1_700_000_000,
-            subscription::DeclaredFormat::Links,
-        );
+        let parsed = subscription::parse(payload(&fixtures).as_bytes(), "airport", 1_700_000_000);
 
         let index = index(&fixtures);
         let rendered = Format::Links

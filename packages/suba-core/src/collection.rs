@@ -27,11 +27,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::filter::{FilterError, NodeFilter, Pattern};
-use crate::format::Format;
 use crate::index::{IndexEntry, NodeIndex};
 
 /// A collection: which providers it serves from, and what it filters out.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Collection {
     /// The providers it is assembled from, by the names their own document
     /// uses.
@@ -55,15 +54,6 @@ pub struct Collection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<Pattern>,
 
-    /// The format this collection's artifact is written in.
-    ///
-    /// Declared, not guessed: whoever subscribes to the URL gets what this says,
-    /// and a client that wants something else is asking the wrong URL. Base64
-    /// by default, because a collection hands out a subscription and a base64
-    /// link list is the shape every client reads.
-    #[serde(default = "base64", skip_serializing_if = "is_base64")]
-    pub format: Format,
-
     /// The delivery tokens, by the name the operator gave each one, as hashes.
     ///
     /// One per device or person, so one can be revoked without changing the URL
@@ -72,28 +62,6 @@ pub struct Collection {
     /// configuration file is not a set of working subscription URLs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: BTreeMap<String, String>,
-}
-
-/// The format a collection serves in when its document does not say.
-fn base64() -> Format {
-    Format::Base64
-}
-
-/// Whether a collection is written in the format a subscription is in anyway.
-fn is_base64(format: &Format) -> bool {
-    *format == Format::Base64
-}
-
-impl Default for Collection {
-    fn default() -> Self {
-        Self {
-            providers: Vec::new(),
-            includes: Vec::new(),
-            excludes: Vec::new(),
-            format: Format::Base64,
-            tokens: BTreeMap::new(),
-        }
-    }
 }
 
 impl Collection {
@@ -272,14 +240,10 @@ mod tests {
     }
 
     fn index(observations: &[(&str, &Observation)]) -> NodeIndex {
-        // These fixtures are all link lists; which shapes a build can read is
-        // not what this module is about.
-        let links = crate::subscription::DeclaredFormat::Links;
-
         NodeIndex::from_observations(
             observations
                 .iter()
-                .map(|(provider, observation)| (*provider, links, *observation)),
+                .map(|(provider, observation)| (*provider, *observation)),
         )
     }
 

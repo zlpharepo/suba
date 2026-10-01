@@ -43,7 +43,7 @@ struct Entries {
 #[derive(Debug)]
 pub(crate) struct Artifact {
     pub(crate) body: Arc<str>,
-    /// The format the body is written in, which the collection declared.
+    /// The format the body is written in, as the request chose it.
     pub(crate) format: Format,
     /// How many nodes the body holds.
     pub(crate) nodes: usize,

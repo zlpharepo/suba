@@ -44,18 +44,13 @@ impl NodeIndex {
     /// happened to iterate the other way round produces the same index.
     pub fn from_observations<'a, I>(observations: I) -> Self
     where
-        I: IntoIterator<Item = (&'a str, subscription::DeclaredFormat, &'a Observation)>,
+        I: IntoIterator<Item = (&'a str, &'a Observation)>,
     {
         let mut merged: BTreeMap<NodeFingerprint, Merged> = BTreeMap::new();
 
-        for (provider, declared, observation) in observations {
+        for (provider, observation) in observations {
             let checked_at = observation.checked_at.unwrap_or_default();
-            let parsed = subscription::parse(
-                observation.payload.as_bytes(),
-                provider,
-                checked_at,
-                declared,
-            );
+            let parsed = subscription::parse(observation.payload.as_bytes(), provider, checked_at);
 
             // What this provider serves right now.
             let mut served: BTreeSet<NodeFingerprint> = BTreeSet::new();
@@ -282,11 +277,8 @@ mod tests {
             ("beta", observed(&node, &[(&node, 2_000)])),
         ];
 
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let index =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
 
         assert_eq!(index.len(), 1, "one node, however many providers serve it");
 
@@ -315,11 +307,8 @@ mod tests {
             ("alpha", observed(&node, &[(&node, 1_000)])),
         ];
 
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let index =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
         let entry = &index.entries()[0];
 
         assert_eq!(
@@ -337,11 +326,8 @@ mod tests {
         let node = link("Node");
         let observations = [("alpha", observed("", &[(&node, 1_000)]))];
 
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let index =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
 
         assert_eq!(index.len(), 1, "it existed, so it is still here");
         assert_eq!(index.orphan_count(), 1);
@@ -365,11 +351,8 @@ mod tests {
         let node = link("Node");
         let observations = [("alpha", observed(&node, &[(&node, 1_000)]))];
 
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let index =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
         let entry = &index.entries()[0];
 
         assert!(!entry.is_orphan());
@@ -388,17 +371,10 @@ mod tests {
             ("charlie", observed(&node, &[(&node, 1_000)])),
         ];
 
-        let forwards = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
-        let backwards = NodeIndex::from_observations(
-            observations
-                .iter()
-                .rev()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let forwards =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
+        let backwards =
+            NodeIndex::from_observations(observations.iter().rev().map(|(name, one)| (*name, one)));
 
         assert_eq!(
             forwards, backwards,
@@ -422,11 +398,8 @@ mod tests {
             ("alpha", observed(&us, &[(&us, 1_000)])),
         ];
 
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let index =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
         let entry = &index.entries()[0];
 
         assert_eq!(entry.name(), Some("US-01"));
@@ -447,11 +420,8 @@ mod tests {
             ("alpha", observed("", &[(&us, 1_000)])),
         ];
 
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let index =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
         let entry = &index.entries()[0];
 
         assert_eq!(entry.name(), Some("United States"));
@@ -471,11 +441,8 @@ mod tests {
             observed(&payload, &[(&later, 2_000), (&earlier, 1_000)]),
         )];
 
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, one)| (*name, subscription::DeclaredFormat::Links, one)),
-        );
+        let index =
+            NodeIndex::from_observations(observations.iter().map(|(name, one)| (*name, one)));
 
         assert_eq!(
             index
@@ -492,8 +459,7 @@ mod tests {
     fn an_observation_with_nothing_in_it_adds_nothing() {
         let quiet = Observation::default();
 
-        let index =
-            NodeIndex::from_observations([("quiet", subscription::DeclaredFormat::Links, &quiet)]);
+        let index = NodeIndex::from_observations([("quiet", &quiet)]);
 
         assert!(index.is_empty());
         assert_eq!(index.orphan_count(), 0);

@@ -273,7 +273,7 @@ mod tests {
             .unwrap();
         let (_, body) = get(&state, "s", &token).await.unwrap();
 
-        // A collection that declares nothing is served base64-wrapped.
+        // A client that names no format is served base64-wrapped.
         let links = suba_core::proto::base64::decode_to_string(body.as_bytes()).unwrap();
         assert!(!body.contains("://"), "{body}");
         assert!(links.contains("#US-01"), "{links}");
@@ -480,7 +480,7 @@ mod tests {
     }
 
     /// The query names a format; failing that, a client that can read only one
-    /// shape gets that shape; failing that, the collection's declaration.
+    /// shape gets that shape; failing that, base64.
     #[tokio::test]
     async fn the_format_is_asked_for_or_recognised() {
         let state = state().await;

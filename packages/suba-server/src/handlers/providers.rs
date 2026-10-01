@@ -7,7 +7,7 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use suba_core::subscription::{self, DeclaredFormat, Unreadable};
+use suba_core::subscription::{self, Unreadable};
 use suba_core::RefreshStatus;
 use suba_core::{Collection, NodeIndex, View};
 
@@ -35,8 +35,8 @@ pub struct Refresh {
     pub bytes: usize,
     /// How many nodes it holds.
     pub nodes: usize,
-    /// Why none of them came out of the payload, when its declared shape is one
-    /// this build does not read.
+    /// Why none of them came out of the payload, when it is a shape this build
+    /// does not read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<Unreadable>,
 }
@@ -111,7 +111,7 @@ pub async fn refresh(
 ///
 /// The same shape a collection's node view has, scoped to one provider: what
 /// its payload parses to after its own two lists, what those lists passed over,
-/// and why nothing came out when the declared shape is one this build does not
+/// and why nothing came out when the payload is a shape this build does not
 /// read.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Nodes {
@@ -122,8 +122,8 @@ pub struct Nodes {
     pub passed_over: usize,
     /// How many nodes it has served and no longer does.
     pub orphans: usize,
-    /// Why the payload contributed no nodes at all, when its declared shape is
-    /// one this build reads none of.
+    /// Why the payload contributed no nodes at all, when it is a shape this
+    /// build reads none of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unreadable: Option<Unreadable>,
 }
@@ -146,19 +146,16 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
         .ok_or_else(|| Error::ProviderNotFound(name.to_owned()))?;
 
     let observations = state.providers().observations().await?;
-    let declared = state.providers().formats().await;
 
     // The same index the collections view is built from, for the same reason: a
     // node's identity, the name it goes by and when it was first seen are facts
     // about the instance, and a view built out of one provider's bytes alone
     // would disagree with the others about the same node.
-    let index = NodeIndex::from_observations(observations.iter().map(|(name, observation)| {
-        (
-            name.as_str(),
-            declared.get(name).copied().unwrap_or(DeclaredFormat::Links),
-            observation,
-        )
-    }));
+    let index = NodeIndex::from_observations(
+        observations
+            .iter()
+            .map(|(name, observation)| (name.as_str(), observation)),
+    );
 
     // One member, and the only filter that applies is this provider's own: a
     // collection's filter belongs to the collection.
@@ -177,13 +174,10 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
     );
 
     let unreadable = observations.get(name).and_then(|observation| {
-        let declared = declared.get(name).copied().unwrap_or(DeclaredFormat::Links);
-
         subscription::parse(
             observation.payload.as_bytes(),
             name,
             observation.checked_at.unwrap_or_default(),
-            declared,
         )
         .unreadable
     });
@@ -387,29 +381,5 @@ mod tests {
             nodes_of(&state, "ghost").await,
             Err(Error::ProviderNotFound(name)) if name == "ghost"
         ));
-    }
-
-    #[cfg(feature = "clash")]
-    #[tokio::test]
-    async fn a_shape_this_build_cannot_read_says_why_the_view_is_empty() {
-        let state = state().await;
-        let provider = Provider::Inline(Inline {
-            shared: SharedFields {
-                format: DeclaredFormat::Clash,
-                ..SharedFields::default()
-            },
-            payload: "proxies:\n  - name: node\n".to_string(),
-        });
-
-        state
-            .providers()
-            .upsert("airport", provider, state.http())
-            .await
-            .unwrap();
-
-        let nodes = nodes_of(&state, "airport").await.unwrap();
-
-        assert!(nodes.nodes.is_empty());
-        assert_eq!(nodes.unreadable, Some(Unreadable::Clash));
     }
 }

@@ -36,56 +36,6 @@ pub enum SourceFormat {
     Clash,
 }
 
-/// The shape a provider says its payload is in.
-///
-/// Declared, not detected — [`SourceFormat`] is what a body turned out to be.
-/// A declaration picks the reader instead of guessing at one, and a shape whose
-/// reader is not compiled in does not exist here at all (I4), so choosing it is
-/// a refusal rather than a silently different reading.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DeclaredFormat {
-    /// Share links, one per line, optionally wrapped in base64.
-    #[default]
-    Links,
-    /// A clash/mihomo document.
-    #[cfg(feature = "clash")]
-    Clash,
-    /// A sing-box configuration document.
-    #[cfg(feature = "singbox")]
-    Singbox,
-}
-
-impl DeclaredFormat {
-    /// The word this is written as, which is also how a reason names it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Links => "links",
-            #[cfg(feature = "clash")]
-            Self::Clash => "clash",
-            #[cfg(feature = "singbox")]
-            Self::Singbox => "singbox",
-        }
-    }
-
-    /// Why this build reads nothing of this shape, or `None` when it reads it.
-    ///
-    /// Both document shapes are declared but not readable yet — a reader is its
-    /// writer's inverse and lands later — and until then a declaration is
-    /// answered with this instead of an empty subscription. An operator who
-    /// declared a format must not be told "0 nodes" as if the body were at
-    /// fault.
-    pub fn unreadable(self) -> Option<Unreadable> {
-        match self {
-            Self::Links => None,
-            #[cfg(feature = "clash")]
-            Self::Clash => Some(Unreadable::Clash),
-            #[cfg(feature = "singbox")]
-            Self::Singbox => Some(Unreadable::Singbox),
-        }
-    }
-}
-
 /// Why a body contributed no nodes at all.
 ///
 /// Static, and chosen by the reader: a body carries credentials, so nothing
@@ -95,23 +45,13 @@ impl DeclaredFormat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Unreadable {
-    /// It was declared a clash document, and this build reads none.
-    #[cfg(feature = "clash")]
-    Clash,
-    /// It was declared a sing-box document, and this build reads none.
-    #[cfg(feature = "singbox")]
-    Singbox,
-    /// It was declared links, and it is a clash document.
+    /// It is a clash document, which this build does not read.
     LooksLikeClash,
 }
 
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
-            #[cfg(feature = "clash")]
-            Self::Clash => "the provider declares a clash document, and this build reads none",
-            #[cfg(feature = "singbox")]
-            Self::Singbox => "the provider declares a sing-box document, and this build reads none",
             Self::LooksLikeClash => {
                 "the body is a clash document, and this build reads none of those"
             }
@@ -180,14 +120,10 @@ fn is_zero(count: &usize) -> bool {
 
 /// Read a subscription payload.
 ///
-/// `declared` is how the provider says it is to be read; within links, the
-/// shape is still detected, because one layer of base64 around the same lines
-/// is the same subscription. The link is kept as it arrived, so what a provider
+/// The shape is detected, because one layer of base64 around the same lines is
+/// the same subscription. The link is kept as it arrived, so what a provider
 /// served can be audited and re-exported without a second parse.
-pub fn parse(payload: &[u8], provider: &str, now: i64, declared: DeclaredFormat) -> Subscription {
-    if let Some(reason) = declared.unreadable() {
-        return Subscription::unreadable(None, reason);
-    }
+pub fn parse(payload: &[u8], provider: &str, now: i64) -> Subscription {
     // A body that is base64 of a link list is the common case for a provider;
     // anything else is read as the text it is.
     let (text, format) = match proto::base64::decode_if_text(payload) {
@@ -199,8 +135,8 @@ pub fn parse(payload: &[u8], provider: &str, now: i64, declared: DeclaredFormat)
     };
 
     if looks_like_clash(&text) {
-        // The declaration said links and the body disagrees. Read as links, this
-        // becomes one skipped reason per line — noise about the wrong problem.
+        // Read as links, this becomes one skipped reason per line — noise about
+        // the wrong problem.
         return Subscription::unreadable(Some(SourceFormat::Clash), Unreadable::LooksLikeClash);
     }
 
@@ -342,7 +278,7 @@ mod tests {
     const VLESS: &str = "vless://11111111-2222-3333-4444-555555555555@example.com:443#Second";
 
     fn read(text: &str) -> Subscription {
-        parse(text.as_bytes(), "primary", NOW, DeclaredFormat::Links)
+        parse(text.as_bytes(), "primary", NOW)
     }
 
     #[test]
@@ -454,45 +390,6 @@ mod tests {
             subscription.is_empty(),
             "this build has no clash reader yet"
         );
-    }
-
-    /// A shape the provider declared and this build cannot read is named.
-    ///
-    /// The declaration decides, so the body is never even looked at: a body that
-    /// happens to hold links must not be read by a provider that said it holds
-    /// something else, or the same declaration would mean two things.
-    #[cfg(feature = "clash")]
-    #[test]
-    fn a_declared_clash_body_is_refused_by_name() {
-        let subscription = parse(
-            format!("{TROJAN}\n").as_bytes(),
-            "primary",
-            NOW,
-            DeclaredFormat::Clash,
-        );
-
-        assert!(subscription.is_empty(), "nothing was read");
-        assert_eq!(subscription.format, None, "and nothing was recognised");
-        assert_eq!(subscription.unreadable, Some(Unreadable::Clash));
-        assert!(
-            subscription.skipped.is_empty(),
-            "one reason, not one per line of something we never read"
-        );
-    }
-
-    #[cfg(feature = "singbox")]
-    #[test]
-    fn a_declared_singbox_body_is_refused_by_name() {
-        let subscription = parse(
-            br#"{"outbounds": []}"#,
-            "primary",
-            NOW,
-            DeclaredFormat::Singbox,
-        );
-
-        assert!(subscription.is_empty());
-        assert_eq!(subscription.format, None);
-        assert_eq!(subscription.unreadable, Some(Unreadable::Singbox));
     }
 
     /// What the reason says is static, so it can be shown to an operator.
