@@ -54,12 +54,11 @@ pub struct Collection {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub excludes: Vec<Pattern>,
 
-    /// The delivery tokens, by the name the operator gave each one, as hashes.
+    /// The delivery tokens, by the name the operator gave each one.
     ///
     /// One per device or person, so one can be revoked without changing the URL
-    /// everyone else holds. The token itself is handed to whoever minted it and
-    /// is never written down: what is kept is the sha256 of it, so a copied
-    /// configuration file is not a set of working subscription URLs.
+    /// everyone else holds. Kept as minted, so the operator can read a URL again;
+    /// this file is therefore a set of working subscription URLs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: BTreeMap<String, String>,
 }

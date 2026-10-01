@@ -189,6 +189,27 @@ mod tests {
         serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
     }
 
+    /// A token listed later is the one minted, with a path that serves it.
+    #[tokio::test]
+    async fn a_minted_token_can_be_listed_and_opened_again() {
+        let server = Server::start().await;
+        let token = server.delivery().await;
+
+        let listed = server
+            .authed(reqwest::Method::GET, "/api/collections/main/tokens")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), 200);
+        assert_eq!(
+            body(listed).await,
+            json!([{"name": "phone", "token": token, "path": format!("/s/{token}")}])
+        );
+
+        let opened = server.get(&format!("/s/{token}")).send().await.unwrap();
+        assert_eq!(opened.status(), 200);
+    }
+
     #[tokio::test]
     async fn the_api_needs_a_session_and_the_delivery_route_does_not() {
         let server = Server::start().await;

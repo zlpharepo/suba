@@ -180,25 +180,39 @@ impl Choice {
     }
 }
 
-/// The delivery token, as the caller mints it.
+/// A delivery token and where it is served.
 #[derive(Debug, Serialize)]
-pub struct Minted {
-    /// The token itself. It is answered once: only its hash is kept, so this is
-    /// the only chance to read it.
+pub struct TokenView {
+    pub name: String,
     pub token: String,
     /// Where a client asks for the subscription, as this instance is configured
     /// now. The token outlives a change of prefix, this path does not.
     pub path: String,
 }
 
-/// The names of a collection's delivery tokens; the tokens themselves are not
-/// kept, so they cannot be listed.
+fn token_view(prefix: &str, name: String, token: String) -> TokenView {
+    TokenView {
+        path: format!("/{prefix}/{token}"),
+        name,
+        token,
+    }
+}
+
+/// A collection's delivery tokens, by name.
 pub async fn tokens(
     _auth: Authenticated,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
-    Ok(Json(state.collections().tokens(&name).await?))
+    let tokens = state.collections().tokens(&name).await?;
+    let prefix = state.settings().subscription_prefix().await?;
+
+    Ok(Json(
+        tokens
+            .into_iter()
+            .map(|(name, token)| token_view(&prefix, name, token))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 /// Give a collection a delivery token under a name.
@@ -211,12 +225,12 @@ pub async fn mint_token(
     Path((name, label)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
     let token = state.collections().mint_token(&name, &label).await?;
-    let path = format!("/{}/{token}", state.settings().subscription_prefix().await?);
+    let prefix = state.settings().subscription_prefix().await?;
 
     // The collection and the token's name are logged, the token never is.
     tracing::debug!("Minted delivery token '{label}' for collection '{name}'");
 
-    Ok((StatusCode::CREATED, Json(Minted { token, path })))
+    Ok((StatusCode::CREATED, Json(token_view(&prefix, label, token))))
 }
 
 /// Take one of a collection's delivery tokens out of service.

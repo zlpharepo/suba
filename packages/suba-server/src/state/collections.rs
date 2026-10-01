@@ -12,7 +12,10 @@
 //! with no definition means is reported when the collection is resolved
 //! ([`suba_core::Resolved::unresolved`]) rather than at the moment it is typed.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use getrandom::fill;
 use serde::{Deserialize, Serialize};
@@ -88,14 +91,14 @@ impl CollectionStore {
         Ok(())
     }
 
-    /// The names of a collection's delivery tokens.
-    pub(crate) async fn tokens(&self, name: &str) -> Result<Vec<String>, Error> {
+    /// A collection's delivery tokens, by name.
+    pub(crate) async fn tokens(&self, name: &str) -> Result<BTreeMap<String, String>, Error> {
         self.file
             .read(|config| {
                 config
                     .collections
                     .get(name)
-                    .map(|collection| collection.tokens.keys().cloned().collect())
+                    .map(|collection| collection.tokens.clone())
             })
             .await
             .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))
@@ -105,8 +108,7 @@ impl CollectionStore {
     ///
     /// Minting under a label that exists replaces that token, which is how a
     /// leaked one is taken out of service; the collection's other tokens keep
-    /// working. The token is answered once and only its hash is stored, so this
-    /// call is the only chance to read it.
+    /// working.
     pub(crate) async fn mint_token(&self, name: &str, label: &str) -> Result<String, Error> {
         token_name(label)?;
 
@@ -114,7 +116,6 @@ impl CollectionStore {
         fill(&mut bytes).map_err(|error| Error::Entropy(error.to_string()))?;
 
         let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        let hash = sha256_hex(token.as_bytes());
 
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
@@ -123,7 +124,7 @@ impl CollectionStore {
             .get_mut(name)
             .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
 
-        collection.tokens.insert(label.to_owned(), hash);
+        collection.tokens.insert(label.to_owned(), token.clone());
         locked.commit(config).await?;
 
         Ok(token)
@@ -150,9 +151,8 @@ impl CollectionStore {
 
     /// The collection a token addresses and the token's name, in that order.
     ///
-    /// Compared as hashes: what a caller holds is the token, and what is stored
-    /// is the hash of it, so a comparison that is not constant time leaks bits
-    /// of a value the caller cannot use.
+    /// Compared as hashes, so the time a comparison takes says nothing about how
+    /// much of a stored token a guess got right.
     pub(crate) async fn by_token(&self, token: &str) -> Option<(String, String)> {
         let hash = sha256_hex(token.as_bytes());
 
@@ -162,7 +162,7 @@ impl CollectionStore {
                     collection
                         .tokens
                         .iter()
-                        .find(|(_, held)| **held == hash)
+                        .find(|(_, held)| sha256_hex(held.as_bytes()) == hash)
                         .map(|(label, _)| (name.clone(), label.clone()))
                 })
             })
@@ -272,10 +272,9 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
-    /// What is written down is a hash, never the token itself: a copied
-    /// configuration file is not a set of working subscription URLs.
+    /// The token is kept as it was minted, so its URL can be read again later.
     #[tokio::test]
-    async fn a_token_is_stored_as_a_hash() {
+    async fn a_token_is_kept_and_can_be_read_again() {
         let dir = scratch("token");
         let store = load(&dir);
         store
@@ -286,10 +285,11 @@ mod tests {
         let token = store.mint_token("main", "phone").await.unwrap();
         let written = std::fs::read_to_string(config_path(&dir, COLLECTIONS_BASENAME)).unwrap();
 
-        assert!(!written.contains(&token), "the token itself: {written}");
-        assert!(
-            written.contains(&sha256_hex(token.as_bytes())),
-            "the hash of it: {written}"
+        assert!(written.contains(&token), "the token itself: {written}");
+        assert_eq!(
+            load(&dir).tokens("main").await.unwrap(),
+            BTreeMap::from([("phone".to_string(), token.clone())]),
+            "and read back after a reload"
         );
         assert_eq!(
             store.by_token(&token).await.unwrap(),
@@ -328,7 +328,15 @@ mod tests {
 
         let phone = store.mint_token("main", "phone").await.unwrap();
         let laptop = store.mint_token("main", "laptop").await.unwrap();
-        assert_eq!(store.tokens("main").await.unwrap(), ["laptop", "phone"]);
+        assert_eq!(
+            store
+                .tokens("main")
+                .await
+                .unwrap()
+                .into_keys()
+                .collect::<Vec<_>>(),
+            ["laptop", "phone"]
+        );
 
         store.revoke_token("main", "phone").await.unwrap();
         assert!(store.by_token(&phone).await.is_none());
