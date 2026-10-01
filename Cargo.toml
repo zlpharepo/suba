@@ -10,6 +10,7 @@ authors = ["ZLPHA"]
 license = "GPL-3.0"
 
 [workspace.dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["system", "network", "disk"] }
 # Every one of these is taken without default features, and each member says
 # which features it wants: a workspace member's `default-features = false` is
 # IGNORED unless the workspace says it too, which would make a build that thinks

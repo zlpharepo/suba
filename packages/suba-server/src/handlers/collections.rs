@@ -104,10 +104,63 @@ impl From<&Source> for SourceView {
     }
 }
 
-pub async fn index(_auth: Authenticated, State(state): State<AppState>) -> impl IntoResponse {
-    let collections = state.collections().list().await;
+/// A collection in the list: its definition, and what it serves right now.
+#[derive(Debug, Serialize)]
+pub struct CollectionSummary {
+    #[serde(flatten)]
+    pub definition: Collection,
+    /// The nodes a delivery would carry now.
+    pub nodes: usize,
+    /// Providers it names that the instance does not have.
+    pub unresolved: Vec<String>,
+    /// Its delivery tokens, with the path each is served at.
+    pub links: Vec<TokenView>,
+}
 
-    Json(collections)
+/// Every collection, with what a list needs to show without asking again.
+pub async fn index(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+) -> ResponseResult<impl IntoResponse> {
+    let collections = state.collections().list().await;
+    let prefix = state.settings().subscription_prefix().await?;
+
+    // One index for the whole list, the same one a delivery is resolved from.
+    let observations = state.providers().observations().await?;
+    let index = NodeIndex::from_observations(
+        observations
+            .iter()
+            .map(|(name, observation)| (name.as_str(), observation)),
+    );
+
+    let mut summaries = BTreeMap::new();
+    for (name, collection) in collections {
+        let resolved = collection.resolve(
+            &index,
+            &provider_filters(&state, &collection).await?,
+            &collection.filter()?,
+            View::default(),
+        );
+        let nodes = resolved.nodes.len();
+        let unresolved = resolved.unresolved;
+        let links = collection
+            .tokens
+            .iter()
+            .map(|(label, token)| token_view(&prefix, label.clone(), token.clone()))
+            .collect();
+
+        summaries.insert(
+            name,
+            CollectionSummary {
+                definition: collection,
+                nodes,
+                unresolved,
+                links,
+            },
+        );
+    }
+
+    Ok(Json(summaries))
 }
 
 pub async fn get(

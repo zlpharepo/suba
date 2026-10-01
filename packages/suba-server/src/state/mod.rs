@@ -1,5 +1,6 @@
 mod collections;
 pub(crate) mod limiter;
+pub(crate) mod metrics;
 mod persisted;
 pub(crate) mod providers;
 pub(crate) mod render;
@@ -18,8 +19,9 @@ use crate::{config::ServerConfig, error::Error};
 #[cfg(feature = "singbox-core")]
 use self::singbox::SingboxStore;
 use self::{
-    collections::CollectionStore, limiter::Limiter, providers::ProviderStore, render::RenderMemo,
-    scheduler::Refresher, sessions::SessionStore, settings::SettingsStore,
+    collections::CollectionStore, limiter::Limiter, metrics::MetricsStore,
+    providers::ProviderStore, render::RenderMemo, scheduler::Refresher, sessions::SessionStore,
+    settings::SettingsStore,
 };
 /// Everything a request handler shares, behind a single reference count.
 ///
@@ -39,6 +41,7 @@ struct Inner {
     rendered: RenderMemo,
     deliveries: Limiter,
     sessions: SessionStore,
+    metrics: Arc<MetricsStore>,
     #[cfg(feature = "singbox-core")]
     singbox: Arc<SingboxStore>,
 }
@@ -64,6 +67,7 @@ impl AppState {
             rendered: RenderMemo::new(),
             deliveries: Limiter::new(),
             sessions: SessionStore::load(&config.data_dir)?,
+            metrics: Arc::new(MetricsStore::new(&config.data_dir)),
             #[cfg(feature = "singbox-core")]
             singbox: Arc::new(SingboxStore::new(
                 &config.config_dir,
@@ -123,6 +127,11 @@ impl AppState {
     }
 
     /// The sessions currently allowed to authenticate.
+    /// Shared so a handler can sample it on the blocking pool.
+    pub(crate) fn metrics(&self) -> Arc<MetricsStore> {
+        Arc::clone(&self.0.metrics)
+    }
+
     pub(crate) fn sessions(&self) -> &SessionStore {
         &self.0.sessions
     }

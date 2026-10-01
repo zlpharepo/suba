@@ -7,4 +7,5 @@ pub fn route() -> Router<AppState> {
         .route("/ping", get(system::ping))
         .route("/status", get(system::status))
         .route("/info", get(system::info))
+        .route("/metrics", get(system::metrics))
 }

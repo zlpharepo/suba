@@ -189,6 +189,50 @@ mod tests {
         serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
     }
 
+    /// The list carries what a page shows without a request per collection.
+    #[tokio::test]
+    async fn the_collection_list_carries_nodes_and_links() {
+        let server = Server::start().await;
+        let token = server.delivery().await;
+
+        let listed = server
+            .authed(reqwest::Method::GET, "/api/collections")
+            .send()
+            .await
+            .unwrap();
+        let main = &body(listed).await["main"];
+
+        assert_eq!(main["providers"], json!(["alpha"]));
+        assert_eq!(main["nodes"], 1);
+        assert_eq!(main["unresolved"], json!([]));
+        assert_eq!(
+            main["links"],
+            json!([{"name": "phone", "token": token, "path": format!("/s/{token}")}])
+        );
+    }
+
+    /// The machine's numbers are an operator's, not a subscriber's.
+    #[tokio::test]
+    async fn the_metrics_need_a_session_and_describe_the_machine() {
+        let server = Server::start().await;
+
+        let anonymous = server.get("/api/system/metrics").send().await.unwrap();
+        assert_eq!(anonymous.status(), 401);
+
+        let metrics = body(
+            server
+                .authed(reqwest::Method::GET, "/api/system/metrics")
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(metrics["cpu"]["cores"].as_u64().unwrap() > 0);
+        assert!(metrics["memory"]["total"].as_u64().unwrap() > 0);
+        assert!(metrics["network"]["received"].is_u64());
+        assert!(metrics["host"]["arch"].is_string());
+    }
+
     /// A token listed later is the one minted, with a path that serves it.
     #[tokio::test]
     async fn a_minted_token_can_be_listed_and_opened_again() {

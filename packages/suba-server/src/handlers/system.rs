@@ -2,7 +2,10 @@ use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use suba_core::{Format, ProtocolSupport};
 
-use crate::{dto::Authenticated, AppState};
+use crate::{
+    dto::{Authenticated, ResponseResult},
+    AppState,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -60,6 +63,18 @@ pub async fn status(State(state): State<AppState>) -> Json<SystemStatus> {
         version: VERSION.to_string(),
         administrator_configured: state.settings().administrator().await.is_some(),
     })
+}
+
+/// The machine this instance runs on: CPU, memory, disk and network.
+pub async fn metrics(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+) -> ResponseResult<Json<crate::state::metrics::Metrics>> {
+    let metrics = state.metrics();
+
+    Ok(Json(
+        tokio::task::spawn_blocking(move || metrics.sample()).await?,
+    ))
 }
 
 pub async fn info(_auth: Authenticated, State(state): State<AppState>) -> Json<SystemInfo> {
