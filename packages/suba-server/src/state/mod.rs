@@ -14,7 +14,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use reqwest::Client;
 
-use crate::{config::ServerConfig, error::Error};
+use crate::{config::ServerConfig, error::Error, identity::Identity};
 
 #[cfg(feature = "singbox-core")]
 use self::singbox::SingboxStore;
@@ -49,6 +49,13 @@ struct Inner {
 impl AppState {
     /// Load every store and build the shared HTTP client.
     pub async fn build(config: &ServerConfig) -> Result<Self, Error> {
+        // Before anything is read: who this run is, and whether it may be. A
+        // root run writes files root owns, so they are handed back first rather
+        // than after the stores have created some.
+        let identity =
+            Identity::discover(config.privileged, &[&config.data_dir, &config.config_dir])?;
+        identity.settle_files(&[&config.data_dir, &config.config_dir]);
+
         // One client for the instance: subscriptions and releases both go out
         // through it, so connection reuse and timeouts are the same everywhere.
         // A user agent is not decoration: the release API answers `403` to a
@@ -73,6 +80,7 @@ impl AppState {
                 &config.config_dir,
                 &config.data_dir,
                 http.clone(),
+                identity,
             )),
         })))
     }
@@ -161,6 +169,7 @@ mod tests {
             port: 0,
             config_dir: root.join("config"),
             data_dir: root.join("data"),
+            privileged: Default::default(),
         };
 
         let state = AppState::build(&config).await.unwrap();

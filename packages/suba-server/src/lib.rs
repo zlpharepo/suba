@@ -3,6 +3,7 @@ mod dto;
 mod error;
 pub mod fs;
 mod handlers;
+pub mod identity;
 pub mod password;
 pub mod provider;
 mod routers;
@@ -13,6 +14,7 @@ pub mod tracing;
 pub(crate) use config::Claims;
 pub use config::{ConfigError, ListenAddr, ServerConfig};
 pub use error::{Error, HttpError};
+pub use identity::{Identity, Privileged, Source};
 pub use state::AppState;
 
 pub struct SubaServer {

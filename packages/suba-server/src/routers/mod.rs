@@ -116,6 +116,7 @@ mod tests {
                 port: 0,
                 config_dir: root.join("config"),
                 data_dir: root.join("data"),
+                privileged: Default::default(),
             };
             let state = AppState::build(&config).await.unwrap();
             let router = super::AppRouter::route(state.web_dir()).with_state(state);
@@ -435,7 +436,12 @@ mod tests {
         let chosen = server
             .put_json(
                 "/api/cores/sing-box",
-                json!({ "version": null, "config": "second", "collections": [] }),
+                json!({
+                    "version": null,
+                    "config": "second",
+                    "privilege": "operator",
+                    "collections": []
+                }),
             )
             .await;
         assert_eq!(chosen.status(), 200);
@@ -472,6 +478,42 @@ mod tests {
             )
             .await;
         assert_eq!(section.status(), 409);
+    }
+
+    /// What the module asks a core to be and what this instance can give it
+    /// have to agree, and a disagreement is answered rather than substituted.
+    #[cfg(feature = "singbox-core")]
+    #[tokio::test]
+    async fn a_core_that_has_to_be_root_is_refused_where_there_is_no_root() {
+        let server = Server::start().await;
+
+        // The module is set to run the core as root, and this instance is not
+        // root: what a caller can act on is told to the caller.
+        let chosen = server
+            .put_json(
+                "/api/cores/sing-box",
+                json!({
+                    "version": null,
+                    "config": "default",
+                    "privilege": "root",
+                    "collections": []
+                }),
+            )
+            .await;
+        assert_eq!(chosen.status(), 200);
+        assert_eq!(body(chosen).await["privilege"], json!("root"));
+
+        let refused = server
+            .put_json("/api/cores/sing-box/status", json!({ "action": "start" }))
+            .await;
+        assert_eq!(refused.status(), 409);
+        assert!(
+            body(refused).await["message"]
+                .as_str()
+                .unwrap()
+                .contains("start it as root"),
+            "the refusal says which way out there is"
+        );
     }
 
     /// The `ETag` a read answers with is the one a write can name, quotes and

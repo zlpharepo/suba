@@ -38,11 +38,14 @@ use std::{
     io::{self, Read as _, Write as _},
     os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _},
     path::Path,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
 };
 
 use rustix::{
-    fs::{open, openat, renameat, unlinkat, AtFlags, Mode, OFlags},
+    fs::{chown, open, openat, renameat, unlinkat, AtFlags, Gid, Mode, OFlags, Uid},
     io::Errno,
     process::geteuid,
 };
@@ -59,6 +62,33 @@ const MAX_NAME: usize = 255;
 /// Distinguishes temp files written in the same process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The user files are written for, when this process is not that user.
+static FOR: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+
+/// Write files for this user from now on.
+///
+/// A root run exists to start a core, not to take the operator's files away from
+/// them: without this, an instance started as root leaves a `config.json` its
+/// owner cannot read, let alone edit, and the only way back is a `chown -R`.
+/// Taken once, before any store is built.
+pub fn write_for(uid: u32, gid: u32) {
+    let _ = FOR.set(Some((uid, gid)));
+}
+
+/// Give a file or directory just created back to the user this process writes
+/// for.
+///
+/// Best effort by design: the thing asked for has already happened, and an owner
+/// that could not be changed is a file the operator notices by not being able to
+/// edit it — not a reason to fail a save that landed.
+fn settle_with(path: &Path) {
+    let Some((uid, gid)) = FOR.get().copied().flatten() else {
+        return;
+    };
+
+    let _ = chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)));
+}
+
 /// Create a directory tree with restrictive permissions.
 pub fn ensure_dir(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
@@ -69,7 +99,10 @@ pub fn ensure_dir(path: impl AsRef<Path>) -> io::Result<()> {
 
     let mut builder = DirBuilder::new();
     builder.recursive(true).mode(DIR_MODE);
-    builder.create(path)
+    builder.create(path)?;
+    settle_with(path);
+
+    Ok(())
 }
 
 /// Write `name` inside `dir`, replacing whatever is there.
@@ -118,6 +151,8 @@ pub fn write_atomic(dir: &Path, name: &str, contents: impl AsRef<[u8]>) -> io::R
     // filesystem that will not sync a directory is not a reason to fail a write
     // that already landed.
     let _ = rustix::fs::fsync(&directory);
+
+    settle_with(&dir.join(name));
 
     Ok(())
 }
@@ -238,16 +273,8 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
     let metadata = directory.metadata()?;
     let mode = metadata.mode() & 0o777;
 
-    if metadata.uid() != geteuid().as_raw() {
-        return Err(refused(path, "", "is not owned by the user running suba"));
-    }
-
-    if mode & OTHER_WRITE != 0 {
-        return Err(refused(
-            path,
-            "",
-            "is writable by a user other than its owner",
-        ));
+    if let Err(reason) = trust(metadata.uid(), mode, geteuid().as_raw()) {
+        return Err(refused(path, "", reason));
     }
 
     // Ours and private from others, but perhaps readable by them. Tighter is the
@@ -257,6 +284,69 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
     }
 
     Ok(directory)
+}
+
+/// Whether a directory is one this process may keep files in.
+///
+/// Root is answered on its own, because it can reach any directory there is: who
+/// owns one says nothing about what root may do, and comparing against root's
+/// own id was what stopped a root run from using the operator's data directory.
+fn trust(owner: u32, mode: u32, euid: u32) -> Result<(), &'static str> {
+    if euid != 0 && owner != euid {
+        return Err("is not owned by the user running suba");
+    }
+    if mode & OTHER_WRITE != 0 {
+        return Err("is writable by a user other than its owner");
+    }
+
+    Ok(())
+}
+
+/// Give a directory tree back to the user it belongs to.
+///
+/// A run that started as root writes what root owns, and an operator who then
+/// runs without a privilege would find their own instance unreadable. Only what
+/// root owns is changed — a file that already belongs to somebody else is left
+/// alone — and symlinks are not followed, so nothing outside the tree is
+/// reached.
+pub fn hand_back(dir: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    // The root of a filesystem is not a data directory, and handing it to a user
+    // is not something a mistyped `--data /` should be able to do.
+    if dir.as_os_str().is_empty() || dir.parent().is_none() {
+        return Err(refused(dir, "", "is not a directory to hand back"));
+    }
+
+    let owner = Some(Uid::from_raw(uid));
+    let group = Some(Gid::from_raw(gid));
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.uid() == 0 => chown(dir, owner, group)?,
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        // `DirEntry::metadata` is the entry itself, not what a link points at.
+        let metadata = entry.metadata()?;
+        let path = entry.path();
+
+        if metadata.uid() == 0 {
+            chown(&path, owner, group)?;
+        }
+        if metadata.is_dir() {
+            hand_back(&path, uid, gid)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// A name that may be a file inside `dir`.
@@ -320,6 +410,72 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Root is answered on its own, and a directory somebody else can write to
+    /// is never trusted — which is the one thing that check is for.
+    #[test]
+    fn a_directory_is_trusted_by_who_may_write_it() {
+        assert!(trust(501, 0o700, 501).is_ok(), "its own owner");
+        assert!(trust(0, 0o700, 0).is_ok(), "root, owning it");
+        assert!(
+            trust(501, 0o700, 0).is_ok(),
+            "root, on a directory that is somebody else's: it can reach \
+             anything there is, so the owner says nothing about what it may do"
+        );
+
+        assert!(trust(501, 0o700, 502).is_err(), "another user's directory");
+        assert!(trust(501, 0o755, 501).is_ok(), "readable by others is fine");
+        assert!(trust(501, 0o777, 501).is_err(), "writable by others");
+        assert!(trust(501, 0o777, 0).is_err(), "writable by others, as root");
+    }
+
+    /// The root of a filesystem is not a data directory, and a mistyped
+    /// `--data /` must not be able to hand it to a user.
+    #[test]
+    fn handing_back_refuses_a_path_that_is_not_a_data_directory() {
+        assert!(hand_back(Path::new("/"), 501, 20).is_err());
+        assert!(hand_back(Path::new(""), 501, 20).is_err());
+    }
+
+    /// An owner that cannot be applied is not a reason to lose a write: the
+    /// thing asked for has already happened, and a file the operator cannot edit
+    /// is something they notice, not a failure to report here.
+    #[test]
+    fn a_write_lands_even_when_its_owner_cannot_be_changed() {
+        let dir = scratch("settle-with");
+        fs::create_dir_all(&dir).unwrap();
+
+        // A user this test is almost never, so the change is refused wherever it
+        // can be. Taken once per process, which is how the server takes it.
+        write_for(1, 1);
+
+        assert!(write_atomic(&dir, "held", b"x").is_ok());
+        assert_eq!(fs::read(dir.join("held")).unwrap(), b"x");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handing_back_a_directory_that_is_not_there_is_not_a_failure() {
+        let dir = scratch("hand-back-absent");
+
+        assert!(hand_back(&dir, 501, 20).is_ok());
+    }
+
+    /// Only what root owns is changed: a file that already belongs to somebody
+    /// else is left alone, which is what makes this safe to run at every start.
+    #[test]
+    fn handing_back_leaves_what_root_does_not_own_alone() {
+        let dir = scratch("hand-back-other");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("theirs"), b"x").unwrap();
+        let before = fs::metadata(dir.join("theirs")).unwrap().uid();
+
+        hand_back(&dir, 501, 20).unwrap();
+
+        assert_eq!(fs::metadata(dir.join("theirs")).unwrap().uid(), before);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

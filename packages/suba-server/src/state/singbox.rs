@@ -22,6 +22,7 @@
 //! touched by one — which is what makes "restart" safe to offer.
 
 use std::collections::HashMap;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,7 +36,7 @@ use suba_singbox::run::{self, Runner, Status};
 use suba_singbox::schema::{Schema, Skipped, Verdict};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::{error::Error, fs};
+use crate::{error::Error, fs, identity::Identity};
 
 /// The directory the operator's configurations live in, under the config
 /// directory.
@@ -85,9 +86,30 @@ pub(crate) struct Settings {
     /// The configuration that runs; the default one when none is chosen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    /// Whether the core runs with the privileges this instance has.
+    #[serde(default, skip_serializing_if = "is_operator")]
+    pub privilege: Privilege,
     /// The collections whose nodes become outbounds, in this order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<String>,
+}
+
+/// How a started core runs, which is not something that can be inferred from a
+/// configuration: a `tun` inbound needs a privilege, and whether this instance
+/// has one to give is the operator's to say.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Privilege {
+    /// Dropped to the user whose files these are: what a configuration without
+    /// a `tun`, `tproxy` or `redirect` inbound needs.
+    #[default]
+    Operator,
+    /// Started as this instance is, which is root when it was started as root.
+    Root,
+}
+
+fn is_operator(privilege: &Privilege) -> bool {
+    *privilege == Privilege::Operator
 }
 
 /// The operator's configuration, and the tag it is addressed by.
@@ -194,6 +216,9 @@ pub(crate) struct SingboxStore {
     dirs: Dirs,
     /// The instance's HTTP client, which fetching a release goes through.
     http: reqwest::Client,
+    /// Who this process is, for the one decision that depends on it: whether a
+    /// started core inherits its privileges or is dropped to the operator.
+    identity: Identity,
     /// Held across a cache miss so concurrent requests make one upstream call.
     releases: AsyncMutex<Option<ReleasesCache>>,
     /// The process, which outlives any request that touched it.
@@ -215,12 +240,18 @@ pub(crate) struct SingboxStore {
 }
 
 impl SingboxStore {
-    pub(crate) fn new(config_dir: &Path, data_dir: &Path, http: reqwest::Client) -> Self {
+    pub(crate) fn new(
+        config_dir: &Path,
+        data_dir: &Path,
+        http: reqwest::Client,
+        identity: Identity,
+    ) -> Self {
         Self {
             config_dir: config_dir.to_path_buf(),
             document_dir: config_dir.join(DOCUMENT_DIR),
             dirs: Dirs::new(data_dir),
             http,
+            identity,
             releases: AsyncMutex::new(None),
             runner: Arc::new(Runner::new()),
             started: Mutex::new(None),
@@ -932,7 +963,13 @@ impl SingboxStore {
     }
 
     fn start_checked(&self, generated: &[Value]) -> Result<u32, Error> {
-        let version = self.current()?.ok_or(Error::NoVersion)?;
+        let settings = self.settings()?;
+        // Asked before the version is: how a core is run is a property of this
+        // instance, and an operator who set that has to be told about it rather
+        // than about something the module has not got to yet. Nothing is
+        // written either way, so a refused start leaves the document alone.
+        let drop_to = self.run_as(settings.privilege)?;
+        let version = settings.version.ok_or(Error::NoVersion)?;
 
         let assembled = self.assemble(generated)?;
         let (schema, _) = self.parsed_schema()?;
@@ -948,9 +985,59 @@ impl SingboxStore {
         let config = std::fs::canonicalize(self.dirs.config().join(CONFIG))?;
         let work = std::fs::canonicalize(self.dirs.work())?;
 
-        let pid = self.runner.spawn(run::command(&binary, &config, &work))?;
+        let mut command = run::command(&binary, &config, &work);
+        match drop_to {
+            Some((uid, gid)) => tracing::info!("starting {version} as {uid}:{gid}"),
+            // Said out loud because it is the one thing an operator cannot see
+            // from the page: a core that never became root cannot create an
+            // interface, and its own log is the only place that shows up.
+            None => tracing::info!("starting {version} with this instance's privileges"),
+        }
+        if let Some((uid, gid)) = drop_to {
+            // SAFETY: between `fork` and `exec` this closure makes three
+            // syscalls and nothing else — no allocation, no lock, nothing a
+            // forked child of a threaded process may not do.
+            unsafe {
+                command.pre_exec(move || drop_identity(uid, gid));
+            }
+        }
+
+        let pid = self.runner.spawn(command)?;
         *self.started.lock().expect("the started version") = Some(version);
         Ok(pid)
+    }
+
+    /// Who a started core runs as, or a refusal when it cannot be who the
+    /// module asked for.
+    ///
+    /// Nothing here reads the configuration: which inbound needs a privilege is
+    /// the operator's business, and a `tun` inbound in a core that was not given
+    /// one fails with the core's own words in the log. What is checked is the
+    /// intent — an instance that was asked for a privilege it does not have says
+    /// so instead of quietly running the core as somebody else.
+    fn run_as(&self, privilege: Privilege) -> Result<Option<(u32, u32)>, Error> {
+        match privilege {
+            // Nothing to hand down when there is nothing to hand down from:
+            // this process is already the operator.
+            Privilege::Operator if !self.identity.is_root() => Ok(None),
+            // Dropping to root is not dropping: an instance whose files are
+            // root's has nothing to give, and says so rather than reporting a
+            // start that was never unprivileged.
+            Privilege::Operator => match self.identity.operator {
+                Some((uid, gid)) if uid != 0 => Ok(Some((uid, gid))),
+                _ => Err(Error::NoDropTarget),
+            },
+            Privilege::Root if !self.identity.is_root() => Err(Error::NoPrivilege),
+            Privilege::Root => Ok(None),
+        }
+    }
+
+    /// What a start refuses on, without starting anything.
+    ///
+    /// A caller that is about to replace a running core asks this first: a
+    /// refusal here must not leave the operator with nothing running.
+    pub(crate) fn startable(&self) -> Result<(), Error> {
+        self.run_as(self.settings()?.privilege).map(drop)
     }
 
     /// Ask the core to stop.
@@ -983,6 +1070,28 @@ impl SingboxStore {
                 version: version.clone(),
             })
         })
+    }
+}
+
+/// Become `uid`/`gid` with none of root's groups left, between `fork` and `exec`.
+///
+/// The groups go first: clearing them is what needs the privilege that dropping
+/// the user takes away, and a core that kept root's supplementary groups —
+/// `wheel` among them — would not be dropped at all. `rustix` wraps these three
+/// on Linux only, and this has to work on macOS too, so they are made through
+/// `libc`.
+fn drop_identity(uid: u32, gid: u32) -> std::io::Result<()> {
+    // SAFETY: three syscalls that take numbers, in a child process that has not
+    // yet run anything of its own. Nothing here allocates, locks or reads.
+    let failed = unsafe {
+        libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setgid(gid as libc::gid_t) != 0
+            || libc::setuid(uid as libc::uid_t) != 0
+    };
+
+    match failed {
+        true => Err(std::io::Error::last_os_error()),
+        false => Ok(()),
     }
 }
 
@@ -1038,6 +1147,7 @@ mod tests {
             &scratch.0.join("config"),
             &scratch.0.join("data"),
             reqwest::Client::new(),
+            identity(),
         );
         let (url, calls) = release_server().await;
 
@@ -1091,6 +1201,7 @@ mod tests {
             &scratch.0.join("config"),
             &scratch.0.join("data"),
             reqwest::Client::new(),
+            identity(),
         );
         let (url, calls) = release_server().await;
         let failed = format!("{url}/missing");
@@ -1215,13 +1326,25 @@ mod tests {
     /// The configuration the store's tests write to.
     const NAME: &str = DEFAULT_CONFIG;
 
+    /// A process that is not root, so the module's default — run the core as
+    /// the operator — is the case that needs no drop and no privilege.
+    fn identity() -> Identity {
+        Identity::not_root()
+    }
+
     /// A store over a scratch directory, with one version installed and current.
     fn store() -> (Scratch, SingboxStore) {
+        store_as(identity())
+    }
+
+    /// The same, run by an instance that is something other than this process.
+    fn store_as(identity: Identity) -> (Scratch, SingboxStore) {
         let scratch = Scratch::new();
         let store = SingboxStore::new(
             &scratch.0.join("config"),
             &scratch.0.join("data"),
             reqwest::Client::new(),
+            identity,
         );
 
         let version = Version::from_tag("v1.14.2");
@@ -1238,6 +1361,7 @@ mod tests {
         store
             .set_settings(&Settings {
                 version: Some(version),
+                privilege: Default::default(),
                 config: Some(NAME.to_string()),
                 collections: Vec::new(),
             })
@@ -1298,6 +1422,7 @@ mod tests {
             &scratch.0.join("config"),
             &scratch.0.join("data"),
             reqwest::Client::new(),
+            identity(),
         );
         let version = Version::from_tag("1.14.2");
         suba_singbox::install::install(
@@ -1322,6 +1447,7 @@ mod tests {
             &scratch.0.join("config"),
             &scratch.0.join("data"),
             reqwest::Client::new(),
+            identity(),
         );
         let version = Version::from_tag("1.14.2");
         suba_singbox::install::install(
@@ -1424,6 +1550,92 @@ mod tests {
 
         store.remove_config("copy").expect("a removal");
         assert_eq!(store.configs().unwrap(), [NAME]);
+    }
+
+    /// What the module asks a core to be and what this instance can give it
+    /// have to agree, in both directions.
+    #[test]
+    fn a_privilege_this_instance_does_not_have_is_refused() {
+        let (_scratch, store) = store();
+
+        assert_eq!(
+            store.run_as(Privilege::Operator).expect("as the operator"),
+            None,
+            "a process that is not root is already the operator, so there is \
+             nothing to drop"
+        );
+        assert!(matches!(
+            store.run_as(Privilege::Root),
+            Err(Error::NoPrivilege)
+        ));
+    }
+
+    /// A root instance hands its privilege down or keeps it, and never quietly
+    /// does the other one.
+    #[test]
+    fn a_root_instance_answers_both_ways() {
+        let (_scratch, store) = store_as(Identity::root_as(501, 20));
+
+        assert_eq!(
+            store.run_as(Privilege::Operator).unwrap(),
+            Some((501, 20)),
+            "dropped to the user whose files these are"
+        );
+        assert_eq!(
+            store.run_as(Privilege::Root).unwrap(),
+            None,
+            "kept, which is what a tun inbound needs"
+        );
+    }
+
+    /// An instance whose files are root's has nothing to hand down, and says so
+    /// rather than running the core as root behind a setting that said not to.
+    #[test]
+    fn root_owning_the_files_is_not_a_user_to_drop_to() {
+        let (_scratch, store) = store_as(Identity::root_as(0, 0));
+
+        assert!(matches!(
+            store.run_as(Privilege::Operator),
+            Err(Error::NoDropTarget)
+        ));
+    }
+
+    /// A restart asks what a start refuses on *before* it stops anything: a
+    /// refusal must not leave the operator with nothing running.
+    #[test]
+    fn a_start_that_cannot_be_what_it_was_asked_to_be_is_refused_first() {
+        let (_scratch, store) = store();
+        assert!(store.startable().is_ok());
+
+        let mut settings = store.settings().unwrap();
+        settings.privilege = Privilege::Root;
+        store.set_settings(&settings).unwrap();
+
+        assert!(matches!(store.startable(), Err(Error::NoPrivilege)));
+    }
+
+    /// A settings document written before this module had a privilege setting
+    /// still means what it meant, and the choice survives being written down.
+    #[test]
+    fn the_privilege_the_module_was_told_is_the_one_it_reads_back() {
+        let (scratch, store) = store();
+        let written = std::fs::read_to_string(crate::config::config_path(
+            scratch.0.join("config"),
+            SETTINGS_BASENAME,
+        ))
+        .expect("the settings");
+
+        assert_eq!(store.settings().unwrap().privilege, Privilege::Operator);
+        assert!(
+            !written.contains("privilege"),
+            "the default is not written down: {written}"
+        );
+
+        let mut settings = store.settings().unwrap();
+        settings.privilege = Privilege::Root;
+        store.write_settings(&settings).unwrap();
+
+        assert_eq!(store.settings().unwrap().privilege, Privilege::Root);
     }
 
     /// A name is a name, never a path.
@@ -1583,6 +1795,7 @@ mod tests {
         assert!(matches!(
             store.set_settings(&Settings {
                 version: Some(Version::from_tag("1.99.0")),
+                privilege: Default::default(),
                 config: Some(NAME.to_string()),
                 collections: Vec::new(),
             }),
@@ -1640,6 +1853,7 @@ mod tests {
             &scratch.0.join("config"),
             &scratch.0.join("data"),
             reqwest::Client::new(),
+            identity(),
         );
         let version = Version::from_tag("9.99.9");
         let release = Release::from_json(&serde_json::json!({
@@ -1662,6 +1876,7 @@ mod tests {
             &scratch.0.join("config"),
             &scratch.0.join("data"),
             reqwest::Client::new(),
+            identity(),
         );
 
         assert!(matches!(store.start(&[]), Err(Error::NoVersion)));
@@ -1807,7 +2022,12 @@ mod tests {
         let relative =
             PathBuf::from("target").join(format!("suba-relative-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&relative).expect("a relative scratch directory");
-        let store = SingboxStore::new(&scratch.0.join("config"), &relative, reqwest::Client::new());
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &relative,
+            reqwest::Client::new(),
+            identity(),
+        );
         let version = Version::from_tag("1.14.2");
         suba_singbox::install::install(
             &store.dirs,
@@ -1822,6 +2042,7 @@ mod tests {
         store
             .set_settings(&Settings {
                 version: Some(version),
+                privilege: Default::default(),
                 config: Some(NAME.to_string()),
                 collections: Vec::new(),
             })

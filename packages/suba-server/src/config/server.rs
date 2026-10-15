@@ -14,6 +14,13 @@ pub struct ServerConfig {
     pub config_dir: PathBuf,
     /// Directory holding runtime data, such as sessions and the web UI.
     pub data_dir: PathBuf,
+    /// What the command line said about running with a privilege.
+    ///
+    /// A core that creates an interface needs root, so an instance that serves
+    /// such a configuration is started as root on purpose. A run that is root
+    /// without this is refused: nothing should end up as root by accident, and
+    /// a root run has to be told whose files it is holding.
+    pub privileged: crate::identity::Privileged,
 }
 
 /// The address of the public listener.

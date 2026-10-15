@@ -156,6 +156,22 @@ pub enum Error {
     #[error("the configuration changed since it was read")]
     Stale,
 
+    /// The module runs the core with a privilege this instance does not have.
+    #[cfg(feature = "singbox-core")]
+    #[error(
+        "the core is set to run with privileges, and this instance has none: start it as root, \
+         or set the module to run the core as the operator"
+    )]
+    NoPrivilege,
+
+    /// The module runs the core as the operator, and nobody said who that is.
+    #[cfg(feature = "singbox-core")]
+    #[error(
+        "the core is set to run as the operator, and nothing says which user that is: start the \
+         server as that user, or set the module to run the core with root's privileges"
+    )]
+    NoDropTarget,
+
     /// There is no version to run.
     #[cfg(feature = "singbox-core")]
     #[error("no version is installed and current")]
@@ -172,6 +188,17 @@ pub enum Error {
     /// A document that is not JSON.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    /// This instance is root, and the command line did not say that was meant.
+    #[error(
+        "this instance is running as root, which a `--run-as-root` on the command line has to \
+         say: a core that creates an interface needs it, and nothing else does"
+    )]
+    RootNotAcknowledged,
+
+    /// A root run that cannot be told whose files it is holding.
+    #[error("the files this instance is holding cannot be attributed: {reason}")]
+    Operator { reason: &'static str },
 }
 
 pub struct HttpError {
@@ -392,6 +419,18 @@ impl IntoHttpError for Error {
                 status_code: StatusCode::PRECONDITION_FAILED,
                 message: "The configuration changed since it was read".to_string(),
             },
+            // Both are answered as themselves: what a caller can act on is told
+            // to the caller, in the words of the thing that is wrong.
+            #[cfg(feature = "singbox-core")]
+            Error::NoPrivilege => HttpError {
+                status_code: StatusCode::CONFLICT,
+                message: Error::NoPrivilege.to_string(),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::NoDropTarget => HttpError {
+                status_code: StatusCode::CONFLICT,
+                message: Error::NoDropTarget.to_string(),
+            },
             #[cfg(feature = "singbox-core")]
             Error::NoVersion => HttpError {
                 status_code: StatusCode::CONFLICT,
@@ -410,6 +449,21 @@ impl IntoHttpError for Error {
                 status_code: StatusCode::INTERNAL_SERVER_ERROR,
                 message: "Internal server error".to_string(),
             },
+            // Neither of these can be answered by a request: they are what
+            // stops the server before it listens, and the operator reads them
+            // on the terminal that started it.
+            Error::RootNotAcknowledged => HttpError {
+                status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                message: Error::RootNotAcknowledged.to_string(),
+            },
+            Error::Operator { reason } => {
+                tracing::error!("{reason}");
+
+                HttpError {
+                    status_code: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "Internal server error".to_string(),
+                }
+            }
         }
     }
 }

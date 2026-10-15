@@ -517,6 +517,7 @@ mod artifact_tests {
             port: 0,
             config_dir: root.join("config"),
             data_dir: root.join("data"),
+            privileged: Default::default(),
         };
 
         AppState::build(&config).await.unwrap()
@@ -802,6 +803,7 @@ mod tests {
             port: 0,
             config_dir: root.join("config"),
             data_dir: root.join("data"),
+            privileged: Default::default(),
         };
 
         AppState::build(&config).await.unwrap()

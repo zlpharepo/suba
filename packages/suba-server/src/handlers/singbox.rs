@@ -25,7 +25,9 @@ use crate::{
     dto::{Authenticated, ResponseResult},
     error::Error,
     handlers::collections::outbounds_of,
-    state::singbox::{Document, InstallationTask, RuntimePhase, Saved, Settings, SingboxStore},
+    state::singbox::{
+        Document, InstallationTask, Privilege, RuntimePhase, Saved, Settings, SingboxStore,
+    },
     AppState,
 };
 
@@ -40,6 +42,8 @@ pub struct Core {
     pub version: Option<String>,
     /// The configuration in use.
     pub config: String,
+    /// Whether the core runs with this instance's privileges.
+    pub privilege: Privilege,
     /// The collections whose nodes become outbounds, in order.
     pub collections: Vec<String>,
     /// Whether the chosen version's binary is where it should be.
@@ -64,6 +68,10 @@ pub struct Choose {
     /// The configuration to run. A name whose document has not been written yet
     /// reads as an empty one, which is how a module starts.
     pub config: String,
+    /// Whether the core runs with this instance's privileges. Both are named
+    /// because neither can be inferred: `tun` needs a privilege, and whether
+    /// this instance has one to give is the operator's to say.
+    pub privilege: Privilege,
     #[serde(default)]
     pub collections: Vec<String>,
 }
@@ -90,6 +98,7 @@ fn core_view(store: &SingboxStore, note: Option<String>) -> Result<Core, Error> 
     Ok(Core {
         version: settings.version.map(|version| version.as_str().to_string()),
         config: store.config()?,
+        privilege: settings.privilege,
         collections: settings.collections,
         installed: store.binary_in_place()?,
         assembled: store.assembled(),
@@ -146,6 +155,7 @@ pub async fn choose(
     let settings = Settings {
         version: choose.version.as_deref().map(Version::from_tag),
         config: Some(choose.config),
+        privilege: choose.privilege,
         collections: choose.collections,
     };
 
@@ -238,8 +248,10 @@ pub async fn act(
                 Command::Stop => store.stop(PATIENCE)?,
                 Command::Restart => {
                     // Checked before the stop, so a configuration that does not
-                    // hold up leaves the running core running.
+                    // hold up — or a core that cannot be started as it is set
+                    // to — leaves the running core running.
                     store.assemble(&generated)?;
+                    store.startable()?;
                     store.stop(PATIENCE)?;
                     store.start(&generated)?;
                 }
@@ -620,6 +632,7 @@ fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, 
 #[cfg(test)]
 mod version_view_tests {
     use super::*;
+    use crate::identity::Identity;
     use suba_singbox::core::{Dirs, Metadata};
 
     #[test]
@@ -629,6 +642,7 @@ mod version_view_tests {
             &root.join("config"),
             &root.join("data"),
             reqwest::Client::new(),
+            Identity::not_root(),
         );
         let version = Version::from_tag("1.14.2");
 
@@ -714,6 +728,7 @@ mod version_view_tests {
             &root.join("config"),
             &root.join("data"),
             reqwest::Client::new(),
+            Identity::not_root(),
         );
         let dirs = Dirs::new(root.join("data"));
         let version = Version::from_tag("1.14.2");
@@ -754,6 +769,7 @@ mod version_view_tests {
             &root.join("config"),
             &root.join("data"),
             reqwest::Client::new(),
+            Identity::not_root(),
         );
         let version = Version::from_tag("1.14.2");
         let dirs = Dirs::new(root.join("data"));
@@ -762,6 +778,7 @@ mod version_view_tests {
         store
             .write_settings(&Settings {
                 version: Some(version.clone()),
+                privilege: Default::default(),
                 config: Some("default".to_string()),
                 collections: Vec::new(),
             })

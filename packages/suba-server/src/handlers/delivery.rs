@@ -180,6 +180,7 @@ mod tests {
             port: 0,
             config_dir: root.join("config"),
             data_dir: root.join("data"),
+            privileged: Default::default(),
         };
 
         if let Some(prefix) = prefix {

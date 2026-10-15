@@ -2864,6 +2864,7 @@ dependencies = [
  "http",
  "http-serde",
  "jsonwebtoken",
+ "libc",
  "reqwest",
  "rustix",
  "serde",

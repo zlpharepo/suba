@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use suba_server::{tracing, ServerConfig, SubaServer};
+use suba_server::{tracing, Privileged, ServerConfig, SubaServer};
 
 #[derive(Parser)]
 #[command(author = "ZLPHA")]
@@ -28,6 +28,21 @@ struct Cli {
     /// Run as a service
     #[arg(short, long, default_value = "false")]
     service: bool,
+
+    /// Allow this instance to run as root, which a core that creates an
+    /// interface needs (a `tun` inbound, or `tproxy`/`redirect` on Linux)
+    #[arg(long, default_value = "false")]
+    run_as_root: bool,
+
+    /// The user whose files this instance is holding, for a run that is root:
+    /// what it writes is theirs, and a core is dropped to them unless the
+    /// module asks for root
+    #[arg(long)]
+    user: Option<u32>,
+
+    /// The group those files belong to, when it is a different number
+    #[arg(long)]
+    group: Option<u32>,
 }
 
 impl Cli {
@@ -41,6 +56,11 @@ impl Cli {
             port: self.port,
             config_dir: PathBuf::from(self.resolve_path(&self.config)),
             data_dir: PathBuf::from(self.resolve_path(&self.data)),
+            privileged: Privileged {
+                acknowledged: self.run_as_root,
+                user: self.user,
+                group: self.group,
+            },
         };
 
         let server = SubaServer::new(config).await.unwrap_or_else(|error| {
