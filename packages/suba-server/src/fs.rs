@@ -167,6 +167,36 @@ pub fn read_to_string(dir: &Path, name: &str) -> io::Result<Option<String>> {
     Ok(Some(contents))
 }
 
+/// The names of the regular files directly inside `dir`, sorted; a directory
+/// that is not there is empty, because nothing has been written yet.
+///
+/// The directory is put through the same trust check as every other operation.
+/// What comes back is a **name**, never a path, and it is one a caller hands
+/// straight back to `read_to_string`/`write_atomic`, which refuse anything that
+/// is not a plain name — so a hostile entry cannot become a path out of `dir`.
+pub fn list(dir: &Path) -> io::Result<Vec<String>> {
+    if let Err(error) = open_private(dir, false) {
+        return match error.kind() {
+            io::ErrorKind::NotFound => Ok(Vec::new()),
+            _ => Err(error),
+        };
+    }
+
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    names.sort();
+
+    Ok(names)
+}
+
 /// Forget `name` inside `dir`.
 ///
 /// Removing what is not there is not a failure: the caller is getting rid of

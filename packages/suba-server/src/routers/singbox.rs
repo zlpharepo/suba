@@ -17,15 +17,24 @@ pub fn route() -> Router<AppState> {
         .route("/", put(singbox::choose))
         .route("/status", get(singbox::status))
         .route("/status", put(singbox::act))
-        .route("/config", get(singbox::config).put(singbox::write_config))
         .route(
-            "/config/{section}",
+            "/configs",
+            get(singbox::configs).post(singbox::create_config),
+        )
+        .route(
+            "/configs/{name}",
+            get(singbox::config)
+                .put(singbox::write_config)
+                .delete(singbox::delete_config),
+        )
+        .route(
+            "/configs/{name}/sections/{section}",
             get(singbox::section)
                 .put(singbox::write_section)
                 .delete(singbox::delete_section),
         )
         .route(
-            "/config/{section}/{tag}",
+            "/configs/{name}/sections/{section}/{tag}",
             get(singbox::entry)
                 .put(singbox::write_entry)
                 .delete(singbox::delete_entry),

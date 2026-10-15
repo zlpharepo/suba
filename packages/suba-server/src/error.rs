@@ -126,6 +126,26 @@ pub enum Error {
     #[error("section '{section}' is not there")]
     NoSection { section: String },
 
+    /// A configuration this instance does not have.
+    #[cfg(feature = "singbox-core")]
+    #[error("there is no configuration named '{name}'")]
+    NoConfig { name: String },
+
+    /// A configuration of that name is already there.
+    #[cfg(feature = "singbox-core")]
+    #[error("a configuration named '{name}' is already there")]
+    ConfigExists { name: String },
+
+    /// The configuration in use cannot be forgotten while it is the one in use.
+    #[cfg(feature = "singbox-core")]
+    #[error("'{name}' is the configuration in use; switch to another one first")]
+    ConfigInUse { name: String },
+
+    /// A configuration name that could not be told apart in a URL or a file name.
+    #[cfg(feature = "singbox-core")]
+    #[error("configuration name: {reason}")]
+    ConfigName { reason: &'static str },
+
     /// An entry an array section does not hold.
     #[cfg(feature = "singbox-core")]
     #[error("{section} has no entry tagged '{tag}'")]
@@ -339,6 +359,28 @@ impl IntoHttpError for Error {
             Error::NoSection { section } => HttpError {
                 status_code: StatusCode::NOT_FOUND,
                 message: format!("Section '{section}' is not there"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::NoConfig { name } => HttpError {
+                status_code: StatusCode::NOT_FOUND,
+                message: format!("There is no configuration named '{name}'"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::ConfigExists { name } => HttpError {
+                status_code: StatusCode::CONFLICT,
+                message: format!("A configuration named '{name}' is already there"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::ConfigInUse { name } => HttpError {
+                status_code: StatusCode::CONFLICT,
+                message: format!(
+                    "'{name}' is the configuration in use; switch to another one first"
+                ),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::ConfigName { reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("configuration name: {reason}"),
             },
             #[cfg(feature = "singbox-core")]
             Error::NoEntry { section, tag } => HttpError {

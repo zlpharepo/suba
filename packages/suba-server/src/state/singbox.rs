@@ -1,12 +1,13 @@
 //! The sing-box module as the server uses it: the operator's settings and
-//! configuration, the configuration assembled from them, and the process
+//! configurations, the configuration assembled from them, and the process
 //! running it.
 //!
 //! Three documents, three owners. `config/sing-box.<ext>` is the module's
-//! settings (which version runs, which collections contribute outbounds);
-//! `config/sing-box/config.json` is the configuration the operator wrote, one
-//! document, edited whole or a section or an entry at a time; and
-//! `data/sing-box/config/config.json` is what a start assembled from both, which
+//! settings (which version runs, which configuration, which collections
+//! contribute outbounds); `config/sing-box/<name>.json` is one of the
+//! configurations the operator wrote, each edited whole or a section or an
+//! entry at a time, of which the settings name the one in use; and
+//! `data/sing-box/config/config.json` is what a start assembled from it, which
 //! is ours to overwrite.
 //!
 //! File and process operations run on the blocking pool. Release fetching is
@@ -36,15 +37,39 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{error::Error, fs};
 
-/// The directory the operator's configuration lives in, under the config
+/// The directory the operator's configurations live in, under the config
 /// directory.
 const DOCUMENT_DIR: &str = "sing-box";
 
-/// The operator's configuration, one document.
-const DOCUMENT: &str = "config.json";
+/// The configuration a module that has not chosen one runs.
+pub(crate) const DEFAULT_CONFIG: &str = "default";
 
-/// The module's settings, beside the server's own in the config directory.
-pub(crate) const SETTINGS_BASENAME: &str = "sing-box";
+/// The longest a configuration name may be.
+const CONFIG_NAME_MAX: usize = 64;
+
+/// The file a configuration is kept in.
+fn document_file(name: &str) -> String {
+    format!("{name}.json")
+}
+
+/// Refuse a configuration name that could not be told apart in a URL, a file
+/// name or a log line.
+pub(crate) fn config_name(name: &str) -> Result<(), Error> {
+    let usable = !name.is_empty()
+        && name.len() <= CONFIG_NAME_MAX
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !name.starts_with('.');
+
+    match usable {
+        true => Ok(()),
+        false => Err(Error::ConfigName {
+            reason:
+                "a name is 1 to 64 letters, digits, '.', '_' or '-', and does not start with '.'",
+        }),
+    }
+}
 
 /// What the operator chose for the module.
 ///
@@ -57,6 +82,9 @@ pub(crate) struct Settings {
     /// The version that runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<Version>,
+    /// The configuration that runs; the default one when none is chosen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
     /// The collections whose nodes become outbounds, in this order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<String>,
@@ -68,6 +96,9 @@ pub(crate) struct Document {
     /// The sha256 of the bytes on disk: what `If-Match` has to name.
     pub etag: String,
 }
+
+/// The module's settings, beside the server's own in the config directory.
+pub(crate) const SETTINGS_BASENAME: &str = "sing-box";
 
 /// What a write left behind.
 #[derive(Debug, Serialize)]
@@ -280,14 +311,39 @@ impl SingboxStore {
         self.failed_version.lock().expect("failed version").clone()
     }
 
-    /// The operator's configuration, as it is on disk; an empty one when none
-    /// has been written.
-    pub(crate) fn document(&self) -> Result<Document, Error> {
-        let text = fs::read_to_string(&self.document_dir, DOCUMENT)?;
+    /// The configurations this instance has, by name.
+    ///
+    /// A file that is not `<name>.json` is not a configuration, and a name that
+    /// begins with `.` is one of our own half-written temp files rather than
+    /// something the operator made.
+    pub(crate) fn configs(&self) -> Result<Vec<String>, Error> {
+        Ok(fs::list(&self.document_dir)?
+            .into_iter()
+            .filter(|file| !file.starts_with('.'))
+            .filter_map(|file| file.strip_suffix(".json").map(str::to_string))
+            .collect())
+    }
+
+    /// The configuration the module runs: the one the settings name, or the
+    /// default one.
+    pub(crate) fn config(&self) -> Result<String, Error> {
+        Ok(self
+            .settings()?
+            .config
+            .unwrap_or_else(|| DEFAULT_CONFIG.to_string()))
+    }
+
+    /// One configuration, as it is on disk; an empty one when none has been
+    /// written.
+    pub(crate) fn config_document(&self, name: &str) -> Result<Document, Error> {
+        config_name(name)?;
+
+        let text = fs::read_to_string(&self.document_dir, &document_file(name))?;
         let value = match &text {
             Some(text) => serde_json::from_str(text).map_err(|error| {
                 Error::Document(format!(
-                    "{DOCUMENT_DIR}/{DOCUMENT}: not JSON (line {}, column {})",
+                    "{}/{name}: not JSON (line {}, column {})",
+                    DOCUMENT_DIR,
                     error.line(),
                     error.column()
                 ))
@@ -301,9 +357,62 @@ impl SingboxStore {
         })
     }
 
-    /// One section of the operator's configuration.
-    pub(crate) fn section(&self, section: &str) -> Result<(Value, String), Error> {
-        let Document { value, etag } = self.document()?;
+    /// Make a configuration exist, from a copy of another or empty.
+    ///
+    /// A name that is taken is refused rather than replaced: the caller meant to
+    /// make a new one, and overwriting a document somebody wrote by hand is not
+    /// a thing to do behind their back.
+    pub(crate) fn create_config(&self, name: &str, copy: Option<&str>) -> Result<(), Error> {
+        config_name(name)?;
+        if self.configs()?.iter().any(|held| held == name) {
+            return Err(Error::ConfigExists {
+                name: name.to_string(),
+            });
+        }
+
+        let value = match copy {
+            Some(source) => {
+                if !self.configs()?.iter().any(|held| held == source) {
+                    return Err(Error::NoConfig {
+                        name: source.to_string(),
+                    });
+                }
+                self.config_document(source)?.value
+            }
+            None => Value::Object(Map::new()),
+        };
+
+        let body = serde_json::to_vec_pretty(&value)?;
+        fs::ensure_dir(&self.document_dir)?;
+
+        Ok(fs::write_atomic(
+            &self.document_dir,
+            &document_file(name),
+            body,
+        )?)
+    }
+
+    /// Forget a configuration. The one in use is refused: it is what the
+    /// running core was started from, and switching is a step of its own.
+    pub(crate) fn remove_config(&self, name: &str) -> Result<(), Error> {
+        config_name(name)?;
+        if self.config()? == name {
+            return Err(Error::ConfigInUse {
+                name: name.to_string(),
+            });
+        }
+        if !self.configs()?.iter().any(|held| held == name) {
+            return Err(Error::NoConfig {
+                name: name.to_string(),
+            });
+        }
+
+        Ok(fs::remove(&self.document_dir, &document_file(name))?)
+    }
+
+    /// One section of a configuration.
+    pub(crate) fn section(&self, name: &str, section: &str) -> Result<(Value, String), Error> {
+        let Document { value, etag } = self.config_document(name)?;
 
         match value.get(section) {
             Some(found) => Ok((found.clone(), etag)),
@@ -314,8 +423,13 @@ impl SingboxStore {
     }
 
     /// One entry of an array section, by its tag.
-    pub(crate) fn entry(&self, section: &str, tag: &str) -> Result<(Value, String), Error> {
-        let Document { value, etag } = self.document()?;
+    pub(crate) fn entry(
+        &self,
+        name: &str,
+        section: &str,
+        tag: &str,
+    ) -> Result<(Value, String), Error> {
+        let Document { value, etag } = self.config_document(name)?;
 
         value
             .get(section)
@@ -331,11 +445,12 @@ impl SingboxStore {
     /// Replace the whole configuration.
     pub(crate) fn write_document(
         &self,
+        name: &str,
         value: Value,
         if_match: Option<&str>,
         generated: &[Value],
     ) -> Result<Saved, Error> {
-        self.edit(if_match, generated, |sections| {
+        self.edit(name, if_match, generated, |sections| {
             let Value::Object(replacement) = value else {
                 return Err(Error::Document("a configuration is an object".to_string()));
             };
@@ -348,12 +463,13 @@ impl SingboxStore {
     /// Replace one section.
     pub(crate) fn write_section(
         &self,
+        name: &str,
         section: &str,
         value: Value,
         if_match: Option<&str>,
         generated: &[Value],
     ) -> Result<Saved, Error> {
-        self.edit(if_match, generated, |sections| {
+        self.edit(name, if_match, generated, |sections| {
             sections.insert(section.to_string(), value);
 
             Ok(())
@@ -363,11 +479,12 @@ impl SingboxStore {
     /// Remove one section.
     pub(crate) fn remove_section(
         &self,
+        name: &str,
         section: &str,
         if_match: Option<&str>,
         generated: &[Value],
     ) -> Result<Saved, Error> {
-        self.edit(if_match, generated, |sections| {
+        self.edit(name, if_match, generated, |sections| {
             sections
                 .remove(section)
                 .map(drop)
@@ -383,6 +500,7 @@ impl SingboxStore {
     /// is refused rather than moved: renaming is a removal and a write.
     pub(crate) fn write_entry(
         &self,
+        name: &str,
         section: &str,
         tag: &str,
         value: Value,
@@ -407,7 +525,7 @@ impl SingboxStore {
         }
         let entry = Value::Object(entry);
 
-        self.edit(if_match, generated, |sections| {
+        self.edit(name, if_match, generated, |sections| {
             let entries = sections
                 .entry(section.to_string())
                 .or_insert_with(|| Value::Array(Vec::new()));
@@ -429,12 +547,13 @@ impl SingboxStore {
     /// Remove one entry of an array section.
     pub(crate) fn remove_entry(
         &self,
+        name: &str,
         section: &str,
         tag: &str,
         if_match: Option<&str>,
         generated: &[Value],
     ) -> Result<Saved, Error> {
-        self.edit(if_match, generated, |sections| {
+        self.edit(name, if_match, generated, |sections| {
             let index = sections
                 .get(section)
                 .and_then(Value::as_array)
@@ -462,12 +581,13 @@ impl SingboxStore {
     /// the outbounds it names — and a start refuses what is still dangling.
     fn edit(
         &self,
+        name: &str,
         if_match: Option<&str>,
         generated: &[Value],
         change: impl FnOnce(&mut Map<String, Value>) -> Result<(), Error>,
     ) -> Result<Saved, Error> {
         let _writing = self.writing.lock().expect("the configuration");
-        let Document { value, etag } = self.document()?;
+        let Document { value, etag } = self.config_document(name)?;
 
         if if_match.is_some_and(|expected| expected != etag) {
             return Err(Error::Stale);
@@ -489,7 +609,7 @@ impl SingboxStore {
 
         let body = serde_json::to_vec_pretty(&value)?;
         fs::ensure_dir(&self.document_dir)?;
-        fs::write_atomic(&self.document_dir, DOCUMENT, &body)?;
+        fs::write_atomic(&self.document_dir, &document_file(name), &body)?;
 
         let warnings = match assemble::assemble(&value, generated) {
             Ok(_) => Vec::new(),
@@ -513,9 +633,11 @@ impl SingboxStore {
 
     /// Replace the module's settings.
     ///
-    /// A version that is not installed is refused; a collection that does not
-    /// exist is not, because a collection may be written after the settings
-    /// that name it, and a start says which one is missing.
+    /// A version that is not installed is refused; a configuration that has no
+    /// document yet and a collection that does not exist are not, because both
+    /// may be written after the settings that name them — a module that has just
+    /// been installed has an empty configuration, and the editor writes it on
+    /// the first save.
     pub(crate) fn set_settings(&self, settings: &Settings) -> Result<(), Error> {
         let _selection = self.selection.lock().expect("current selection");
 
@@ -525,6 +647,9 @@ impl SingboxStore {
                     version: version.clone(),
                 }));
             }
+        }
+        if let Some(name) = &settings.config {
+            config_name(name)?;
         }
 
         self.write_settings(settings)
@@ -727,7 +852,7 @@ impl SingboxStore {
     /// to hold up: the operator is still writing it, and the tags that exist so
     /// far are exactly what the next field needs.
     pub(crate) fn references(&self, generated: &[Value]) -> Result<Vec<Tag>, Error> {
-        let document = assemble::document(&self.document()?.value, generated)
+        let document = assemble::document(&self.current_document()?.value, generated)
             .map_err(|unfit| Error::Document(unfit.to_string()))?;
 
         assemble::tags(&document).map_err(|unfit| Error::Document(unfit.to_string()))
@@ -758,8 +883,13 @@ impl SingboxStore {
     /// The configuration the core would run: the operator's, and whatever the
     /// collections contributed.
     pub(crate) fn assemble(&self, generated: &[Value]) -> Result<Assembled, Error> {
-        assemble::assemble(&self.document()?.value, generated)
+        assemble::assemble(&self.current_document()?.value, generated)
             .map_err(|unfit| Error::Document(unfit.to_string()))
+    }
+
+    /// The configuration in use.
+    fn current_document(&self) -> Result<Document, Error> {
+        self.config_document(&self.config()?)
     }
 
     /// Write the assembled configuration where the core is pointed at it.
@@ -1082,6 +1212,9 @@ mod tests {
         assert!(!logged.contains(SENTINEL), "logged: {logged}");
     }
 
+    /// The configuration the store's tests write to.
+    const NAME: &str = DEFAULT_CONFIG;
+
     /// A store over a scratch directory, with one version installed and current.
     fn store() -> (Scratch, SingboxStore) {
         let scratch = Scratch::new();
@@ -1105,6 +1238,7 @@ mod tests {
         store
             .set_settings(&Settings {
                 version: Some(version),
+                config: Some(NAME.to_string()),
                 collections: Vec::new(),
             })
             .expect("a current version");
@@ -1214,7 +1348,7 @@ mod tests {
     fn a_section_is_checked_as_part_of_the_whole_document() {
         let (_scratch, store) = store();
 
-        let refused = store.write_section("bogus", serde_json::json!({}), None, &[]);
+        let refused = store.write_section(NAME, "bogus", serde_json::json!({}), None, &[]);
         assert!(
             matches!(
                 &refused,
@@ -1223,17 +1357,95 @@ mod tests {
             ),
             "{refused:?}"
         );
-        assert!(!store.document_dir.join(DOCUMENT).exists());
+        assert!(!store.document_dir.join(document_file(NAME)).exists());
 
         let saved = store
-            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "info" }),
+                None,
+                &[],
+            )
             .expect("a section");
         assert!(saved.unchecked.is_empty());
         assert_eq!(
-            store.section("log").expect("a section").0,
+            store.section(NAME, "log").expect("a section").0,
             serde_json::json!({ "level": "info" })
         );
-        assert_eq!(saved.etag, store.document().unwrap().etag);
+        assert_eq!(saved.etag, store.config_document(NAME).unwrap().etag);
+    }
+
+    /// Configurations are named documents: one is made from a copy of another,
+    /// and the one in use is not the one that gets forgotten.
+    #[test]
+    fn a_configuration_is_made_from_a_copy_of_another() {
+        let (_scratch, store) = store();
+
+        store
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "info" }),
+                None,
+                &[],
+            )
+            .expect("a section");
+        assert_eq!(store.configs().unwrap(), [NAME]);
+
+        std::fs::write(store.document_dir.join("notes.txt"), "not a configuration").unwrap();
+        store.create_config("copy", Some(NAME)).expect("a copy");
+        assert_eq!(store.configs().unwrap(), ["copy", NAME]);
+        assert_eq!(
+            store.config_document("copy").unwrap().value,
+            store.config_document(NAME).unwrap().value
+        );
+
+        // A name that is taken is refused rather than quietly replacing what
+        // somebody wrote.
+        assert!(matches!(
+            store.create_config("copy", None),
+            Err(Error::ConfigExists { .. })
+        ));
+        // A copy of nothing is refused rather than silently coming out empty.
+        assert!(matches!(
+            store.create_config("third", Some("gone")),
+            Err(Error::NoConfig { .. })
+        ));
+        // The configuration in use is not the one that gets forgotten.
+        assert!(matches!(
+            store.remove_config(NAME),
+            Err(Error::ConfigInUse { .. })
+        ));
+        assert!(matches!(
+            store.remove_config("gone"),
+            Err(Error::NoConfig { .. })
+        ));
+
+        store.remove_config("copy").expect("a removal");
+        assert_eq!(store.configs().unwrap(), [NAME]);
+    }
+
+    /// A name is a name, never a path.
+    #[test]
+    fn a_configuration_name_cannot_be_a_path() {
+        for name in [
+            "",
+            "a/b",
+            "..",
+            ".hidden",
+            "a\\b",
+            &"x".repeat(CONFIG_NAME_MAX + 1),
+        ] {
+            assert!(
+                matches!(config_name(name), Err(Error::ConfigName { .. })),
+                "{name}"
+            );
+        }
+
+        for name in ["default", "work-2", "a.b_c"] {
+            assert!(config_name(name).is_ok(), "{name}");
+        }
     }
 
     /// A write that names the document it read is refused once someone else
@@ -1241,10 +1453,11 @@ mod tests {
     #[test]
     fn a_write_against_a_stale_etag_is_refused() {
         let (_scratch, store) = store();
-        let before = store.document().unwrap().etag;
+        let before = store.config_document(NAME).unwrap().etag;
 
         let saved = store
             .write_section(
+                NAME,
                 "log",
                 serde_json::json!({ "level": "info" }),
                 Some(&before),
@@ -1254,6 +1467,7 @@ mod tests {
 
         assert!(matches!(
             store.write_section(
+                NAME,
                 "log",
                 serde_json::json!({ "level": "warn" }),
                 Some(&before),
@@ -1262,12 +1476,13 @@ mod tests {
             Err(Error::Stale)
         ));
         assert_eq!(
-            store.section("log").unwrap().0,
+            store.section(NAME, "log").unwrap().0,
             serde_json::json!({ "level": "info" }),
             "the refused write changed nothing"
         );
         assert!(store
             .write_section(
+                NAME,
                 "log",
                 serde_json::json!({ "level": "warn" }),
                 Some(&saved.etag),
@@ -1285,6 +1500,7 @@ mod tests {
 
         store
             .write_section(
+                NAME,
                 "outbounds",
                 serde_json::json!([direct("a"), direct("b")]),
                 None,
@@ -1293,6 +1509,7 @@ mod tests {
             .unwrap();
         store
             .write_entry(
+                NAME,
                 "outbounds",
                 "c",
                 serde_json::json!({ "type": "direct" }),
@@ -1301,12 +1518,12 @@ mod tests {
             )
             .unwrap();
         store
-            .write_entry("outbounds", "a", direct("a"), None, &[])
+            .write_entry(NAME, "outbounds", "a", direct("a"), None, &[])
             .unwrap();
 
         let tags = |store: &SingboxStore| -> Vec<String> {
             store
-                .section("outbounds")
+                .section(NAME, "outbounds")
                 .unwrap()
                 .0
                 .as_array()
@@ -1316,17 +1533,19 @@ mod tests {
                 .collect()
         };
         assert_eq!(tags(&store), ["a", "b", "c"]);
-        assert_eq!(store.entry("outbounds", "c").unwrap().0, direct("c"));
+        assert_eq!(store.entry(NAME, "outbounds", "c").unwrap().0, direct("c"));
 
         assert!(matches!(
-            store.write_entry("outbounds", "a", direct("renamed"), None, &[]),
+            store.write_entry(NAME, "outbounds", "a", direct("renamed"), None, &[]),
             Err(Error::Document(_))
         ));
 
-        store.remove_entry("outbounds", "b", None, &[]).unwrap();
+        store
+            .remove_entry(NAME, "outbounds", "b", None, &[])
+            .unwrap();
         assert_eq!(tags(&store), ["a", "c"]);
         assert!(matches!(
-            store.remove_entry("outbounds", "b", None, &[]),
+            store.remove_entry(NAME, "outbounds", "b", None, &[]),
             Err(Error::NoEntry { .. })
         ));
     }
@@ -1339,6 +1558,7 @@ mod tests {
 
         let saved = store
             .write_section(
+                NAME,
                 "outbounds",
                 serde_json::json!([{ "type": "selector", "tag": "s", "outbounds": ["gone"] }]),
                 None,
@@ -1363,6 +1583,7 @@ mod tests {
         assert!(matches!(
             store.set_settings(&Settings {
                 version: Some(Version::from_tag("1.99.0")),
+                config: Some(NAME.to_string()),
                 collections: Vec::new(),
             }),
             Err(Error::Singbox(
@@ -1376,7 +1597,13 @@ mod tests {
     fn the_assembled_configuration_lands_where_the_core_is_pointed() {
         let (_scratch, store) = store();
         store
-            .write_section("log", serde_json::json!({ "level": "warn" }), None, &[])
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "warn" }),
+                None,
+                &[],
+            )
             .expect("a section");
 
         let generated = vec![serde_json::json!({ "type": "direct", "tag": "node 1" })];
@@ -1445,7 +1672,13 @@ mod tests {
     fn a_broken_document_stops_a_start_and_leaves_the_product_alone() {
         let (_scratch, store) = store();
         store
-            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "info" }),
+                None,
+                &[],
+            )
             .expect("a section");
         store.assemble(&[]).expect("an assembly");
         let assembled = store.assemble(&[]).expect("an assembly");
@@ -1455,7 +1688,7 @@ mod tests {
         // A document the schema refuses, written by hand: the one way to get
         // one past `edit`, and what a start has to survive.
         std::fs::write(
-            store.document_dir.join(DOCUMENT),
+            store.document_dir.join(document_file(NAME)),
             r#"{"log": {"level": 7}}"#,
         )
         .expect("a broken document");
@@ -1495,7 +1728,13 @@ mod tests {
     fn a_broken_document_leaves_the_running_core_alone() {
         let (_scratch, store) = store();
         store
-            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "info" }),
+                None,
+                &[],
+            )
             .expect("a section");
 
         let pid = store.start(&[]).expect("a start");
@@ -1503,7 +1742,7 @@ mod tests {
 
         // The one way to get a broken document past `edit`.
         std::fs::write(
-            store.document_dir.join(DOCUMENT),
+            store.document_dir.join(document_file(NAME)),
             r#"{"log": {"level": 7}}"#,
         )
         .expect("a broken document");
@@ -1524,7 +1763,13 @@ mod tests {
     fn the_core_runs_and_stops_one_at_a_time() {
         let (_scratch, store) = store();
         store
-            .write_section("log", serde_json::json!({ "level": "info" }), None, &[])
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "info" }),
+                None,
+                &[],
+            )
             .expect("a section");
 
         let pid = store.start(&[]).expect("a start");
@@ -1577,6 +1822,7 @@ mod tests {
         store
             .set_settings(&Settings {
                 version: Some(version),
+                config: Some(NAME.to_string()),
                 collections: Vec::new(),
             })
             .expect("a current version");

@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use http::StatusCode;
@@ -38,6 +38,8 @@ const PATIENCE: Duration = Duration::from_secs(10);
 pub struct Core {
     /// The version in use, when one is chosen.
     pub version: Option<String>,
+    /// The configuration in use.
+    pub config: String,
     /// The collections whose nodes become outbounds, in order.
     pub collections: Vec<String>,
     /// Whether the chosen version's binary is where it should be.
@@ -52,11 +54,34 @@ pub struct Core {
 }
 
 /// What the operator chooses for the module.
+///
+/// All three are the resource, so all three are named: a settings request that
+/// left one out would silently reset it, which is the kind of change nobody
+/// asks for.
 #[derive(Debug, Deserialize)]
 pub struct Choose {
     pub version: Option<String>,
+    /// The configuration to run. A name whose document has not been written yet
+    /// reads as an empty one, which is how a module starts.
+    pub config: String,
     #[serde(default)]
     pub collections: Vec<String>,
+}
+
+/// One configuration this instance has.
+#[derive(Debug, Serialize)]
+pub struct ConfigView {
+    pub name: String,
+    /// Whether it is the one in use.
+    pub current: bool,
+}
+
+/// A configuration to make.
+#[derive(Debug, Deserialize)]
+pub struct NewConfig {
+    pub name: String,
+    /// An existing configuration to start from; absent starts empty.
+    pub copy: Option<String>,
 }
 
 fn core_view(store: &SingboxStore, note: Option<String>) -> Result<Core, Error> {
@@ -64,6 +89,7 @@ fn core_view(store: &SingboxStore, note: Option<String>) -> Result<Core, Error> 
 
     Ok(Core {
         version: settings.version.map(|version| version.as_str().to_string()),
+        config: store.config()?,
         collections: settings.collections,
         installed: store.binary_in_place()?,
         assembled: store.assembled(),
@@ -105,12 +131,12 @@ pub enum Command {
     Restart,
 }
 
-/// Replace the module's settings: the version in use and the collections that
-/// contribute outbounds.
+/// Replace the module's settings: the version in use, the configuration in use
+/// and the collections that contribute outbounds.
 ///
-/// Neither touches a running process — it keeps the version and configuration
-/// it started with — so the answer says so instead of pretending the change
-/// has taken effect.
+/// None of them touches a running process — it keeps the version and
+/// configuration it started with — so the answer says so instead of pretending
+/// the change has taken effect.
 pub async fn choose(
     State(state): State<AppState>,
     _auth: Authenticated,
@@ -119,6 +145,7 @@ pub async fn choose(
     let store = state.singbox();
     let settings = Settings {
         version: choose.version.as_deref().map(Version::from_tag),
+        config: Some(choose.config),
         collections: choose.collections,
     };
 
@@ -256,13 +283,73 @@ fn saved(saved: Saved) -> (HeaderMap, Json<Saved>) {
     (tagged(&saved.etag), Json(saved))
 }
 
-/// The configuration the operator wrote, whole.
+/// The configurations this instance has.
+pub async fn configs(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+) -> ResponseResult<Json<Vec<ConfigView>>> {
+    let store = state.singbox();
+
+    Ok(Json(
+        tokio::task::spawn_blocking(move || -> Result<Vec<ConfigView>, Error> {
+            let current = store.config()?;
+
+            Ok(store
+                .configs()?
+                .into_iter()
+                .map(|name| ConfigView {
+                    current: name == current,
+                    name,
+                })
+                .collect())
+        })
+        .await??,
+    ))
+}
+
+/// Make a configuration, from a copy of another or empty.
+pub async fn create_config(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Json(new): Json<NewConfig>,
+) -> ResponseResult<(StatusCode, Json<ConfigView>)> {
+    let store = state.singbox();
+
+    tokio::task::spawn_blocking(move || -> Result<_, Error> {
+        store.create_config(&new.name, new.copy.as_deref())?;
+
+        Ok((
+            StatusCode::CREATED,
+            Json(ConfigView {
+                current: store.config()? == new.name,
+                name: new.name,
+            }),
+        ))
+    })
+    .await?
+}
+
+/// Forget a configuration.
+pub async fn delete_config(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+    Path(name): Path<String>,
+) -> ResponseResult<Response> {
+    let store = state.singbox();
+    tokio::task::spawn_blocking(move || store.remove_config(&name)).await??;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// One configuration, whole.
 pub async fn config(
     State(state): State<AppState>,
     _auth: Authenticated,
+    Path(name): Path<String>,
 ) -> ResponseResult<(HeaderMap, Json<Value>)> {
     let store = state.singbox();
-    let Document { value, etag } = tokio::task::spawn_blocking(move || store.document()).await??;
+    let Document { value, etag } =
+        tokio::task::spawn_blocking(move || store.config_document(&name)).await??;
 
     Ok((tagged(&etag), Json(value)))
 }
@@ -271,6 +358,7 @@ pub async fn config(
 pub async fn write_config(
     State(state): State<AppState>,
     _auth: Authenticated,
+    Path(name): Path<String>,
     request: HeaderMap,
     Json(value): Json<Value>,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
@@ -280,20 +368,21 @@ pub async fn write_config(
 
     Ok(saved(
         tokio::task::spawn_blocking(move || {
-            store.write_document(value, expected.as_deref(), &generated)
+            store.write_document(&name, value, expected.as_deref(), &generated)
         })
         .await??,
     ))
 }
 
-/// One section of the configuration.
+/// One section of a configuration.
 pub async fn section(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path(section): Path<String>,
+    Path((name, section)): Path<(String, String)>,
 ) -> ResponseResult<(HeaderMap, Json<Value>)> {
     let store = state.singbox();
-    let (value, etag) = tokio::task::spawn_blocking(move || store.section(&section)).await??;
+    let (value, etag) =
+        tokio::task::spawn_blocking(move || store.section(&name, &section)).await??;
 
     Ok((tagged(&etag), Json(value)))
 }
@@ -302,7 +391,7 @@ pub async fn section(
 pub async fn write_section(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path(section): Path<String>,
+    Path((name, section)): Path<(String, String)>,
     request: HeaderMap,
     Json(value): Json<Value>,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
@@ -312,7 +401,7 @@ pub async fn write_section(
 
     Ok(saved(
         tokio::task::spawn_blocking(move || {
-            store.write_section(&section, value, expected.as_deref(), &generated)
+            store.write_section(&name, &section, value, expected.as_deref(), &generated)
         })
         .await??,
     ))
@@ -322,7 +411,7 @@ pub async fn write_section(
 pub async fn delete_section(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path(section): Path<String>,
+    Path((name, section)): Path<(String, String)>,
     request: HeaderMap,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
     let generated = generated(&state).await?;
@@ -331,7 +420,7 @@ pub async fn delete_section(
 
     Ok(saved(
         tokio::task::spawn_blocking(move || {
-            store.remove_section(&section, expected.as_deref(), &generated)
+            store.remove_section(&name, &section, expected.as_deref(), &generated)
         })
         .await??,
     ))
@@ -341,10 +430,11 @@ pub async fn delete_section(
 pub async fn entry(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path((section, tag)): Path<(String, String)>,
+    Path((name, section, tag)): Path<(String, String, String)>,
 ) -> ResponseResult<(HeaderMap, Json<Value>)> {
     let store = state.singbox();
-    let (value, etag) = tokio::task::spawn_blocking(move || store.entry(&section, &tag)).await??;
+    let (value, etag) =
+        tokio::task::spawn_blocking(move || store.entry(&name, &section, &tag)).await??;
 
     Ok((tagged(&etag), Json(value)))
 }
@@ -353,7 +443,7 @@ pub async fn entry(
 pub async fn write_entry(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path((section, tag)): Path<(String, String)>,
+    Path((name, section, tag)): Path<(String, String, String)>,
     request: HeaderMap,
     Json(value): Json<Value>,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
@@ -363,7 +453,14 @@ pub async fn write_entry(
 
     Ok(saved(
         tokio::task::spawn_blocking(move || {
-            store.write_entry(&section, &tag, value, expected.as_deref(), &generated)
+            store.write_entry(
+                &name,
+                &section,
+                &tag,
+                value,
+                expected.as_deref(),
+                &generated,
+            )
         })
         .await??,
     ))
@@ -373,7 +470,7 @@ pub async fn write_entry(
 pub async fn delete_entry(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Path((section, tag)): Path<(String, String)>,
+    Path((name, section, tag)): Path<(String, String, String)>,
     request: HeaderMap,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
     let generated = generated(&state).await?;
@@ -382,7 +479,7 @@ pub async fn delete_entry(
 
     Ok(saved(
         tokio::task::spawn_blocking(move || {
-            store.remove_entry(&section, &tag, expected.as_deref(), &generated)
+            store.remove_entry(&name, &section, &tag, expected.as_deref(), &generated)
         })
         .await??,
     ))
@@ -665,6 +762,7 @@ mod version_view_tests {
         store
             .write_settings(&Settings {
                 version: Some(version.clone()),
+                config: Some("default".to_string()),
                 collections: Vec::new(),
             })
             .unwrap();

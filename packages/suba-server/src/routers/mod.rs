@@ -355,6 +355,125 @@ mod tests {
         assert!((1..=60).contains(&wait), "{wait}");
     }
 
+    /// Configurations are named resources: made, listed, addressed by name, and
+    /// the one in use is the one that is not forgotten.
+    #[cfg(feature = "singbox-core")]
+    #[tokio::test]
+    async fn configurations_are_addressed_by_name() {
+        let server = Server::start().await;
+        let listed = |server: &Server| {
+            server
+                .authed(reqwest::Method::GET, "/api/cores/sing-box/configs")
+                .send()
+        };
+        let create = |server: &Server, body: Value| {
+            server
+                .authed(reqwest::Method::POST, "/api/cores/sing-box/configs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.to_string())
+                .send()
+        };
+
+        // Nothing has been written yet, and a name whose document has not been
+        // written reads as an empty configuration rather than as a missing one.
+        assert_eq!(body(listed(&server).await.unwrap()).await, json!([]));
+
+        let empty = server
+            .authed(reqwest::Method::GET, "/api/cores/sing-box/configs/default")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), 200);
+        assert_eq!(body(empty).await, json!({}));
+
+        let made = create(&server, json!({ "name": "second" })).await.unwrap();
+        assert_eq!(made.status(), 201);
+        assert_eq!(
+            body(made).await,
+            json!({ "name": "second", "current": false })
+        );
+        assert_eq!(
+            body(listed(&server).await.unwrap()).await,
+            json!([{ "name": "second", "current": false }])
+        );
+
+        // The name is taken, so asking for it again is refused rather than
+        // quietly replacing what somebody wrote.
+        assert_eq!(
+            create(&server, json!({ "name": "second" }))
+                .await
+                .unwrap()
+                .status(),
+            409
+        );
+
+        let copied = create(&server, json!({ "name": "copy", "copy": "second" }))
+            .await
+            .unwrap();
+        assert_eq!(copied.status(), 201);
+
+        // A name that could not be a file name is refused where the name is
+        // read, on the collection and on the resource alike.
+        assert_eq!(
+            create(&server, json!({ "name": "a/b" }))
+                .await
+                .unwrap()
+                .status(),
+            422
+        );
+        let traversal = server
+            .authed(
+                reqwest::Method::GET,
+                "/api/cores/sing-box/configs/..%2Fescape",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(traversal.status(), 422);
+
+        // The configuration in use is the one that is not forgotten.
+        let chosen = server
+            .put_json(
+                "/api/cores/sing-box",
+                json!({ "version": null, "config": "second", "collections": [] }),
+            )
+            .await;
+        assert_eq!(chosen.status(), 200);
+        assert_eq!(body(chosen).await["config"], json!("second"));
+
+        let refused = server
+            .authed(
+                reqwest::Method::DELETE,
+                "/api/cores/sing-box/configs/second",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 409);
+
+        let gone = server
+            .authed(reqwest::Method::DELETE, "/api/cores/sing-box/configs/copy")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), 204);
+        assert_eq!(
+            body(listed(&server).await.unwrap()).await,
+            json!([{ "name": "second", "current": true }])
+        );
+
+        // A section of a named configuration: the route reaches the store, and
+        // with no version installed there is no schema to check against, which
+        // is the answer it stops at.
+        let section = server
+            .put_json(
+                "/api/cores/sing-box/configs/second/sections/log",
+                json!({ "level": "info" }),
+            )
+            .await;
+        assert_eq!(section.status(), 409);
+    }
+
     /// The `ETag` a read answers with is the one a write can name, quotes and
     /// all, and a stale one is refused before anything else is looked at.
     #[cfg(feature = "singbox-core")]
@@ -363,7 +482,7 @@ mod tests {
         let server = Server::start().await;
 
         let read = server
-            .authed(reqwest::Method::GET, "/api/cores/sing-box/config")
+            .authed(reqwest::Method::GET, "/api/cores/sing-box/configs/default")
             .send()
             .await
             .unwrap();
@@ -373,7 +492,10 @@ mod tests {
 
         let write = |if_match: &str| {
             server
-                .authed(reqwest::Method::PUT, "/api/cores/sing-box/config/log")
+                .authed(
+                    reqwest::Method::PUT,
+                    "/api/cores/sing-box/configs/default/sections/log",
+                )
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::IF_MATCH, if_match.to_string())
                 .body(json!({"level": "info"}).to_string())
