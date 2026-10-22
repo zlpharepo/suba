@@ -89,6 +89,9 @@ impl AppRouter {
 /// headers added after a handler returns — is pinned rather than smoke-tested.
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "singbox-core")]
+    mod references;
+
     use http::header;
     use serde_json::{json, Value};
 
@@ -556,11 +559,17 @@ mod tests {
     async fn a_build_without_the_core_has_no_core_routes() {
         let server = Server::start().await;
 
-        let absent = server
-            .authed(reqwest::Method::GET, "/api/cores/sing-box")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(absent.status(), 404);
+        for path in [
+            "/api/cores/sing-box",
+            "/api/cores/sing-box/configs/default/references",
+            "/api/cores/sing-box/references",
+        ] {
+            let absent = server
+                .authed(reqwest::Method::GET, path)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(absent.status(), 404);
+        }
     }
 }

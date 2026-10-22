@@ -16,7 +16,7 @@ use axum::{
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use suba_singbox::assemble::{self, Tag};
+use suba_singbox::assemble;
 use suba_singbox::core::{Release, Version};
 use suba_singbox::install::{Generate, Needs};
 use suba_singbox::run::{self, Exit, Status};
@@ -26,7 +26,7 @@ use crate::{
     error::Error,
     handlers::collections::outbounds_of,
     state::singbox::{
-        Document, InstallationTask, Privilege, RuntimePhase, Saved, Settings, SingboxStore,
+        Document, InstallationTask, Privilege, RuntimePhase, Saved, Settings, SingboxStore, Tag,
     },
     AppState,
 };
@@ -1142,21 +1142,23 @@ pub async fn generate(
     }))
 }
 
-/// The tags a form can offer as references, and what was not checked about them.
+/// Tagged definitions for editor previews; listing is not runtime validation.
 #[derive(Debug, Serialize)]
 pub struct References {
     pub tags: Vec<Tag>,
+    /// Catalog presence does not imply validation; retain runtime's stated gaps.
     pub unchecked: &'static [assemble::Unchecked],
 }
 
-/// What a form can point at.
+/// The named configuration and selected collections, without assembly or refresh.
 pub async fn references(
     State(state): State<AppState>,
     _auth: Authenticated,
+    Path(name): Path<String>,
 ) -> ResponseResult<Json<References>> {
     let generated = generated(&state).await?;
     let store = state.singbox();
-    let tags = tokio::task::spawn_blocking(move || store.references(&generated)).await??;
+    let tags = tokio::task::spawn_blocking(move || store.references(&name, &generated)).await??;
 
     Ok(Json(References {
         tags,

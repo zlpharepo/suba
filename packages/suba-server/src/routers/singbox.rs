@@ -27,6 +27,7 @@ pub fn route() -> Router<AppState> {
                 .put(singbox::write_config)
                 .delete(singbox::delete_config),
         )
+        .route("/configs/{name}/references", get(singbox::references))
         .route(
             "/configs/{name}/sections/{section}",
             get(singbox::section)
@@ -49,5 +50,4 @@ pub fn route() -> Router<AppState> {
         .route("/releases", get(singbox::releases))
         .route("/schema", get(singbox::schema))
         .route("/generate", post(singbox::generate))
-        .route("/references", get(singbox::references))
 }

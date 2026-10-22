@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use suba_singbox::assemble::{self, Assembled, Tag};
+use suba_singbox::assemble::{self, Assembled};
 use suba_singbox::core::{self, Asset, Dirs, Metadata, Release, Version};
 use suba_singbox::install::{self, Generate};
 use suba_singbox::run::{self, Runner, Status};
@@ -37,6 +37,9 @@ use suba_singbox::schema::{Schema, Skipped, Verdict};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{error::Error, fs, identity::Identity};
+
+mod references;
+pub(crate) use references::Tag;
 
 /// The directory the operator's configurations live in, under the config
 /// directory.
@@ -877,16 +880,13 @@ impl SingboxStore {
         })
     }
 
-    /// The tags a form can offer as references.
-    ///
-    /// Read from the document and the generated outbounds, without requiring it
-    /// to hold up: the operator is still writing it, and the tags that exist so
-    /// far are exactly what the next field needs.
-    pub(crate) fn references(&self, generated: &[Value]) -> Result<Vec<Tag>, Error> {
-        let document = assemble::document(&self.current_document()?.value, generated)
-            .map_err(|unfit| Error::Document(unfit.to_string()))?;
-
-        assemble::tags(&document).map_err(|unfit| Error::Document(unfit.to_string()))
+    /// Suggestions use the named saved document, not the active runtime config.
+    /// Collisions remain visible and do not prevent editing other references.
+    pub(crate) fn references(&self, name: &str, generated: &[Value]) -> Result<Vec<Tag>, Error> {
+        Ok(references::catalog(
+            &self.config_document(name)?.value,
+            generated,
+        ))
     }
 
     /// The schema of the version in use, parsed, with the bytes it came from.
