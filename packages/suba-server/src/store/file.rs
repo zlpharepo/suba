@@ -171,11 +171,7 @@ mod tests {
             payload: payload.to_string(),
             fetched_at: Some(1_700_000_000),
             content_hash: Some("abc".to_string()),
-            sighting: std::collections::BTreeMap::from([(
-                suba_core::proto::NodeFingerprint::parse("00000000000000000000000000000001")
-                    .expect("a fingerprint"),
-                1_700_000_000,
-            )]),
+            updated_at: Some(1_700_000_000),
             ..Observation::default()
         }
     }

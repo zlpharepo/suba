@@ -206,13 +206,7 @@ impl Format {
         let mut body = String::new();
 
         for entry in nodes {
-            let Some(node) = entry.node.as_ref() else {
-                skipped.push(orphan(entry));
-
-                continue;
-            };
-
-            match write_link(node) {
+            match write_link(&entry.node) {
                 Ok(link) => {
                     body.push_str(&link);
                     body.push('\n');
@@ -221,7 +215,7 @@ impl Format {
                 // model said about it.
                 Err(error) => skipped.push(Skipped {
                     id: entry.id,
-                    name: entry.name().map(str::to_owned),
+                    name: Some(entry.name().to_owned()),
                     reason: SkipReason::Refused {
                         kind: error.kind(),
                         reason: error.to_string(),
@@ -248,35 +242,19 @@ impl Format {
     /// A clash document, as the dialect writes it.
     #[cfg(feature = "clash")]
     fn render_clash(self, nodes: &[&IndexEntry], skipped: &mut Vec<Skipped>) -> String {
-        // What can be written at all: a node nobody serves has no content, so it
-        // is not the dialect's to refuse.
-        let writable: Vec<(&IndexEntry, &Node<Client>)> = nodes
+        let named: Vec<(&str, &Node<Client>)> = nodes
             .iter()
-            .filter_map(|entry| match entry.node.as_ref() {
-                Some(node) => Some((*entry, node)),
-                None => {
-                    skipped.push(orphan(entry));
-
-                    None
-                }
-            })
-            .collect();
-
-        let named: Vec<(&str, &Node<Client>)> = writable
-            .iter()
-            .map(|(entry, node)| (entry.name().unwrap_or_default(), *node))
+            .map(|entry| (entry.name(), &entry.node))
             .collect();
 
         let (body, refused) = suba_clash::client_config(&named);
 
-        // A refusal names a position in what the dialect was given, which is the
-        // position in `writable`: orphans were taken out before it was called.
         for refusal in refused {
-            let (entry, _) = writable[refusal.index];
+            let entry = nodes[refusal.index];
 
             skipped.push(Skipped {
                 id: entry.id,
-                name: entry.name().map(str::to_owned),
+                name: Some(entry.name().to_owned()),
                 reason: match refusal.reason {
                     suba_clash::Reason::Protocol(kind) => SkipReason::Protocol(kind),
                     suba_clash::Reason::Transport(carriage) => SkipReason::Transport(carriage),
@@ -295,16 +273,6 @@ impl Format {
     }
 }
 
-/// A node no document can contain: nothing serves it any more, so there is no
-/// content to write into one. `IndexEntry` keeps the identity and the history,
-/// deliberately not a copy of a payload that is gone.
-fn orphan(entry: &IndexEntry) -> Skipped {
-    Skipped {
-        id: entry.id,
-        name: None,
-        reason: SkipReason::Orphan,
-    }
-}
 /// The outbounds a set of nodes contributes to a configuration this host runs.
 ///
 /// The same walk a rendered sing-box document takes, stopping one step earlier:
@@ -315,57 +283,29 @@ fn orphan(entry: &IndexEntry) -> Skipped {
 #[cfg(feature = "singbox")]
 pub fn outbounds(entries: &[&IndexEntry]) -> (Vec<serde_json::Value>, Vec<Skipped>) {
     let mut skipped = Vec::new();
-    let writable = writable(entries, &mut skipped);
-
-    let named: Vec<(&str, &Node<Client>)> = writable
+    let named: Vec<(&str, &Node<Client>)> = entries
         .iter()
-        .map(|(entry, node)| (entry.name().unwrap_or_default(), *node))
+        .map(|entry| (entry.name(), &entry.node))
         .collect();
 
     let (outbounds, refused) = suba_singbox::outbounds(&named);
-    refusals(&writable, refused, &mut skipped);
+    refusals(entries, refused, &mut skipped);
 
     (outbounds, skipped)
 }
 
-/// The entries a document can hold at all.
-///
-/// A node nobody serves any more has no content, so leaving it out is a fact
-/// about the index rather than something a dialect decided.
-#[cfg(feature = "singbox")]
-fn writable<'a>(
-    entries: &[&'a IndexEntry],
-    skipped: &mut Vec<Skipped>,
-) -> Vec<(&'a IndexEntry, &'a Node<Client>)> {
-    entries
-        .iter()
-        .filter_map(|entry| match entry.node.as_ref() {
-            Some(node) => Some((*entry, node)),
-            None => {
-                skipped.push(orphan(entry));
-
-                None
-            }
-        })
-        .collect()
-}
-
-/// Which entry each refusal came from.
-///
-/// A dialect reports a position in what it was given, which is the position in
-/// `writable`: the orphans were taken out before it was called.
 #[cfg(feature = "singbox")]
 fn refusals(
-    writable: &[(&IndexEntry, &Node<Client>)],
+    entries: &[&IndexEntry],
     refused: Vec<suba_singbox::Refused>,
     skipped: &mut Vec<Skipped>,
 ) {
     for refusal in refused {
-        let (entry, _) = writable[refusal.index];
+        let entry = entries[refusal.index];
 
         skipped.push(Skipped {
             id: entry.id,
-            name: entry.name().map(str::to_owned),
+            name: Some(entry.name().to_owned()),
             reason: match refusal.reason {
                 suba_singbox::Reason::Protocol(kind) => SkipReason::Protocol(kind),
                 suba_singbox::Reason::Transport(carriage) => SkipReason::Transport(carriage),
@@ -485,8 +425,6 @@ pub enum SkipReason {
     Protocol(Kind),
     /// The format has no representation for how the node is carried.
     Transport(String),
-    /// Nothing serves it any more, so there is no content to write.
-    Orphan,
     /// The model refused to write it, with a typed kind and the model's own
     /// static explanation — never a value from the node.
     Refused {
@@ -549,7 +487,7 @@ mod tests {
     }
 
     fn entries(index: &NodeIndex) -> Vec<&IndexEntry> {
-        index.served().collect()
+        index.entries().iter().collect()
     }
 
     /// The other half of the same walk: the values an assembly merges, rather
@@ -624,10 +562,8 @@ mod tests {
             rendered.skipped
         );
 
-        // The index orders nodes by when they were first seen, not by the order a
-        // payload listed them, and two fixtures that differ only in something the
-        // identity ignores are one node — so the document is compared against the
-        // shapes the fixtures can become, not line by line.
+        // Fixtures differing only in identity-ignored fields collapse within
+        // this provider, so compare against the shapes the fixtures can become.
         let mut written: Vec<&str> = rendered.body.lines().collect();
         let mut expected: Vec<String> = Vec::new();
         let mut identities = std::collections::BTreeSet::new();
@@ -703,37 +639,6 @@ mod tests {
             links.body
         );
         assert_eq!(wrapped.skipped, links.skipped);
-    }
-
-    /// A node nothing serves has no content, so no document can contain it.
-    #[test]
-    fn a_node_nobody_serves_is_left_out_with_its_reason() {
-        let fixtures = links();
-        let kept = proto::parse_link(&fixtures[0]).expect("the fixture parses");
-        let dropped = proto::parse_link(&fixtures[2]).expect("the fixture parses");
-
-        // A node the provider has served and dropped: the sighting keeps it, the
-        // payload does not.
-        let held = Observation {
-            payload: payload(&fixtures[..1]),
-            checked_at: Some(1_700_000_000),
-            sighting: [(kept.id(), 1_700_000_000), (dropped.id(), 1_700_000_000)]
-                .into_iter()
-                .collect(),
-            ..Observation::default()
-        };
-
-        let index = NodeIndex::from_observations([("airport", &held)]);
-        let all: Vec<&IndexEntry> = index.entries().iter().collect();
-        let rendered = Format::Links
-            .render(&all, RenderIntent::Client)
-            .expect("a client document");
-
-        assert_eq!(rendered.body.lines().count(), 1);
-        assert_eq!(rendered.skipped.len(), 1);
-        assert_eq!(rendered.skipped[0].id, dropped.id());
-        assert_eq!(rendered.skipped[0].name, None);
-        assert_eq!(rendered.skipped[0].reason, SkipReason::Orphan);
     }
 
     #[test]
@@ -984,11 +889,57 @@ mod tests {
         assert_eq!(written.name, node.name);
     }
 
+    #[test]
+    fn resolved_names_are_written_by_every_compiled_format() {
+        let held = observation(&["trojan://PASSWORD@example.com:443#Node".to_string()]);
+        let index = NodeIndex::from_observations([("alpha", &held), ("beta", &held)]);
+        let mut named = index.entries().to_vec();
+        crate::name_conflicts(&mut named);
+        let entries: Vec<_> = named.iter().collect();
+        let expected = ["[alpha] Node", "[beta] Node"];
+
+        for format in Format::all() {
+            let rendered = format.render(&entries, RenderIntent::Client).unwrap();
+            assert!(rendered.skipped.is_empty());
+            match format {
+                Format::Links | Format::Base64 => {
+                    let body = if *format == Format::Base64 {
+                        proto::base64::decode_to_string(rendered.body.as_bytes()).unwrap()
+                    } else {
+                        rendered.body
+                    };
+                    let names: Vec<_> = body
+                        .lines()
+                        .map(|line| proto::parse_link(line).unwrap().name.as_str().to_string())
+                        .collect();
+                    assert_eq!(names, expected);
+                }
+                #[cfg(feature = "singbox")]
+                Format::Singbox => {
+                    let document: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
+                    let names: Vec<_> = document["outbounds"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|node| node["tag"].as_str().unwrap())
+                        .collect();
+                    assert_eq!(names, expected);
+                }
+                #[cfg(feature = "clash")]
+                Format::Clash => {
+                    for name in expected {
+                        assert!(rendered.body.contains(name));
+                    }
+                }
+            }
+        }
+    }
+
     /// The subscription parser and the renderer agree on what a node is.
     #[test]
     fn what_the_subscription_parser_reads_is_what_the_renderer_writes() {
         let fixtures = links();
-        let parsed = subscription::parse(payload(&fixtures).as_bytes(), "airport", 1_700_000_000);
+        let parsed = subscription::parse(payload(&fixtures).as_bytes(), "airport");
 
         let index = index(&fixtures);
         let rendered = Format::Links

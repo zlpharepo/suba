@@ -10,7 +10,7 @@ use axum::{
 use http::{header, HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use suba_core::format::{Format, RenderIntent};
-use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source, View};
+use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source};
 
 #[cfg(feature = "singbox-core")]
 use crate::state::singbox::GeneratedOutbound;
@@ -31,20 +31,12 @@ use crate::{
 /// them.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeView {
-    /// The node's identity, which is what it is: two providers serving it, or
-    /// two names for it, are one entry.
+    /// Content identity is shared across providers; a row also belongs to its source.
     pub id: String,
-    /// The name it is served under, when someone serves it.
-    pub name: Option<String>,
-    /// The protocol, by the name the model uses for it.
-    pub protocol: Option<String>,
-    /// Where a client dials, when someone serves it.
-    pub endpoint: Option<String>,
-    /// When this instance first saw it, from any provider.
-    pub first_seen: i64,
-    /// Whether nothing serves it any more.
-    pub orphan: bool,
-    /// Everyone that has served it, whoever was first.
+    pub name: String,
+    pub protocol: String,
+    pub endpoint: String,
+    /// The current source, without credentials or historical timestamps.
     pub sources: Vec<SourceView>,
 }
 
@@ -53,12 +45,8 @@ pub struct NodeView {
 pub struct SourceView {
     /// The provider that served it.
     pub provider: String,
-    /// What that provider called it, when it still serves it.
-    pub name: Option<String>,
-    /// When that provider first served it.
-    pub first_seen: i64,
-    /// Whether that provider's current payload still lists it.
-    pub serving: bool,
+    /// The name in that provider's current payload, before collection disambiguation.
+    pub name: String,
 }
 
 /// What a collection resolves to, for a caller that wants the structure rather
@@ -70,28 +58,22 @@ pub struct SourceView {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Nodes {
     pub name: String,
-    /// The nodes, oldest first, orphans included and marked.
+    /// Current entries, in listed provider order followed by payload order.
     pub nodes: Vec<NodeView>,
     /// How many nodes a filter passed over.
     pub passed_over: usize,
-    /// How many nodes nothing serves any more.
-    pub orphans: usize,
     /// Providers this collection names that the instance does not have.
     pub unresolved: Vec<String>,
 }
 
 impl From<&IndexEntry> for NodeView {
     fn from(entry: &IndexEntry) -> Self {
-        let node = entry.node.as_ref();
-
         Self {
             id: entry.id.to_string(),
-            name: entry.name().map(str::to_owned),
-            protocol: node.map(|node| node.protocol.kind().as_str().to_owned()),
-            endpoint: node.map(|node| node.endpoint.to_string()),
-            first_seen: entry.first_seen,
-            orphan: entry.is_orphan(),
-            sources: entry.sources.iter().map(SourceView::from).collect(),
+            name: entry.name().to_owned(),
+            protocol: entry.node.protocol.kind().as_str().to_owned(),
+            endpoint: entry.node.endpoint.to_string(),
+            sources: vec![SourceView::from(&entry.source)],
         }
     }
 }
@@ -101,8 +83,6 @@ impl From<&Source> for SourceView {
         Self {
             provider: source.provider.clone(),
             name: source.name.clone(),
-            first_seen: source.first_seen,
-            serving: source.serving,
         }
     }
 }
@@ -142,7 +122,6 @@ pub async fn index(
             &index,
             &provider_filters(&state, &collection).await?,
             &collection.filter()?,
-            View::default(),
         );
         let nodes = resolved.nodes.len();
         let unresolved = resolved.unresolved;
@@ -342,9 +321,6 @@ pub(crate) async fn artifact_of(
         &index,
         &provider_filters(state, &collection).await?,
         &collection.filter()?,
-        // A delivery carries what is served now: an orphan has no content, so
-        // there is nothing to hand anyone.
-        View::default(),
     );
 
     let nodes = resolved.nodes;
@@ -352,7 +328,7 @@ pub(crate) async fn artifact_of(
     // The direction is asked for explicitly, and today every compiled format
     // writes the client one; a format that grew a server direction would have to
     // say so in its descriptor first.
-    let rendered = format.render(&nodes, RenderIntent::Client)?;
+    let rendered = format.render(&nodes.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
     let artifact = std::sync::Arc::new(Artifact {
         body: rendered.body.into(),
         format,
@@ -569,6 +545,35 @@ mod artifact_tests {
         );
     }
 
+    #[tokio::test]
+    async fn collection_delivery_keeps_distinct_provider_entries_in_source_order() {
+        let state = state().await;
+        let shared = link("shared.example.com", "Shared");
+        inline(
+            &state,
+            "alpha",
+            &format!("{shared}{}", link("alpha.example.com", "Unique")),
+        )
+        .await;
+        inline(&state, "beta", &shared).await;
+        collection(&state, "main", &["beta", "alpha"]).await;
+
+        let artifact = artifact_of(&state, "main", Format::Links).await.unwrap().0;
+        let names: Vec<_> = artifact
+            .body
+            .lines()
+            .map(|line| {
+                suba_core::proto::parse_link(line)
+                    .expect("a rendered fixture link")
+                    .name
+                    .as_str()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(artifact.nodes, 3);
+        assert_eq!(names, ["[beta] Shared", "[alpha] Shared", "Unique"]);
+    }
+
     /// The artifact is the shape the request names, and two shapes of one
     /// collection are two artifacts.
     #[cfg(feature = "clash")]
@@ -733,16 +738,14 @@ mod artifact_tests {
         ]
         .map(str::to_string);
         let outbounds = outbounds_of(&state, &selected).await.unwrap();
-        assert_eq!(outbounds.len(), 3);
-        for (port, tag, contributors) in [
-            (443, "shared-first", vec!["second", "shared-only", "first"]),
-            (444, "collision 2", vec!["first"]),
-            (445, "collision", vec!["second"]),
-        ] {
-            let outbound = outbounds
-                .iter()
-                .find(|outbound| outbound.value["server_port"] == port)
-                .expect("each admitted identity is rendered once");
+        assert_eq!(outbounds.len(), 4);
+        for (outbound, (port, tag, contributors)) in outbounds.iter().zip([
+            (443, "[beta] shared-second", vec!["second"]),
+            (445, "[beta] collision", vec!["second"]),
+            (443, "[alpha] shared-first", vec!["shared-only", "first"]),
+            (444, "[alpha] collision", vec!["first"]),
+        ]) {
+            assert_eq!(outbound.value["server_port"], port);
             assert_eq!(outbound.value["tag"], tag);
             assert_eq!(outbound.collections, contributors);
         }
@@ -779,8 +782,8 @@ mod artifact_tests {
 
         assert_eq!(outbounds.len(), 2);
         for (outbound, (port, tag, contributors)) in outbounds.iter().zip([
-            (444, "collision 2", vec!["alpha", "shared"]),
-            (445, "collision 3", vec!["beta"]),
+            (444, "[alpha] collision", vec!["alpha", "shared"]),
+            (445, "[beta] collision", vec!["beta"]),
         ]) {
             assert_eq!(outbound.value["server_port"], port);
             assert_eq!(outbound.value["tag"], tag);
@@ -796,10 +799,6 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
         .await
         .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
 
-    // The index is built from **every** provider, not only the ones this
-    // collection names: a node's spelling and its history are facts about the
-    // instance, and a view assembled from a subset would disagree with the
-    // others about the same node.
     let observations = state.providers().observations().await?;
     let index = NodeIndex::from_observations(
         observations
@@ -812,27 +811,18 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
         &index,
         &provider_filters(state, &collection).await?,
         &filter,
-        // The structure is where an orphan is worth seeing: it has no content,
-        // so nothing can be served from it, but it is the evidence that a
-        // provider used to serve it.
-        View { orphans: true },
     );
 
     Ok(Nodes {
         name: name.to_owned(),
-        nodes: resolved
-            .nodes
-            .iter()
-            .map(|entry| NodeView::from(*entry))
-            .collect(),
+        nodes: resolved.nodes.iter().map(NodeView::from).collect(),
         passed_over: resolved.passed_over,
-        orphans: resolved.orphans,
         unresolved: resolved.unresolved,
     })
 }
 
 /// The outbounds the named collections contribute to a sing-box configuration,
-/// in selected order, with every collection that admits each node's identity.
+/// in selected order, with every collection that admits each provider entry.
 ///
 /// A collection that does not exist is an error naming it: an empty
 /// contribution would look like a collection that serves nothing.
@@ -848,7 +838,7 @@ pub(crate) async fn outbounds_of(
             .map(|(name, observation)| (name.as_str(), observation)),
     );
 
-    let mut nodes: Vec<&IndexEntry> = Vec::new();
+    let mut nodes: Vec<IndexEntry> = Vec::new();
     let mut collections = BTreeMap::<_, Vec<String>>::new();
     for name in names {
         let collection = state
@@ -860,13 +850,13 @@ pub(crate) async fn outbounds_of(
             &index,
             &provider_filters(state, &collection).await?,
             &collection.filter()?,
-            View::default(),
         );
 
-        // A shared identity is rendered once, but every admitting collection
-        // contributes to it, even when its provider uses a different name.
+        // Overlapping collections share an entry only when its provider also
+        // matches. Equal content from distinct providers remains distinct.
         for entry in resolved.nodes {
-            let contributors = collections.entry(entry.id).or_insert_with(|| {
+            let key = (entry.source.provider.clone(), entry.id);
+            let contributors = collections.entry(key).or_insert_with(|| {
                 nodes.push(entry);
                 Vec::new()
             });
@@ -876,7 +866,8 @@ pub(crate) async fn outbounds_of(
         }
     }
 
-    let (outbounds, skipped) = suba_core::outbounds(&nodes);
+    suba_core::name_conflicts(&mut nodes);
+    let (outbounds, skipped) = suba_core::outbounds(&nodes.iter().collect::<Vec<_>>());
     let skipped: std::collections::BTreeSet<_> =
         skipped.into_iter().map(|entry| entry.id).collect();
 
@@ -888,7 +879,9 @@ pub(crate) async fn outbounds_of(
         .zip(outbounds)
         .map(|(entry, value)| GeneratedOutbound {
             value,
-            collections: collections.remove(&entry.id).expect("resolved identity"),
+            collections: collections
+                .remove(&(entry.source.provider, entry.id))
+                .expect("resolved provider entry"),
         })
         .collect())
 }
@@ -989,12 +982,10 @@ mod tests {
     fn named<'a>(nodes: &'a [NodeView], name: &str) -> &'a NodeView {
         nodes
             .iter()
-            .find(|node| node.name.as_deref() == Some(name))
+            .find(|node| node.name == name)
             .unwrap_or_else(|| panic!("no node named {name}"))
     }
 
-    /// Nodes that arrive in the same second are ordered by identity, not by
-    /// name, so tests look nodes up by name.
     #[tokio::test]
     async fn the_view_reports_the_nodes_a_collection_serves() {
         let state = state().await;
@@ -1011,29 +1002,29 @@ mod tests {
         let nodes = nodes_of(&state, "main").await.unwrap();
 
         assert_eq!(nodes.name, "main");
-        assert_eq!(nodes.nodes.len(), 2, "the shared node is one node");
+        assert_eq!(
+            nodes.nodes.len(),
+            3,
+            "distinct providers keep separate entries"
+        );
         assert_eq!(nodes.passed_over, 0);
-        assert_eq!(nodes.orphans, 0);
         assert!(nodes.unresolved.is_empty());
-
-        let shared = named(&nodes.nodes, "Shared");
-        assert_eq!(shared.protocol.as_deref(), Some("trojan"));
-        assert_eq!(shared.endpoint.as_deref(), Some("alpha.example.com:443"));
-        assert!(!shared.orphan);
         assert_eq!(
-            shared
-                .sources
+            nodes
+                .nodes
                 .iter()
-                .map(|source| source.provider.as_str())
+                .map(|node| node.name.as_str())
                 .collect::<Vec<_>>(),
-            ["alpha", "beta"]
+            ["[alpha] Shared", "JP-01", "[beta] Shared"]
         );
-        assert_eq!(
-            shared.sources[1].name.as_deref(),
-            Some("Shared"),
-            "each provider's spelling is its own"
-        );
-        assert!(shared.sources.iter().all(|source| source.serving));
+        let shared = named(&nodes.nodes, "[alpha] Shared");
+        assert_eq!(shared.protocol, "trojan");
+        assert_eq!(shared.endpoint, "alpha.example.com:443");
+        assert_eq!(shared.sources[0].provider, "alpha");
+        assert_eq!(shared.sources[0].name, "Shared");
+        let other = named(&nodes.nodes, "[beta] Shared");
+        assert_eq!(other.id, shared.id);
+        assert_eq!(other.sources[0].provider, "beta");
     }
 
     /// The view is a structure, and a node's credentials are not part of it.
@@ -1078,7 +1069,7 @@ mod tests {
 
         let nodes = nodes_of(&state, "main").await.unwrap();
         assert_eq!(nodes.nodes.len(), 1);
-        assert_eq!(nodes.nodes[0].name.as_deref(), Some("US-01"));
+        assert_eq!(nodes.nodes[0].name, "US-01");
         assert_eq!(nodes.passed_over, 1);
 
         // The same nodes, without the collection's filter: all three are served.
@@ -1115,11 +1106,7 @@ mod tests {
 
         let nodes = nodes_of(&state, "main").await.unwrap();
 
-        let mut names: Vec<&str> = nodes
-            .nodes
-            .iter()
-            .filter_map(|node| node.name.as_deref())
-            .collect();
+        let mut names: Vec<&str> = nodes.nodes.iter().map(|node| node.name.as_str()).collect();
         names.sort_unstable();
 
         assert_eq!(
@@ -1130,9 +1117,8 @@ mod tests {
         assert_eq!(nodes.passed_over, 1);
     }
 
-    /// A node a provider stopped serving is still shown, marked.
     #[tokio::test]
-    async fn an_orphan_is_shown_and_marked() {
+    async fn removed_provider_nodes_disappear_from_collection_views() {
         let state = state().await;
         let kept = link("alpha.example.com", "Kept");
         let gone = link("delta.example.com", "Gone");
@@ -1143,22 +1129,9 @@ mod tests {
 
         let nodes = nodes_of(&state, "main").await.unwrap();
 
-        assert_eq!(nodes.orphans, 1);
-        assert_eq!(nodes.nodes.len(), 2, "the orphan is in the view");
-
-        let orphan = nodes
-            .nodes
-            .iter()
-            .find(|node| node.orphan)
-            .expect("an orphan");
-        assert_eq!(orphan.name, None);
-        assert_eq!(orphan.protocol, None);
-        assert_eq!(orphan.endpoint, None);
-        assert!(!orphan.sources[0].serving);
-        assert_eq!(
-            orphan.sources[0].provider, "alpha",
-            "who used to serve it is still known"
-        );
+        assert_eq!(nodes.nodes.len(), 1);
+        assert_eq!(nodes.nodes[0].name, "Kept");
+        assert_eq!(nodes.nodes[0].sources[0].provider, "alpha");
     }
 
     #[tokio::test]

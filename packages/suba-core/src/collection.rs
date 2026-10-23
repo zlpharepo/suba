@@ -12,9 +12,9 @@
 //! want" is a filter, evaluated against what is served right now.
 //!
 //! Resolution is a pure function of the index and the compiled filters: the same
-//! inputs give the same nodes, in the same order, and the order is the index's
-//! (oldest first). Node order is what a client displays and what a rename can
-//! refer to by position, so it must not depend on the order a map iterated in.
+//! inputs give the same nodes, in listed provider order and then payload order.
+//! Different providers remain distinct sources even when their content matches;
+//! conflicts are named only after filtering, without changing the provider index.
 //!
 //! Two filters apply, and they apply to the same spelling — the name the
 //! provider itself used, because that is the name its own filter was written
@@ -22,7 +22,7 @@
 //! collection's providers do not serve is not this collection's business at all
 //! and is not counted anywhere.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -35,10 +35,8 @@ pub struct Collection {
     /// The providers it is assembled from, by the names their own document
     /// uses.
     ///
-    /// The order they are listed in is not the order of the result: a node's
-    /// position is the index's, so that adding a provider to the list does not
-    /// renumber the nodes the other providers contributed. A name listed twice
-    /// contributes once.
+    /// Listed provider order determines result order; each provider retains
+    /// its current payload order. A name listed twice contributes once.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<String>,
 
@@ -84,121 +82,55 @@ impl Collection {
     /// `filter` is this collection's own, compiled by the caller: it is the same
     /// value for every request, and compiling it here would re-read the same
     /// patterns on every one.
-    pub fn resolve<'a>(
+    pub fn resolve(
         &self,
-        index: &'a NodeIndex,
+        index: &NodeIndex,
         providers: &BTreeMap<String, NodeFilter>,
         filter: &NodeFilter,
-        view: View,
-    ) -> Resolved<'a> {
-        let mut members: Vec<(&str, &NodeFilter)> = Vec::new();
-        let mut unresolved: Vec<String> = Vec::new();
-
-        for name in &self.providers {
-            match providers.get(name.as_str()) {
-                Some(provider) if !members.iter().any(|(member, _)| *member == name) => {
-                    members.push((name, provider));
-                }
-                Some(_) => {}
-                None if !unresolved.contains(name) => unresolved.push(name.clone()),
-                None => {}
-            }
-        }
-
+    ) -> Resolved {
+        let mut visited = BTreeSet::new();
+        let mut unresolved = Vec::new();
         let mut nodes = Vec::new();
         let mut passed_over = 0;
-        let mut orphans = 0;
 
-        for entry in index.entries() {
-            let mut belongs = false;
-            let mut serves_now = false;
-            let mut admitted = false;
-
-            for source in &entry.sources {
-                let Some((_, provider)) = members.iter().find(|(name, _)| *name == source.provider)
-                else {
-                    continue;
-                };
-
-                belongs = true;
-
-                // A source that has stopped serving it says the node existed,
-                // not that it is served now; there is no name to filter either.
-                if !source.serving {
-                    continue;
-                }
-
-                serves_now = true;
-
-                if let Some(name) = source.name.as_deref() {
-                    admitted |= provider.admits(name) && filter.admits(name);
-                }
-            }
-
-            if !belongs {
-                // Some other provider's node entirely: not dropped, not this
-                // collection's business.
+        for name in &self.providers {
+            if !visited.insert(name) {
                 continue;
             }
+            let Some(provider) = providers.get(name) else {
+                unresolved.push(name.clone());
+                continue;
+            };
 
-            if entry.is_orphan() {
-                // Counted whether or not it was asked for: a provider that
-                // quietly shrank is something the operator needs to see.
-                orphans += 1;
-
-                if view.orphans {
-                    nodes.push(entry);
+            for entry in index
+                .entries()
+                .iter()
+                .filter(|entry| entry.source.provider == *name)
+            {
+                if provider.admits(&entry.source.name) && filter.admits(&entry.source.name) {
+                    nodes.push(entry.clone());
+                } else {
+                    passed_over += 1;
                 }
-
-                continue;
-            }
-
-            if !serves_now {
-                // A provider of this collection dropped it, and nobody else
-                // here serves it. It is not a filter's doing.
-                continue;
-            }
-
-            match admitted {
-                true => nodes.push(entry),
-                false => passed_over += 1,
             }
         }
 
+        crate::index::name_conflicts(&mut nodes);
         Resolved {
             nodes,
             passed_over,
-            orphans,
             unresolved,
         }
     }
 }
 
-/// What a resolution was asked for.
-///
-/// Everything here narrows what a collection serves; nothing here can add a node
-/// the collection would not otherwise serve.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct View {
-    /// Include the nodes nothing serves any more.
-    ///
-    /// Off by default. An orphan has no content — no payload mentions it — so a
-    /// delivery cannot send it anywhere; what a structural view can do with it is
-    /// show that it existed, and that it is gone.
-    pub orphans: bool,
-}
-
-/// What a collection resolves to.
+/// Owned output names cannot change the provider's original spelling.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Resolved<'a> {
-    /// The nodes to serve, in the index's order.
-    pub nodes: Vec<&'a IndexEntry>,
-    /// How many nodes a filter passed over.
+pub struct Resolved {
+    /// Listed provider order, then each provider's payload order.
+    pub nodes: Vec<IndexEntry>,
     pub passed_over: usize,
-    /// How many nodes nothing serves any more.
-    pub orphans: usize,
-    /// Providers the collection names whose definition the caller could not
-    /// supply.
+    /// Missing provider definitions, in first-listed order.
     pub unresolved: Vec<String>,
 }
 
@@ -207,7 +139,6 @@ mod tests {
     use super::*;
     use crate::{observation::Observation, proto::parse_link, proto::NodeFingerprint};
 
-    const NOW: i64 = 1_700_000_000;
     const ALPHA: &str = "alpha.example.com";
     const BETA: &str = "beta.example.com";
 
@@ -221,21 +152,11 @@ mod tests {
             .id()
     }
 
-    /// An observation of `payload`, where `seen` are the nodes it has ever
-    /// served and when each was first seen.
-    fn observed(payload: &str, seen: &[(&str, i64)]) -> Observation {
-        let mut observation = Observation {
+    fn observed(payload: &str) -> Observation {
+        Observation {
             payload: payload.to_string(),
-            fetched_at: Some(NOW),
-            checked_at: Some(NOW),
             ..Observation::default()
-        };
-
-        for (link, first_seen) in seen {
-            observation.sighting.insert(id(link), *first_seen);
         }
-
-        observation
     }
 
     fn index(observations: &[(&str, &Observation)]) -> NodeIndex {
@@ -272,25 +193,20 @@ mod tests {
         }
     }
 
-    fn names<'a>(resolved: &Resolved<'a>) -> Vec<&'a str> {
-        resolved
-            .nodes
-            .iter()
-            .map(|entry| entry.name().expect("every resolved node is served"))
-            .collect()
+    fn names(resolved: &Resolved) -> Vec<&str> {
+        resolved.nodes.iter().map(IndexEntry::name).collect()
     }
 
     #[test]
     fn a_provider_the_collection_does_not_name_is_not_its_business() {
-        let alpha = observed(&link(ALPHA, "US-01"), &[(&link(ALPHA, "US-01"), 1_000)]);
-        let beta = observed(&link(BETA, "JP-01"), &[(&link(BETA, "JP-01"), 2_000)]);
+        let alpha = observed(&link(ALPHA, "US-01"));
+        let beta = observed(&link(BETA, "JP-01"));
         let index = index(&[("alpha", &alpha), ("beta", &beta)]);
 
         let resolved = collection(&["alpha"]).resolve(
             &index,
             &providers(vec![("alpha", unfiltered()), ("beta", unfiltered())]),
             &unfiltered(),
-            View::default(),
         );
 
         assert_eq!(names(&resolved), ["US-01"]);
@@ -303,31 +219,27 @@ mod tests {
     #[test]
     fn the_providers_it_names_contribute_together() {
         let shared = link(ALPHA, "Shared");
-        let alpha = observed(&shared, &[(&shared, 1_000)]);
-        let beta = observed(
-            &format!("{}{}", link(BETA, "JP-01"), shared),
-            &[(&link(BETA, "JP-01"), 2_000), (&shared, 1_000)],
-        );
+        let alpha = observed(&shared);
+        let beta = observed(&format!("{}{}", link(BETA, "JP-01"), shared));
         let index = index(&[("alpha", &alpha), ("beta", &beta)]);
 
         let resolved = collection(&["alpha", "beta"]).resolve(
             &index,
             &providers(vec![("alpha", unfiltered()), ("beta", unfiltered())]),
             &unfiltered(),
-            View::default(),
         );
 
         assert_eq!(
             names(&resolved),
-            ["Shared", "JP-01"],
-            "a node two providers serve is one node"
+            ["[alpha] Shared", "JP-01", "[beta] Shared"],
+            "each provider contributes its own source entry"
         );
     }
 
     #[test]
     fn a_node_a_filter_passes_over_is_counted() {
-        let alpha = observed(&link(ALPHA, "US-01"), &[(&link(ALPHA, "US-01"), 1_000)]);
-        let beta = observed(&link(BETA, "JP-01"), &[(&link(BETA, "JP-01"), 2_000)]);
+        let alpha = observed(&link(ALPHA, "US-01"));
+        let beta = observed(&link(BETA, "JP-01"));
         let index = index(&[("alpha", &alpha), ("beta", &beta)]);
 
         let resolved = collection(&["alpha", "beta"]).resolve(
@@ -337,7 +249,6 @@ mod tests {
                 ("beta", filter(&[], &["JP-01"])),
             ]),
             &unfiltered(),
-            View::default(),
         );
 
         assert_eq!(names(&resolved), ["US-01"]);
@@ -348,14 +259,13 @@ mod tests {
     fn exclude_still_beats_include() {
         let us = link(ALPHA, "US-01");
         let jp = link(BETA, "JP-01");
-        let alpha = observed(&format!("{us}{jp}"), &[(&us, 1_000), (&jp, 1_000)]);
+        let alpha = observed(&format!("{us}{jp}"));
         let index = index(&[("alpha", &alpha)]);
 
         let resolved = collection(&["alpha"]).resolve(
             &index,
             &providers(vec![("alpha", unfiltered())]),
             &filter(&["US-01", "JP-01"], &["JP-01"]),
-            View::default(),
         );
 
         assert_eq!(names(&resolved), ["US-01"]);
@@ -375,8 +285,8 @@ mod tests {
 
         assert_eq!(id(&us), id(&states), "the fixture is one node, two names");
 
-        let alpha = observed(&us, &[(&us, 1_000)]);
-        let beta = observed(&states, &[(&states, 2_000)]);
+        let alpha = observed(&us);
+        let beta = observed(&states);
         let index = index(&[("alpha", &alpha), ("beta", &beta)]);
 
         // Both providers named: alpha's spelling matches, so the node is in.
@@ -384,7 +294,6 @@ mod tests {
             &index,
             &providers(vec![("alpha", unfiltered()), ("beta", unfiltered())]),
             &filter(&["US-01"], &[]),
-            View::default(),
         );
         assert_eq!(names(&resolved), ["US-01"]);
 
@@ -393,83 +302,20 @@ mod tests {
             &index,
             &providers(vec![("beta", unfiltered())]),
             &filter(&["US-01"], &[]),
-            View::default(),
         );
         assert!(resolved.nodes.is_empty());
         assert_eq!(resolved.passed_over, 1);
     }
 
     #[test]
-    fn orphans_are_counted_and_left_out_unless_they_are_asked_for() {
-        let gone = link(ALPHA, "Gone");
-        let alpha = observed("", &[(&gone, 1_000)]);
-        let index = index(&[("alpha", &alpha)]);
-        let providers = providers(vec![("alpha", unfiltered())]);
-
-        let resolved =
-            collection(&["alpha"]).resolve(&index, &providers, &unfiltered(), View::default());
-        assert!(resolved.nodes.is_empty(), "a dead endpoint is not served");
-        assert_eq!(resolved.orphans, 1);
-
-        let resolved = collection(&["alpha"]).resolve(
-            &index,
-            &providers,
-            &unfiltered(),
-            View { orphans: true },
-        );
-        assert_eq!(resolved.nodes.len(), 1);
-        assert!(resolved.nodes[0].is_orphan());
-    }
-
-    #[test]
-    fn an_orphan_of_a_provider_it_does_not_name_is_not_counted() {
-        let gone = link(BETA, "Gone");
-        let beta = observed("", &[(&gone, 1_000)]);
-        let index = index(&[("beta", &beta)]);
-
-        let resolved = collection(&["alpha"]).resolve(
-            &index,
-            &providers(vec![("alpha", unfiltered()), ("beta", unfiltered())]),
-            &unfiltered(),
-            View::default(),
-        );
-
-        assert!(resolved.nodes.is_empty());
-        assert_eq!(resolved.orphans, 0);
-    }
-
-    /// A node a member stopped serving is not this collection's to report when
-    /// someone else still serves it: it is not an orphan (the index says so), and
-    /// no filter passed over it.
-    #[test]
-    fn a_node_a_member_dropped_but_still_served_is_not_reported() {
-        let shared = link(ALPHA, "Shared");
-        let alpha = observed("", &[(&shared, 1_000)]);
-        let beta = observed(&shared, &[(&shared, 2_000)]);
-        let index = index(&[("alpha", &alpha), ("beta", &beta)]);
-
-        let resolved = collection(&["alpha"]).resolve(
-            &index,
-            &providers(vec![("alpha", unfiltered())]),
-            &unfiltered(),
-            View { orphans: true },
-        );
-
-        assert!(resolved.nodes.is_empty());
-        assert_eq!(resolved.orphans, 0);
-        assert_eq!(resolved.passed_over, 0);
-    }
-
-    #[test]
     fn a_provider_it_names_that_has_no_definition_is_reported() {
-        let alpha = observed(&link(ALPHA, "US-01"), &[(&link(ALPHA, "US-01"), 1_000)]);
+        let alpha = observed(&link(ALPHA, "US-01"));
         let index = index(&[("alpha", &alpha)]);
 
         let resolved = collection(&["alpha", "ghost"]).resolve(
             &index,
             &providers(vec![("alpha", unfiltered())]),
             &unfiltered(),
-            View::default(),
         );
 
         assert_eq!(names(&resolved), ["US-01"]);
@@ -478,49 +324,42 @@ mod tests {
 
     #[test]
     fn a_name_listed_twice_contributes_once() {
-        let alpha = observed(&link(ALPHA, "US-01"), &[(&link(ALPHA, "US-01"), 1_000)]);
+        let alpha = observed(&link(ALPHA, "US-01"));
         let index = index(&[("alpha", &alpha)]);
 
         let resolved = collection(&["alpha", "alpha", "ghost", "ghost"]).resolve(
             &index,
             &providers(vec![("alpha", filter(&["US-01"], &[]))]),
             &unfiltered(),
-            View::default(),
         );
 
         assert_eq!(names(&resolved), ["US-01"]);
         assert_eq!(resolved.unresolved, ["ghost"]);
     }
 
-    /// The result's order is the index's, so the listing order cannot renumber
-    /// nodes.
     #[test]
-    fn the_order_is_the_index_order_not_the_listing_order() {
+    fn listed_provider_order_takes_precedence_over_index_order() {
         let first = link(ALPHA, "First");
         let second = link(BETA, "Second");
-        let alpha = observed(&first, &[(&first, 1_000)]);
-        let beta = observed(&second, &[(&second, 2_000)]);
+        let alpha = observed(&first);
+        let beta = observed(&second);
         let index = index(&[("alpha", &alpha), ("beta", &beta)]);
 
         let resolved = collection(&["beta", "alpha"]).resolve(
             &index,
             &providers(vec![("beta", unfiltered()), ("alpha", unfiltered())]),
             &unfiltered(),
-            View::default(),
         );
 
-        assert_eq!(names(&resolved), ["First", "Second"]);
+        assert_eq!(names(&resolved), ["Second", "First"]);
     }
 
     /// Removing a provider takes away its nodes and nothing else.
     #[test]
     fn removing_a_provider_leaves_the_other_nodes_untouched() {
-        let alpha = observed(&link(ALPHA, "US-01"), &[(&link(ALPHA, "US-01"), 1_000)]);
-        let beta = observed(&link(BETA, "JP-01"), &[(&link(BETA, "JP-01"), 2_000)]);
-        let inline = observed(
-            &link("local", "Hand written"),
-            &[(&link("local", "Hand written"), 3_000)],
-        );
+        let alpha = observed(&link(ALPHA, "US-01"));
+        let beta = observed(&link(BETA, "JP-01"));
+        let inline = observed(&link("local", "Hand written"));
         let index = index(&[("alpha", &alpha), ("beta", &beta), ("inline", &inline)]);
         let filters = providers(vec![
             ("alpha", unfiltered()),
@@ -528,18 +367,9 @@ mod tests {
             ("inline", unfiltered()),
         ]);
 
-        let all = collection(&["alpha", "beta", "inline"]).resolve(
-            &index,
-            &filters,
-            &unfiltered(),
-            View::default(),
-        );
-        let without_alpha = collection(&["beta", "inline"]).resolve(
-            &index,
-            &filters,
-            &unfiltered(),
-            View::default(),
-        );
+        let all = collection(&["alpha", "beta", "inline"]).resolve(&index, &filters, &unfiltered());
+        let without_alpha =
+            collection(&["beta", "inline"]).resolve(&index, &filters, &unfiltered());
 
         assert_eq!(names(&all), ["US-01", "JP-01", "Hand written"]);
         assert_eq!(
@@ -562,9 +392,50 @@ mod tests {
     }
 
     #[test]
+    fn resolved_entries_keep_provider_payload_order_and_leave_source_names_untouched() {
+        let alpha = observed(&format!(
+            "{}{}",
+            link(ALPHA, "Shared"),
+            link("third.example.com", "Alpha tail")
+        ));
+        let beta = observed(&format!("{}{}", link(BETA, "Shared"), link(ALPHA, "Alias")));
+        let index = index(&[("alpha", &alpha), ("beta", &beta)]);
+        let original = index.clone();
+        let filters = providers(vec![("alpha", unfiltered()), ("beta", unfiltered())]);
+
+        let resolved =
+            collection(&["beta", "alpha", "beta"]).resolve(&index, &filters, &unfiltered());
+        assert_eq!(
+            names(&resolved),
+            [
+                "[beta] Shared",
+                "[beta] Alias",
+                "[alpha] Shared",
+                "Alpha tail"
+            ]
+        );
+        assert_eq!(
+            resolved
+                .nodes
+                .iter()
+                .map(|entry| (entry.source.provider.as_str(), entry.source.position))
+                .collect::<Vec<_>>(),
+            [("beta", 0), ("beta", 1), ("alpha", 0), ("alpha", 1)]
+        );
+        assert_eq!(resolved.nodes[1].id, resolved.nodes[2].id);
+        assert_eq!(index, original);
+
+        let narrowed =
+            collection(&["beta", "alpha"]).resolve(&index, &filters, &filter(&["Alias"], &[]));
+        assert_eq!(names(&narrowed), ["Alias"]);
+        assert_eq!(narrowed.passed_over, 3);
+        assert_eq!(narrowed.nodes[0].source.provider, "beta");
+    }
+
+    #[test]
     fn the_same_collection_resolves_to_the_same_nodes_twice() {
-        let alpha = observed(&link(ALPHA, "US-01"), &[(&link(ALPHA, "US-01"), 1_000)]);
-        let beta = observed(&link(BETA, "JP-01"), &[(&link(BETA, "JP-01"), 2_000)]);
+        let alpha = observed(&link(ALPHA, "US-01"));
+        let beta = observed(&link(BETA, "JP-01"));
         let index = index(&[("alpha", &alpha), ("beta", &beta)]);
         let filters = providers(vec![
             ("alpha", unfiltered()),
@@ -572,22 +443,21 @@ mod tests {
         ]);
         let collection = collection(&["alpha", "beta"]);
 
-        let once = collection.resolve(&index, &filters, &unfiltered(), View::default());
-        let twice = collection.resolve(&index, &filters, &unfiltered(), View::default());
+        let once = collection.resolve(&index, &filters, &unfiltered());
+        let twice = collection.resolve(&index, &filters, &unfiltered());
 
         assert_eq!(once, twice);
     }
 
     #[test]
     fn an_empty_collection_resolves_to_nothing() {
-        let alpha = observed(&link(ALPHA, "US-01"), &[(&link(ALPHA, "US-01"), 1_000)]);
+        let alpha = observed(&link(ALPHA, "US-01"));
         let index = index(&[("alpha", &alpha)]);
 
         let resolved = Collection::default().resolve(
             &index,
             &providers(vec![("alpha", unfiltered())]),
             &unfiltered(),
-            View::default(),
         );
 
         assert!(resolved.nodes.is_empty());

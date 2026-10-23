@@ -108,7 +108,8 @@ impl Subscription {
         self.nodes.len()
     }
 
-    /// The identity of every node, for merging one subscription into another.
+    /// Content identities within this payload. Pair them with the provider when
+    /// combining subscriptions so distinct providers remain separate sources.
     pub fn identities(&self) -> Vec<NodeFingerprint> {
         self.nodes.iter().map(NodeRecord::id).collect()
     }
@@ -123,7 +124,7 @@ fn is_zero(count: &usize) -> bool {
 /// The shape is detected, because one layer of base64 around the same lines is
 /// the same subscription. The link is kept as it arrived, so what a provider
 /// served can be audited and re-exported without a second parse.
-pub fn parse(payload: &[u8], provider: &str, now: i64) -> Subscription {
+pub fn parse(payload: &[u8], provider: &str) -> Subscription {
     // A body that is base64 of a link list is the common case for a provider;
     // anything else is read as the text it is.
     let (text, format) = match proto::base64::decode_if_text(payload) {
@@ -140,12 +141,12 @@ pub fn parse(payload: &[u8], provider: &str, now: i64) -> Subscription {
         return Subscription::unreadable(Some(SourceFormat::Clash), Unreadable::LooksLikeClash);
     }
 
-    read_links(&text, format, provider, now)
+    read_links(&text, format, provider)
 }
 
 /// Read one share link per line.
-fn read_links(text: &str, format: SourceFormat, provider: &str, now: i64) -> Subscription {
-    let mut reader = Reader::new(format, provider, now);
+fn read_links(text: &str, format: SourceFormat, provider: &str) -> Subscription {
+    let mut reader = Reader::new(format, provider);
 
     for (index, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -193,7 +194,6 @@ impl Subscription {
 struct Reader<'a> {
     format: SourceFormat,
     provider: &'a str,
-    now: i64,
     nodes: Vec<NodeRecord>,
     /// Identity to position, so a duplicate folds into what was already read.
     seen: HashMap<NodeFingerprint, usize>,
@@ -203,11 +203,10 @@ struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    fn new(format: SourceFormat, provider: &'a str, now: i64) -> Self {
+    fn new(format: SourceFormat, provider: &'a str) -> Self {
         Self {
             format,
             provider,
-            now,
             nodes: Vec::new(),
             seen: HashMap::new(),
             duplicates: 0,
@@ -230,14 +229,12 @@ impl<'a> Reader<'a> {
 
         // The position is where in the payload it appeared, which is what makes
         // "the provider's order" reproducible.
-        record.seen_at(self.provider, number - 1, self.now, line);
+        record.attribute(self.provider, number - 1, line);
 
         match self.seen.get(&id) {
-            // The same node twice: the first sighting keeps its position, and
-            // the count says the payload mentioned it twice.
-            Some(&position) => {
+            // Keep the first occurrence's spelling and position within this payload.
+            Some(_) => {
                 self.duplicates += 1;
-                self.nodes[position].seen_at(self.provider, number - 1, self.now, line);
             }
             None => {
                 self.seen.insert(id, self.nodes.len());
@@ -273,12 +270,11 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
 
-    const NOW: i64 = 1_700_000_000;
     const TROJAN: &str = "trojan://hunter2@example.com:443#First";
     const VLESS: &str = "vless://11111111-2222-3333-4444-555555555555@example.com:443#Second";
 
     fn read(text: &str) -> Subscription {
-        parse(text.as_bytes(), "primary", NOW)
+        parse(text.as_bytes(), "primary")
     }
 
     #[test]
@@ -355,7 +351,7 @@ mod tests {
         assert_eq!(subscription.duplicates, 1);
         assert_eq!(
             subscription.nodes[0].provenance[0].position, 0,
-            "the first sighting keeps its position"
+            "the first occurrence keeps its position"
         );
     }
 

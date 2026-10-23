@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use suba_core::subscription::{self, Unreadable};
+use suba_core::NodeIndex;
 use suba_core::RefreshStatus;
-use suba_core::{Collection, NodeIndex, View};
 
 use crate::{
     dto::{Authenticated, ErrorResponse, ResponseResult},
@@ -25,8 +25,8 @@ use crate::{
 /// A subscription may carry credentials, so what is reported is how big it is
 /// and what it holds, never the bytes themselves. `status` says which of the
 /// three things happened — the payload arrived, it arrived unchanged, or the
-/// provider confirmed that what is held is current — because "nothing was
-/// written" and "nothing arrived" are different answers.
+/// provider confirmed that what is held is current — because unchanged bytes
+/// and a response with no payload are different answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Refresh {
     pub name: String,
@@ -53,10 +53,38 @@ impl From<Refreshed> for Refresh {
     }
 }
 
-pub async fn index(_auth: Authenticated, State(state): State<AppState>) -> impl IntoResponse {
-    let providers = state.providers().list().await;
+#[derive(Serialize)]
+pub struct ProviderSummary {
+    #[serde(flatten)]
+    pub definition: Provider,
+    /// Last successful synchronization; failed attempts do not advance it.
+    pub updated_at: Option<i64>,
+}
 
-    Json(providers)
+pub async fn index(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+) -> ResponseResult<Json<BTreeMap<String, ProviderSummary>>> {
+    Ok(Json(summaries(&state).await?))
+}
+
+async fn summaries(state: &AppState) -> Result<BTreeMap<String, ProviderSummary>, Error> {
+    let providers = state.providers().list().await;
+    let observations = state.providers().observations().await?;
+
+    Ok(providers
+        .into_iter()
+        .map(|(name, definition)| {
+            let updated_at = observations.get(&name).and_then(|held| held.updated_at);
+            (
+                name,
+                ProviderSummary {
+                    definition,
+                    updated_at,
+                },
+            )
+        })
+        .collect())
 }
 
 pub async fn get(
@@ -116,12 +144,11 @@ pub async fn refresh(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Nodes {
     pub name: String,
-    /// The nodes, oldest first, orphans included and marked.
+    /// Current nodes in this provider's payload order, after its filters.
     pub nodes: Vec<NodeView>,
     /// How many nodes this provider's own filter passed over.
     pub passed_over: usize,
-    /// How many nodes it has served and no longer does.
-    pub orphans: usize,
+    pub updated_at: Option<i64>,
     /// Why the payload contributed no nodes at all, when it is a shape this
     /// build reads none of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -145,52 +172,25 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
         .await
         .ok_or_else(|| Error::ProviderNotFound(name.to_owned()))?;
 
-    let observations = state.providers().observations().await?;
-
-    // The same index the collections view is built from, for the same reason: a
-    // node's identity, the name it goes by and when it was first seen are facts
-    // about the instance, and a view built out of one provider's bytes alone
-    // would disagree with the others about the same node.
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
-
-    // One member, and the only filter that applies is this provider's own: a
-    // collection's filter belongs to the collection.
-    let member = Collection {
-        providers: vec![name.to_owned()],
-        ..Collection::default()
-    };
-    let resolved = member.resolve(
-        &index,
-        &BTreeMap::from([(name.to_owned(), provider.filter()?)]),
-        &member.filter()?,
-        // The structure is where an orphan is worth seeing: it has no content,
-        // so nothing can be served from it, but it is the evidence that this
-        // provider used to serve it.
-        View { orphans: true },
-    );
-
-    let unreadable = observations.get(name).and_then(|observation| {
-        subscription::parse(
-            observation.payload.as_bytes(),
-            name,
-            observation.checked_at.unwrap_or_default(),
-        )
-        .unreadable
-    });
+    // Other providers cannot rename this provider's entries or make its view fail.
+    let observation = state.providers().observation(name).await?;
+    let index = NodeIndex::from_observations(observation.iter().map(|held| (name, held)));
+    let filter = provider.filter()?;
+    let nodes: Vec<_> = index
+        .entries()
+        .iter()
+        .filter(|entry| filter.admits(entry.name()))
+        .map(NodeView::from)
+        .collect();
+    let unreadable = observation
+        .as_ref()
+        .and_then(|held| subscription::parse(held.payload.as_bytes(), name).unreadable);
 
     Ok(Nodes {
         name: name.to_owned(),
-        nodes: resolved
-            .nodes
-            .iter()
-            .map(|entry| NodeView::from(*entry))
-            .collect(),
-        passed_over: resolved.passed_over,
-        orphans: resolved.orphans,
+        passed_over: index.len() - nodes.len(),
+        nodes,
+        updated_at: observation.and_then(|held| held.updated_at),
         unreadable,
     })
 }
@@ -287,11 +287,7 @@ mod tests {
 
     /// The names a view reports, in the order it reports them.
     fn names(nodes: &Nodes) -> Vec<&str> {
-        nodes
-            .nodes
-            .iter()
-            .map(|node| node.name.as_deref().unwrap_or("<orphan>"))
-            .collect()
+        nodes.nodes.iter().map(|node| node.name.as_str()).collect()
     }
 
     #[tokio::test]
@@ -315,7 +311,7 @@ mod tests {
         assert_eq!(nodes.name, "airport");
         assert_eq!(names(&nodes), ["US-01", "JP-01"]);
         assert_eq!(nodes.passed_over, 0);
-        assert_eq!(nodes.orphans, 0);
+        assert!(nodes.updated_at.is_some());
         assert_eq!(nodes.unreadable, None);
         assert!(
             !serde_json::to_string(&nodes).unwrap().contains(SENTINEL),
@@ -351,7 +347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_node_it_stopped_serving_is_counted_and_marked() {
+    async fn a_replaced_provider_snapshot_returns_only_its_current_nodes() {
         let state = state().await;
         inline(
             &state,
@@ -369,9 +365,67 @@ mod tests {
 
         let nodes = nodes_of(&state, "airport").await.unwrap();
 
-        assert_eq!(nodes.orphans, 1);
-        assert_eq!(names(&nodes), ["US-01", "<orphan>"]);
-        assert!(nodes.nodes[1].orphan, "the one nobody serves is marked");
+        assert_eq!(names(&nodes), ["US-01"]);
+        let encoded = serde_json::to_value(&nodes).unwrap();
+        assert!(encoded.get("orphans").is_none());
+        assert!(encoded["nodes"][0].get("first_seen").is_none());
+        assert!(encoded["nodes"][0].get("orphan").is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_update_time_is_shared_by_summary_and_latest_nodes() {
+        let state = state().await;
+        inline(
+            &state,
+            "airport",
+            &link("a.example.com", "Current"),
+            &[],
+            &[],
+        )
+        .await;
+        let nodes = nodes_of(&state, "airport").await.unwrap();
+        let listed = summaries(&state).await.unwrap();
+        assert!(nodes.updated_at.is_some());
+        assert_eq!(listed["airport"].updated_at, nodes.updated_at);
+        let wire = serde_json::to_value(&listed["airport"]).unwrap();
+        assert_eq!(wire["type"], "inline");
+        assert_eq!(wire["updated_at"], nodes.updated_at.unwrap());
+        let definition = state.providers().get("airport").await.unwrap();
+        assert!(serde_json::to_value(definition)
+            .unwrap()
+            .get("updated_at")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_provider_view_does_not_read_another_providers_observation() {
+        let state = state().await;
+        inline(
+            &state,
+            "airport",
+            &link("a.example.com", "Current"),
+            &[],
+            &[],
+        )
+        .await;
+        inline(
+            &state,
+            "other",
+            &link("a.example.com", "Other Name"),
+            &[],
+            &[],
+        )
+        .await;
+        std::fs::write(
+            state.data_dir().join("providers/other.json"),
+            "invalid JSON",
+        )
+        .unwrap();
+
+        let nodes = nodes_of(&state, "airport").await.unwrap();
+        assert_eq!(names(&nodes), ["Current"]);
+        assert_eq!(nodes.nodes[0].sources[0].provider, "airport");
+        assert_eq!(nodes.nodes[0].sources[0].name, "Current");
     }
 
     #[tokio::test]

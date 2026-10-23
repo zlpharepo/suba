@@ -348,7 +348,7 @@ impl ProviderStore {
     ///
     /// The store is synchronous — it is file I/O — and this is the layer that
     /// knows a request is waiting on it.
-    async fn observation(&self, name: &str) -> Result<Option<Observation>, Error> {
+    pub(crate) async fn observation(&self, name: &str) -> Result<Option<Observation>, Error> {
         let store = Arc::clone(&self.observations);
         let name = name.to_owned();
 

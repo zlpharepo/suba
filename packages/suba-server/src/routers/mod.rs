@@ -89,6 +89,7 @@ impl AppRouter {
 /// headers added after a handler returns — is pinned rather than smoke-tested.
 #[cfg(test)]
 mod tests {
+    mod provider_snapshots;
     #[cfg(feature = "singbox-core")]
     mod references;
 

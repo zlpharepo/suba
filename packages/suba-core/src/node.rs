@@ -1,10 +1,7 @@
-//! A node as a subscription hub knows it: the node itself, plus where it came
-//! from.
+//! A subscription node with its current source attribution.
 //!
-//! The node — endpoint, carriage, TLS, protocol payload — belongs to
-//! [`suba_proto`](crate::proto). What a hub adds is provenance: which provider
-//! served it, where in that provider's payload it appeared, when it was seen,
-//! and the link exactly as it arrived.
+//! Protocol content belongs to [`suba_proto`](crate::proto). Provenance keeps
+//! payload positions and raw links without retaining previous snapshots.
 
 use std::fmt;
 
@@ -12,16 +9,11 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::proto::{Client, Node, Server};
 
-/// One node, with everyone who served it.
-///
-/// Identity is the node's own content hash, so the same node served by two
-/// providers is one record with two provenances — which is what lets a
-/// collection survive a provider renaming it.
+/// A parsed node and its attribution within the current payload.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeRecord {
-    /// The node itself.
     pub node: Node<Client>,
-    /// Every provider that has served it, in the order they first did.
+    /// Current sources only; records from different providers remain separate.
     pub provenance: Vec<Provenance>,
 }
 
@@ -34,7 +26,7 @@ impl NodeRecord {
         }
     }
 
-    /// The content hash that identifies the node, which is how it is keyed.
+    /// Content identity; the source provider remains separate from this hash.
     pub fn id(&self) -> crate::proto::NodeFingerprint {
         self.node.id()
     }
@@ -44,26 +36,20 @@ impl NodeRecord {
         self.node.name.as_str()
     }
 
-    /// Note a sighting: the first one starts a provenance, later ones extend it.
-    ///
-    /// Returns whether this was the first sighting by that provider, which is
-    /// the caller's signal that something new was learned.
-    pub fn seen_at(&mut self, provider: &str, position: usize, now: i64, raw: &str) -> bool {
-        match self
+    /// Attribute a current source, retaining its first position and raw spelling
+    /// when the same payload repeats an identity. Returns whether it was added.
+    pub fn attribute(&mut self, provider: &str, position: usize, raw: &str) -> bool {
+        if self
             .provenance
-            .iter_mut()
-            .find(|entry| entry.provider == provider)
+            .iter()
+            .any(|entry| entry.provider == provider)
         {
-            Some(entry) => {
-                entry.last_seen = now;
-                false
-            }
-            None => {
-                self.provenance
-                    .push(Provenance::new(provider, position, now, raw));
-                true
-            }
+            return false;
         }
+
+        self.provenance
+            .push(Provenance::new(provider, position, raw));
+        true
     }
 
     /// Whether no provider has served it, which means it is hand-written rather
@@ -89,64 +75,33 @@ impl fmt::Debug for NodeRecord {
     }
 }
 
-/// Where a node was seen, when, and as what.
+/// Source attribution within the current payload, never a historical record.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provenance {
-    /// The provider that served it.
     pub provider: String,
-    /// Where in that provider's payload it appeared.
-    ///
-    /// This is what "the provider's order" means: the same payload fetched twice
-    /// yields the same positions, so a node that moved can be told from one that
-    /// was renamed, and ordering by source does not depend on the order a map
-    /// happened to iterate in.
-    #[serde(default)]
+    /// Zero-based payload position, including skipped lines.
     pub position: usize,
-    /// When this hub first saw it, in seconds since the epoch.
-    pub first_seen: i64,
-    /// When it was last seen.
-    pub last_seen: i64,
-    /// The link exactly as it arrived.
-    ///
-    /// Kept so that what a provider served can be audited and re-exported
-    /// without a second parse — and never printed, because it carries the
-    /// credentials.
+    /// Kept for re-export without parsing again; omitted from Debug because it
+    /// contains the credentials exactly as the provider supplied them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw: String,
 }
 
 impl Provenance {
-    /// A first sighting, at `position` in the payload that carried it.
-    pub fn new(
-        provider: impl Into<String>,
-        position: usize,
-        now: i64,
-        raw: impl Into<String>,
-    ) -> Self {
+    pub fn new(provider: impl Into<String>, position: usize, raw: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
             position,
-            first_seen: now,
-            last_seen: now,
             raw: raw.into(),
         }
-    }
-
-    /// Note that it is still there.
-    pub fn seen_again(&mut self, now: i64) {
-        self.last_seen = now;
     }
 }
 
 impl fmt::Debug for Provenance {
-    /// Which provider, seen when — and not the raw link, which is the node's
-    /// credentials in the form the provider wrote them.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Provenance")
             .field("provider", &self.provider)
             .field("position", &self.position)
-            .field("first_seen", &self.first_seen)
-            .field("last_seen", &self.last_seen)
             .finish_non_exhaustive()
     }
 }
@@ -172,32 +127,23 @@ mod tests {
     }
 
     #[test]
-    fn seeing_the_same_node_twice_from_one_provider_extends_one_provenance() {
+    fn duplicate_attribution_keeps_the_first_payload_position_and_raw_link() {
         let mut record = record();
 
-        assert!(
-            record.seen_at("primary", 0, 1_000, LINK),
-            "the first sighting"
-        );
-        assert!(
-            !record.seen_at("primary", 1, 2_000, LINK),
-            "the second is not a new provenance"
-        );
+        assert!(record.attribute("primary", 0, LINK));
+        assert!(!record.attribute("primary", 1, "a duplicate spelling"));
 
         assert_eq!(record.provenance.len(), 1);
-        assert_eq!(
-            record.provenance[0].first_seen, 1_000,
-            "the first time wins"
-        );
-        assert_eq!(record.provenance[0].last_seen, 2_000);
+        assert_eq!(record.provenance[0].position, 0);
+        assert_eq!(record.provenance[0].raw, LINK);
     }
 
     #[test]
     fn two_providers_serving_one_node_are_two_provenances() {
         let mut record = record();
 
-        record.seen_at("primary", 0, 1_000, LINK);
-        record.seen_at("backup", 4, 1_500, LINK);
+        record.attribute("primary", 0, LINK);
+        record.attribute("backup", 4, LINK);
 
         assert_eq!(record.provenance.len(), 2);
         assert!(!record.is_hand_written());
@@ -214,10 +160,9 @@ mod tests {
     #[test]
     fn a_record_never_prints_the_link_it_was_built_from() {
         let mut record = record();
-        record.seen_at(
+        record.attribute(
             "primary",
             0,
-            1_000,
             "trojan://SENTINELPASSWORD@example.com:443#Node",
         );
 

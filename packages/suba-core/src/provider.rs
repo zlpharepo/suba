@@ -17,7 +17,7 @@
 //!   nothing, so the timestamps move and the payload keeps its own.
 //! * **`NotModified`** — a `304`. The provider confirmed that what this hub
 //!   holds is current, but nothing was read: the payload and its timestamp stay,
-//!   and only the check time moves.
+//!   while the check and successful synchronization times advance.
 //!
 //! A failed fetch is not one of these. It is an error the caller records —
 //! the last good payload is worth more than nothing — and the payload is left
@@ -93,8 +93,8 @@ impl Fetched {
 pub enum RefreshStatus {
     /// A payload arrived and replaced what this hub had.
     Fetched,
-    /// A payload arrived, byte for byte the one already held: nothing was
-    /// written, and the payload keeps the time it was first served.
+    /// Identical bytes arrived: the payload keeps its replacement time while
+    /// successful synchronization metadata advances.
     Unchanged,
     /// The provider answered `304 Not Modified`.
     NotModified,
@@ -170,12 +170,12 @@ pub fn decide(
                 etag: etag.or_else(|| previous.etag.clone()),
                 ..previous.clone()
             }
-            .checked_at(now);
+            .synchronized_at(now);
 
             // The nodes are what the held payload parses to, reported so the
             // caller can answer "how many nodes does this provider have"
             // without a second read.
-            let parsed = subscription::parse(previous.payload.as_bytes(), provider, now);
+            let parsed = subscription::parse(previous.payload.as_bytes(), provider);
 
             RefreshPlan {
                 status: RefreshStatus::NotModified,
@@ -191,13 +191,12 @@ pub fn decide(
             last_modified,
         } => {
             let digest = crate::checksum::sha256_hex(payload.as_bytes());
-            let parsed = subscription::parse(payload.as_bytes(), provider, now);
+            let parsed = subscription::parse(payload.as_bytes(), provider);
 
             // A provider with no validators serves the same bytes every time.
             // Rewriting an identical payload on every interval would churn the
             // disk to say nothing, so the hash decides.
-            let unchanged = previous.content_hash.as_deref() == Some(digest.as_str())
-                && !previous.payload.is_empty();
+            let unchanged = previous.content_hash.as_deref() == Some(digest.as_str());
 
             let report = PayloadReport {
                 format: parsed.format,
@@ -213,10 +212,12 @@ pub fn decide(
                 // where it was: the payload's age is the age of the bytes, not
                 // of the check.
                 let observation = Observation {
+                    etag,
+                    last_modified,
                     content_hash: Some(digest),
                     ..previous.clone()
                 }
-                .checked_at(now);
+                .synchronized_at(now);
 
                 return RefreshPlan {
                     status: RefreshStatus::Unchanged,
@@ -227,19 +228,16 @@ pub fn decide(
                 };
             }
 
-            let mut observation = Observation {
+            let observation = Observation {
                 payload,
                 etag,
                 last_modified,
                 fetched_at: Some(now),
                 checked_at: Some(now),
+                updated_at: Some(now),
                 content_hash: Some(digest),
                 error: None,
-                sighting: previous.sighting.clone(),
             };
-            // A node this hub has served before keeps the time it was first
-            // seen; one it has not starts now.
-            observation.note_sightings(parsed.nodes.iter().map(NodeRecord::id), now);
 
             RefreshPlan {
                 status: RefreshStatus::Fetched,
@@ -280,9 +278,10 @@ pub fn record_failure(
 }
 
 impl Observation {
-    /// The same observation, with the check time moved.
-    fn checked_at(mut self, now: i64) -> Self {
+    fn synchronized_at(mut self, now: i64) -> Self {
         self.checked_at = Some(now);
+        self.updated_at = Some(now);
+        self.error = None;
         self
     }
 }
@@ -321,11 +320,69 @@ mod tests {
         assert_eq!(observation.checked_at, Some(NOW));
         assert!(observation.content_hash.is_some());
         assert!(observation.error.is_none());
-        assert_eq!(
-            observation.remembered().count(),
-            1,
-            "the node was seen for the first time"
-        );
+    }
+
+    #[test]
+    fn successful_sync_time_advances_for_changed_unchanged_and_304_but_not_failures() {
+        let mut held = decide("primary", None, modified(TROJAN), NOW)
+            .observation
+            .unwrap();
+        assert_eq!(held.updated_at, Some(NOW));
+
+        let steps = [
+            (modified(VLESS), RefreshStatus::Fetched),
+            (
+                Fetched::from_payload(VLESS)
+                    .with_validators(Some("\"v2\"".to_string()), Some("modified".to_string())),
+                RefreshStatus::Unchanged,
+            ),
+            (
+                Fetched::NotModified { etag: None },
+                RefreshStatus::NotModified,
+            ),
+        ];
+        for (step, (fetched, status)) in steps.into_iter().enumerate() {
+            let failed_at = NOW + 1 + step as i64 * 2;
+            let failed = record_failure(Some(&held), "timeout".to_string(), failed_at).unwrap();
+            assert_eq!(failed.updated_at, held.updated_at);
+            assert_eq!(failed.payload, held.payload);
+            assert_eq!(failed.content_hash, held.content_hash);
+            assert_eq!(failed.etag, held.etag);
+            assert_eq!(failed.checked_at, Some(failed_at));
+            assert!(record_failure(Some(&failed), "timeout".to_string(), failed_at + 1).is_none());
+
+            let succeeded_at = failed_at + 1;
+            let plan = decide("primary", Some(&failed), fetched, succeeded_at);
+            assert_eq!(plan.status, status);
+            let next = plan.observation.unwrap();
+            assert_eq!(next.updated_at, Some(succeeded_at));
+            assert_eq!(next.checked_at, Some(succeeded_at));
+            assert_eq!(next.error, None);
+            assert_eq!(next.payload, VLESS);
+            if status != RefreshStatus::Fetched {
+                assert_eq!(next.fetched_at, held.fetched_at);
+                assert_eq!(next.etag.as_deref(), Some("\"v2\""));
+                assert_eq!(next.last_modified.as_deref(), Some("modified"));
+            }
+            held = next;
+        }
+
+        let failed = record_failure(None, "timeout".to_string(), NOW).unwrap();
+        assert_eq!(failed.updated_at, None);
+    }
+
+    #[test]
+    fn successful_empty_payloads_are_snapshots_and_reconfirm_without_replacement() {
+        let held = decide("primary", None, Fetched::from_payload(""), NOW)
+            .observation
+            .unwrap();
+        assert_eq!(held.updated_at, Some(NOW));
+        assert!(!held.is_empty());
+        let again = decide("primary", Some(&held), Fetched::from_payload(""), NOW + 1);
+        assert_eq!(again.status, RefreshStatus::Unchanged);
+        let confirmed = again.observation.unwrap();
+        assert_eq!(confirmed.updated_at, Some(NOW + 1));
+        assert_eq!(confirmed.fetched_at, Some(NOW));
     }
 
     #[test]
@@ -425,33 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn a_node_the_provider_no_longer_serves_keeps_the_time_it_was_first_seen() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
-        let held = first.observation.unwrap();
-        let gone = held.remembered().next().unwrap();
-
-        let plan = decide(
-            "primary",
-            Some(&held),
-            modified(&payload_of(VLESS)),
-            NOW + 3_600,
-        );
-
-        let observation = plan.observation.unwrap();
-        assert_eq!(
-            observation.sighting[&gone], NOW,
-            "history survives a payload that dropped the node"
-        );
-    }
-
-    #[test]
-    fn a_first_fetch_has_no_previous_to_merge_from() {
-        let plan = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
-
-        assert_eq!(plan.observation.unwrap().sighting.len(), 1);
-    }
-
-    #[test]
     fn a_payload_with_no_usable_nodes_is_still_kept() {
         // What the provider served is a fact even when it is useless: an
         // operator needs to see it, and the next fetch can compare against it.
@@ -506,23 +536,5 @@ mod tests {
 
         // A different reason is a different fact.
         assert!(record_failure(Some(&first), "dns".to_string(), NOW + 60).is_some());
-    }
-
-    #[test]
-    fn the_sighting_a_node_keeps_is_the_first_time_this_hub_saw_it() {
-        let first = decide("primary", None, modified(&payload_of(TROJAN)), NOW);
-        let held = first.observation.unwrap();
-        let id = held.remembered().next().unwrap();
-
-        // A later fetch of the same node: the payload is new, the sighting is
-        // not.
-        let plan = decide(
-            "primary",
-            Some(&held),
-            modified(&format!("{TROJAN}\n{VLESS}\n")),
-            NOW + 3_600,
-        );
-
-        assert_eq!(plan.observation.unwrap().sighting[&id], NOW);
     }
 }
