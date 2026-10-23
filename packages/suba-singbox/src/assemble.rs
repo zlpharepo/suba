@@ -1,7 +1,7 @@
 //! Assemble the document the core runs, out of the one the user wrote.
 //!
 //! The user's document is never rewritten. The one section with a generated
-//! half is `outbounds`: what a collection renders is put in front of what the
+//! half is `outbounds`: what a collection renders is appended after what the
 //! user wrote, and nothing is merged field by field.
 //!
 //! **Why the checks here exist at all.** Measured on sing-box 1.14.2,
@@ -150,9 +150,9 @@ impl std::error::Error for Unfit {}
 /// Assemble the user's document and the generated outbounds into one.
 ///
 /// `written` is the document the user wrote (an object; `Value::Null` for none
-/// yet). `generated` is what a collection rendered, in the order it should be
-/// looked at first; every entry of it must be named, because a tag is the only
-/// thing that can refer to an outbound.
+/// yet). `generated` is what a collection rendered, appended in its original
+/// order after the written outbounds; every entry of it must be named, because
+/// a tag is the only thing that can refer to an outbound.
 ///
 /// The document comes back only if it holds up: repeated tags, references with
 /// nothing behind them, and cycles are refused, in that order, before anything
@@ -210,38 +210,37 @@ pub fn document(written: &Value, generated: &[Value]) -> Result<Value, Unfit> {
     Ok(Value::Object(sections))
 }
 
-/// The two halves of `outbounds` added together, generated first.
+/// The two halves of `outbounds` added together, written first.
 fn merge(written: Option<Value>, generated: &[Value]) -> Result<Vec<Value>, Unfit> {
-    let mut entries: Vec<Value> = Vec::with_capacity(generated.len());
+    let mut entries = match written {
+        None => Vec::new(),
+        Some(Value::Array(entries)) => entries,
+        Some(_) => {
+            return Err(Unfit::Shape {
+                path: OUTBOUNDS.to_string(),
+                reason: "the section is an array of entries",
+            });
+        }
+    };
 
-    for (index, entry) in generated.iter().enumerate() {
-        if tag_of(entry).is_none() {
+    for (index, entry) in entries.iter().enumerate() {
+        if !entry.is_object() {
             return Err(Unfit::Shape {
                 path: format!("{OUTBOUNDS}[{index}]"),
+                reason: "an entry is an object",
+            });
+        }
+    }
+
+    entries.reserve(generated.len());
+    for entry in generated {
+        if tag_of(entry).is_none() {
+            return Err(Unfit::Shape {
+                path: format!("{OUTBOUNDS}[{}]", entries.len()),
                 reason: "a generated outbound carries the tag that refers to it",
             });
         }
         entries.push(entry.clone());
-    }
-
-    let Some(written) = written else {
-        return Ok(entries);
-    };
-    let Value::Array(written) = written else {
-        return Err(Unfit::Shape {
-            path: OUTBOUNDS.to_string(),
-            reason: "the section is an array of entries",
-        });
-    };
-
-    for (index, entry) in written.into_iter().enumerate() {
-        if !entry.is_object() {
-            return Err(Unfit::Shape {
-                path: format!("{OUTBOUNDS}[{}]", entries.len() + index),
-                reason: "an entry is an object",
-            });
-        }
-        entries.push(entry);
     }
 
     Ok(entries)
@@ -695,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn the_halves_of_outbounds_are_added_not_merged() {
+    fn generated_outbounds_are_appended_after_written_outbounds() {
         let fragments = written(&[
             ("log", r#"{"level":"warn"}"#),
             ("outbounds", r#"[{"type":"direct","tag":"mine"}]"#),
@@ -707,9 +706,9 @@ mod tests {
         assert_eq!(
             assembled.config["outbounds"],
             serde_json::json!([
+                { "type": "direct", "tag": "mine" },
                 { "type": "direct", "tag": "node 1" },
                 { "type": "direct", "tag": "node 2" },
-                { "type": "direct", "tag": "mine" },
             ])
         );
         assert_eq!(
@@ -817,7 +816,7 @@ mod tests {
 
         let assembled = assemble(&fragments, &generated).expect("the member is generated");
 
-        assert_eq!(assembled.config["outbounds"][1]["tag"], "s");
+        assert_eq!(assembled.config["outbounds"][0]["tag"], "s");
     }
 
     #[test]

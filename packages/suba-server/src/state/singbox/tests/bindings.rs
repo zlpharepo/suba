@@ -141,19 +141,16 @@ fn collection_bindings_expand_manual_and_shared_generated_tags_once_in_order() {
         );
         let before = authored.clone();
         let assembled = super::super::bindings::assemble(&authored, &snapshot).unwrap();
-        let group = assembled.config["outbounds"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap();
+        let group = &assembled.config["outbounds"][1];
         assert_eq!(group["outbounds"], json!(["manual", "shared", "next"]));
         assert!(group.get("x-suba-collections").is_none());
+        assert_eq!(assembled.config["outbounds"][0], authored["outbounds"][0]);
         assert_eq!(
-            assembled.config["outbounds"][0],
+            assembled.config["outbounds"][2],
             snapshot.outbounds[0].value
         );
         assert_eq!(
-            assembled.config["outbounds"][1],
+            assembled.config["outbounds"][3],
             snapshot.outbounds[1].value
         );
         assert_eq!(authored, before);
@@ -332,7 +329,7 @@ fn collection_bindings_do_not_repair_stale_manual_members_or_defaults() {
         .unwrap();
     assert_eq!(
         saved.warnings,
-        ["outbounds[2].outbounds[1]: a referenced tag is not declared"]
+        ["outbounds[1].outbounds[1]: a referenced tag is not declared"]
     );
     assert_eq!(reason(store.start(&snapshot)), saved.warnings[0]);
     assert_eq!(store.config_document(NAME).unwrap().value, authored);
@@ -434,27 +431,27 @@ fn collection_bindings_restart_expands_the_next_snapshot_without_persisting_tags
     store.start(&old).unwrap();
     wait_for(&store, "started");
     assert_eq!(
-        runtime(&store)["outbounds"][2]["outbounds"],
+        runtime(&store)["outbounds"][1]["outbounds"],
         json!(["manual", "old"])
     );
     assert_eq!(
-        store.assemble(&new).unwrap().config["outbounds"][2]["outbounds"],
+        store.assemble(&new).unwrap().config["outbounds"][1]["outbounds"],
         json!(["manual", "new"])
     );
     assert_eq!(
-        runtime(&store)["outbounds"][2]["outbounds"],
+        runtime(&store)["outbounds"][1]["outbounds"],
         json!(["manual", "old"]),
         "preview does not reload the core"
     );
     store.restart(&new, Duration::from_secs(2)).unwrap();
     assert_eq!(
-        runtime(&store)["outbounds"][2]["outbounds"],
+        runtime(&store)["outbounds"][1]["outbounds"],
         json!(["manual", "new"])
     );
-    assert!(runtime(&store)["outbounds"][2]
+    assert!(runtime(&store)["outbounds"][1]
         .get("x-suba-collections")
         .is_none());
-    assert_eq!(runtime(&store)["outbounds"][0]["tag"], "new");
+    assert_eq!(runtime(&store)["outbounds"][2]["tag"], "new");
     assert_eq!(store.config_document(NAME).unwrap().value, authored);
     store.stop(Duration::from_secs(2)).unwrap();
 }

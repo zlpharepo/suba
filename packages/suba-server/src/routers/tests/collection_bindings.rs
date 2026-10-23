@@ -288,10 +288,10 @@ async fn collection_bindings_http_refresh_changes_only_the_next_expansion() {
     let mut core = CoreGuard(rustix::process::Pid::from_raw(pid.as_i64().unwrap() as i32));
     let initial = product(&server);
     assert_eq!(
-        initial["outbounds"][2]["outbounds"],
+        initial["outbounds"][1]["outbounds"],
         json!(["manual", "old"])
     );
-    assert!(initial["outbounds"][2].get("x-suba-collections").is_none());
+    assert!(initial["outbounds"][1].get("x-suba-collections").is_none());
     assert_eq!(fetched.load(Ordering::SeqCst), 1);
     revision.store(1, Ordering::SeqCst);
     let refreshed = server
@@ -316,9 +316,9 @@ async fn collection_bindings_http_refresh_changes_only_the_next_expansion() {
     core.0 = rustix::process::Pid::from_raw(pid.as_i64().unwrap() as i32);
     let current = product(&server);
     assert_eq!(current["outbounds"].as_array().unwrap().len(), 3);
-    assert_eq!(current["outbounds"][0], catalog["tags"][0]["value"]);
+    assert_eq!(current["outbounds"][2], catalog["tags"][0]["value"]);
     assert_eq!(
-        current["outbounds"][2]["outbounds"],
+        current["outbounds"][1]["outbounds"],
         json!(["manual", "new"])
     );
     assert_eq!(get(&server, CONFIG).await, authored);
