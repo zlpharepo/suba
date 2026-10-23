@@ -26,7 +26,8 @@ use crate::{
     error::Error,
     handlers::collections::outbounds_of,
     state::singbox::{
-        Document, InstallationTask, Privilege, RuntimePhase, Saved, Settings, SingboxStore, Tag,
+        Document, GeneratedOutbound, InstallationTask, Privilege, RuntimePhase, Saved, Settings,
+        SingboxStore, Tag,
     },
     AppState,
 };
@@ -188,6 +189,14 @@ pub async fn index(
 
 /// The outbounds the chosen collections contribute right now.
 async fn generated(state: &AppState) -> Result<Vec<Value>, Error> {
+    Ok(generated_with_collections(state)
+        .await?
+        .into_iter()
+        .map(|outbound| outbound.value)
+        .collect())
+}
+
+async fn generated_with_collections(state: &AppState) -> Result<Vec<GeneratedOutbound>, Error> {
     let store = state.singbox();
     let names = tokio::task::spawn_blocking(move || store.settings())
         .await??
@@ -1156,7 +1165,7 @@ pub async fn references(
     _auth: Authenticated,
     Path(name): Path<String>,
 ) -> ResponseResult<Json<References>> {
-    let generated = generated(&state).await?;
+    let generated = generated_with_collections(&state).await?;
     let store = state.singbox();
     let tags = tokio::task::spawn_blocking(move || store.references(&name, &generated)).await??;
 

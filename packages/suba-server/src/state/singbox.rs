@@ -39,7 +39,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::{error::Error, fs, identity::Identity};
 
 mod references;
-pub(crate) use references::Tag;
+pub(crate) use references::{GeneratedOutbound, Tag};
 
 /// The directory the operator's configurations live in, under the config
 /// directory.
@@ -882,7 +882,11 @@ impl SingboxStore {
 
     /// Suggestions use the named saved document, not the active runtime config.
     /// Collisions remain visible and do not prevent editing other references.
-    pub(crate) fn references(&self, name: &str, generated: &[Value]) -> Result<Vec<Tag>, Error> {
+    pub(crate) fn references(
+        &self,
+        name: &str,
+        generated: &[GeneratedOutbound],
+    ) -> Result<Vec<Tag>, Error> {
         Ok(references::catalog(
             &self.config_document(name)?.value,
             generated,

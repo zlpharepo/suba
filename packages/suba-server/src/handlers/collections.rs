@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use suba_core::format::{Format, RenderIntent};
 use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source, View};
 
+#[cfg(feature = "singbox-core")]
+use crate::state::singbox::GeneratedOutbound;
+
 use crate::{
     dto::{Authenticated, ResponseResult},
     error::Error,
@@ -647,7 +650,7 @@ mod artifact_tests {
             .unwrap();
         let tags: Vec<&str> = outbounds
             .iter()
-            .map(|outbound| outbound["tag"].as_str().unwrap())
+            .map(|outbound| outbound.value["tag"].as_str().unwrap())
             .collect();
         assert_eq!(tags, ["US-01", "JP-01"]);
 
@@ -655,6 +658,134 @@ mod artifact_tests {
             outbounds_of(&state, &["missing".to_string()]).await,
             Err(Error::CollectionNotFound(name)) if name == "missing"
         ));
+    }
+
+    #[cfg(all(feature = "singbox", feature = "singbox-core"))]
+    #[tokio::test]
+    async fn outbounds_provenance_tracks_filtered_shared_identities() {
+        use suba_core::Pattern;
+
+        let state = state().await;
+        inline(
+            &state,
+            "alpha",
+            "trojan://example-password@example.com:443#shared-first\n\
+             trojan://example-password@example.com:444#collision\n",
+        )
+        .await;
+        inline(
+            &state,
+            "beta",
+            "trojan://example-password@example.com:443#shared-second\n\
+             trojan://example-password@example.com:445#collision\n",
+        )
+        .await;
+        state
+            .providers()
+            .upsert(
+                "masked",
+                Provider::Inline(Inline {
+                    shared: SharedFields {
+                        excludes: vec![Pattern::Name("masked".to_string())],
+                        ..SharedFields::default()
+                    },
+                    payload: "trojan://example-password@example.com:443#masked\n".to_string(),
+                }),
+                state.http(),
+            )
+            .await
+            .unwrap();
+        for (name, providers) in [
+            ("first", vec!["alpha"]),
+            ("second", vec!["beta"]),
+            ("provider-filtered", vec!["masked"]),
+            ("empty", vec!["missing"]),
+            ("unselected", vec!["alpha", "beta"]),
+        ] {
+            collection(&state, name, &providers).await;
+        }
+        for (name, includes) in [
+            ("shared-only", "shared-first"),
+            ("collection-filtered", "absent"),
+        ] {
+            state
+                .collections()
+                .insert(
+                    name,
+                    Collection {
+                        providers: vec!["alpha".to_string()],
+                        includes: vec![Pattern::Name(includes.to_string())],
+                        ..Collection::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let selected = [
+            "second",
+            "provider-filtered",
+            "shared-only",
+            "collection-filtered",
+            "first",
+            "empty",
+            "second",
+        ]
+        .map(str::to_string);
+        let outbounds = outbounds_of(&state, &selected).await.unwrap();
+        assert_eq!(outbounds.len(), 3);
+        for (port, tag, contributors) in [
+            (443, "shared-first", vec!["second", "shared-only", "first"]),
+            (444, "collision 2", vec!["first"]),
+            (445, "collision", vec!["second"]),
+        ] {
+            let outbound = outbounds
+                .iter()
+                .find(|outbound| outbound.value["server_port"] == port)
+                .expect("each admitted identity is rendered once");
+            assert_eq!(outbound.value["tag"], tag);
+            assert_eq!(outbound.collections, contributors);
+        }
+    }
+
+    #[cfg(all(feature = "singbox", feature = "singbox-core"))]
+    #[tokio::test]
+    async fn outbounds_provenance_keeps_renderer_skips_aligned() {
+        let state = state().await;
+        for (provider, payload) in [
+            (
+                "rejected",
+                "trojan://example-password@example.com:443?type=quic&security=tls#collision\n",
+            ),
+            (
+                "alpha",
+                "trojan://example-password@example.com:444#collision\n",
+            ),
+            (
+                "beta",
+                "trojan://example-password@example.com:445#collision\n",
+            ),
+        ] {
+            inline(&state, provider, payload).await;
+            collection(&state, provider, &[provider]).await;
+        }
+        collection(&state, "shared", &["alpha"]).await;
+        let outbounds = outbounds_of(
+            &state,
+            &["rejected", "alpha", "beta", "shared"].map(str::to_string),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outbounds.len(), 2);
+        for (outbound, (port, tag, contributors)) in outbounds.iter().zip([
+            (444, "collision 2", vec!["alpha", "shared"]),
+            (445, "collision 3", vec!["beta"]),
+        ]) {
+            assert_eq!(outbound.value["server_port"], port);
+            assert_eq!(outbound.value["tag"], tag);
+            assert_eq!(outbound.collections, contributors);
+        }
     }
 }
 
@@ -701,7 +832,7 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
 }
 
 /// The outbounds the named collections contribute to a sing-box configuration,
-/// in the order the collections are named.
+/// in selected order, with every collection that admits each node's identity.
 ///
 /// A collection that does not exist is an error naming it: an empty
 /// contribution would look like a collection that serves nothing.
@@ -709,7 +840,7 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
 pub(crate) async fn outbounds_of(
     state: &AppState,
     names: &[String],
-) -> Result<Vec<serde_json::Value>, Error> {
+) -> Result<Vec<GeneratedOutbound>, Error> {
     let observations = state.providers().observations().await?;
     let index = NodeIndex::from_observations(
         observations
@@ -718,6 +849,7 @@ pub(crate) async fn outbounds_of(
     );
 
     let mut nodes: Vec<&IndexEntry> = Vec::new();
+    let mut collections = BTreeMap::<_, Vec<String>>::new();
     for name in names {
         let collection = state
             .collections()
@@ -731,15 +863,34 @@ pub(crate) async fn outbounds_of(
             View::default(),
         );
 
-        // A node two collections share is one outbound, not a duplicate tag.
+        // A shared identity is rendered once, but every admitting collection
+        // contributes to it, even when its provider uses a different name.
         for entry in resolved.nodes {
-            if !nodes.iter().any(|held| held.id == entry.id) {
+            let contributors = collections.entry(entry.id).or_insert_with(|| {
                 nodes.push(entry);
+                Vec::new()
+            });
+            if !contributors.contains(name) {
+                contributors.push(name.clone());
             }
         }
     }
 
-    Ok(suba_core::outbounds(&nodes).0)
+    let (outbounds, skipped) = suba_core::outbounds(&nodes);
+    let skipped: std::collections::BTreeSet<_> =
+        skipped.into_iter().map(|entry| entry.id).collect();
+
+    // Rendering preserves input order minus the identities it refuses. Match
+    // that same walk, not tags: even refused nodes can reserve a renamed tag.
+    Ok(nodes
+        .into_iter()
+        .filter(|entry| !skipped.contains(&entry.id))
+        .zip(outbounds)
+        .map(|(entry, value)| GeneratedOutbound {
+            value,
+            collections: collections.remove(&entry.id).expect("resolved identity"),
+        })
+        .collect())
 }
 
 /// A build that cannot render sing-box documents contributes no outbounds: the
@@ -748,7 +899,7 @@ pub(crate) async fn outbounds_of(
 pub(crate) async fn outbounds_of(
     _state: &AppState,
     _names: &[String],
-) -> Result<Vec<serde_json::Value>, Error> {
+) -> Result<Vec<GeneratedOutbound>, Error> {
     Ok(Vec::new())
 }
 

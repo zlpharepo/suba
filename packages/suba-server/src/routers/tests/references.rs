@@ -80,6 +80,7 @@ async fn reference_catalog_reads_the_named_config_without_writing() {
                     "kind": "selector",
                     "path": "outbounds[0].tag",
                     "source": "config",
+                    "collections": [],
                     "value": outbound
                 }],
                 "unchecked": suba_singbox::assemble::UNCHECKED
@@ -242,11 +243,19 @@ async fn reference_catalog_uses_selected_collections_without_refreshing() {
         assert_eq!(generated["value"]["type"], "trojan");
         assert_eq!(generated["value"]["server"], "alpha.example.com");
         assert_eq!(generated["value"]["server_port"], 443);
-        assert_eq!(generated["value"]["password"], "example-password");
+        assert!(
+            generated["value"]["password"] == "example-password",
+            "the rendered credential is preserved"
+        );
+        assert_eq!(generated["collections"], json!(["first", "repeated"]));
+        assert_eq!(config["collections"], json!([]));
         assert_eq!(config["value"], authored);
         assert_eq!(config["path"], "outbounds[0].tag");
         if let Some(previous) = previous {
-            assert_eq!(catalog, previous);
+            assert!(
+                catalog == previous,
+                "the catalog is stable without a refresh"
+            );
         }
         previous = Some(catalog);
     }
@@ -272,7 +281,7 @@ async fn reference_catalog_without_rendering_keeps_only_authored_definitions() {
         body(response).await["tags"],
         json!([{
             "tag": "authored", "space": "outbound", "kind": "direct",
-            "path": "outbounds[0].tag", "source": "config", "value": outbound
+            "path": "outbounds[0].tag", "source": "config", "collections": [], "value": outbound
         }])
     );
 }

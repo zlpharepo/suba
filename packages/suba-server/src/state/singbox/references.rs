@@ -3,9 +3,18 @@
 //! Incomplete definitions and collisions remain useful while editing. Paths are
 //! relative to their source: the saved document or the selected collections'
 //! generated outbounds, not an assembled document's shifted array indices.
+//! Collection provenance is attached during resolution, before rendering can
+//! rename or omit nodes; the catalog never guesses ownership from a tag.
 
 use serde::Serialize;
 use serde_json::Value;
+
+/// Provenance travels with the rendered value, not its potentially renamed tag.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GeneratedOutbound {
+    pub value: Value,
+    pub collections: Vec<String>,
+}
 
 /// Owned definitions keep editor previews from changing their source data.
 #[derive(Debug, Serialize)]
@@ -15,6 +24,8 @@ pub(crate) struct Tag {
     kind: Option<String>,
     path: String,
     source: Source,
+    /// Empty for authored definitions; otherwise all contributors in selected order.
+    collections: Vec<String>,
     value: Value,
 }
 
@@ -25,11 +36,13 @@ enum Source {
     Collection,
 }
 
-pub(super) fn catalog(document: &Value, generated: &[Value]) -> Vec<Tag> {
+pub(super) fn catalog(document: &Value, generated: &[GeneratedOutbound]) -> Vec<Tag> {
     let mut found = Vec::new();
     append(
         &mut found,
-        generated,
+        generated
+            .iter()
+            .map(|outbound| (&outbound.value, outbound.collections.as_slice())),
         "outbound",
         "outbounds",
         Source::Collection,
@@ -53,20 +66,26 @@ pub(super) fn catalog(document: &Value, generated: &[Value]) -> Vec<Tag> {
         ),
     ] {
         if let Some(entries) = document.pointer(pointer).and_then(Value::as_array) {
-            append(&mut found, entries, space, path, Source::Config);
+            append(
+                &mut found,
+                entries.iter().map(|value| (value, [].as_slice())),
+                space,
+                path,
+                Source::Config,
+            );
         }
     }
     found
 }
 
-fn append(
+fn append<'a>(
     found: &mut Vec<Tag>,
-    entries: &[Value],
+    entries: impl Iterator<Item = (&'a Value, &'a [String])>,
     space: &'static str,
     path: &str,
     source: Source,
 ) {
-    for (index, value) in entries.iter().enumerate() {
+    for (index, (value, collections)) in entries.enumerate() {
         let Some(tag) = value.get("tag") else {
             continue;
         };
@@ -88,6 +107,7 @@ fn append(
                 kind: value.get("type").and_then(Value::as_str).map(str::to_owned),
                 path,
                 source,
+                collections: collections.to_vec(),
                 value: value.clone(),
             });
         }
@@ -110,7 +130,7 @@ mod tests {
     ) -> Value {
         json!({
             "tag": tag, "space": space, "kind": kind, "path": path,
-            "source": source, "value": value
+            "source": source, "collections": [], "value": value
         })
     }
 
@@ -228,64 +248,70 @@ mod tests {
             "inbounds": [{"type": "mixed", "tag": "shared"}]
         });
         let generated = vec![
-            json!({"type": "trojan", "tag": "shared", "server": "example.com", "password": "example-password"}),
-            json!({"type": "direct", "tag": "shared"}),
+            GeneratedOutbound {
+                value: json!({"type": "trojan", "tag": "shared", "server_port": 443}),
+                collections: vec!["second".to_string(), "first".to_string()],
+            },
+            GeneratedOutbound {
+                value: json!({"type": "direct", "tag": "shared"}),
+                collections: vec!["third".to_string()],
+            },
         ];
         let original = (document.clone(), generated.clone());
         let mut found = catalog(&document, &generated);
-        assert_eq!(
-            serde_json::to_value(&found).unwrap(),
-            json!([
-                entry(
-                    "shared",
-                    "outbound",
-                    Some("trojan"),
-                    "outbounds[0].tag",
-                    "collection",
-                    &generated[0]
-                ),
-                entry(
-                    "shared",
-                    "outbound",
-                    Some("direct"),
-                    "outbounds[1].tag",
-                    "collection",
-                    &generated[1]
-                ),
-                entry(
-                    "shared",
-                    "outbound",
-                    Some("direct"),
-                    "outbounds[0].tag",
-                    "config",
-                    &document["outbounds"][0]
-                ),
-                entry(
-                    "shared",
-                    "outbound",
-                    Some("selector"),
-                    "outbounds[1].tag",
-                    "config",
-                    &document["outbounds"][1]
-                ),
-                entry(
-                    "shared",
-                    "outbound",
-                    Some("wireguard"),
-                    "endpoints[0].tag",
-                    "config",
-                    &document["endpoints"][0]
-                ),
-                entry(
-                    "shared",
-                    "inbound",
-                    Some("mixed"),
-                    "inbounds[0].tag",
-                    "config",
-                    &document["inbounds"][0]
-                )
-            ])
-        );
+        let mut expected = json!([
+            entry(
+                "shared",
+                "outbound",
+                Some("trojan"),
+                "outbounds[0].tag",
+                "collection",
+                &generated[0].value
+            ),
+            entry(
+                "shared",
+                "outbound",
+                Some("direct"),
+                "outbounds[1].tag",
+                "collection",
+                &generated[1].value
+            ),
+            entry(
+                "shared",
+                "outbound",
+                Some("direct"),
+                "outbounds[0].tag",
+                "config",
+                &document["outbounds"][0]
+            ),
+            entry(
+                "shared",
+                "outbound",
+                Some("selector"),
+                "outbounds[1].tag",
+                "config",
+                &document["outbounds"][1]
+            ),
+            entry(
+                "shared",
+                "outbound",
+                Some("wireguard"),
+                "endpoints[0].tag",
+                "config",
+                &document["endpoints"][0]
+            ),
+            entry(
+                "shared",
+                "inbound",
+                Some("mixed"),
+                "inbounds[0].tag",
+                "config",
+                &document["inbounds"][0]
+            )
+        ]);
+        expected[0]["collections"] = json!(["second", "first"]);
+        expected[1]["collections"] = json!(["third"]);
+        assert_eq!(serde_json::to_value(&found).unwrap(), expected);
         found[0].value["tag"] = json!("changed-preview");
         found[2].value["tag"] = json!("changed-preview");
         assert_eq!((document, generated), original);
