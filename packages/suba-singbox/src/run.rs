@@ -29,7 +29,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustix::process::{kill_process, Pid, Signal};
 use serde::Serialize;
@@ -54,10 +54,61 @@ pub const EXITS: usize = 8;
 /// cache goes, the configuration is a file rather than an argument, and `run` is
 /// the subcommand. Which binary that is belongs to the caller.
 pub fn command(binary: &Path, config: &Path, work: &Path) -> Command {
-    let mut command = Command::new(binary);
-    command.arg("-D").arg(work).arg("-c").arg(config).arg("run");
+    core_command(binary, config, work, "run")
+}
 
+/// Validate with the same binary, paths and caller-supplied identity as a run.
+pub fn check_command(binary: &Path, config: &Path, work: &Path) -> Command {
+    core_command(binary, config, work, "check")
+}
+
+fn core_command(binary: &Path, config: &Path, work: &Path, action: &str) -> Command {
+    let mut command = Command::new(binary);
     command
+        .arg("-D")
+        .arg(work)
+        .arg("-c")
+        .arg(config)
+        .arg(action);
+    command
+}
+
+/// Bound native validation and discard output that can contain configuration secrets.
+pub fn check(mut command: Command, patience: Duration) -> Result<(), Error> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| Error::Run {
+            reason: "the native configuration check could not be started",
+        })?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(Error::ConfigCheck)
+                };
+            }
+            Ok(None) if started.elapsed() < patience => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::Run {
+                    reason: if result.is_err() {
+                        "the native configuration check could not be observed"
+                    } else {
+                        "the native configuration check timed out"
+                    },
+                });
+            }
+        }
+    }
 }
 
 /// What is known about the process.
@@ -202,6 +253,20 @@ impl Runner {
         });
 
         Ok(pid)
+    }
+
+    /// Catch immediate startup exits without claiming that a live process is ready.
+    pub fn confirm_start(&self, pid: u32, grace: Duration) -> Result<(), Error> {
+        let state = self.lock();
+        let (state, _) = self
+            .ended
+            .wait_timeout_while(state, grace, |state| state.pid == Some(pid))
+            .expect("the state");
+        if state.pid == Some(pid) {
+            Ok(())
+        } else {
+            Err(Error::StartupExit)
+        }
     }
 
     /// Ask the process to end, and make sure it does.
@@ -395,6 +460,72 @@ mod tests {
             command.get_program().to_string_lossy(),
             "/versions/1.14.2/bin/sing-box"
         );
+    }
+
+    #[test]
+    fn native_check_uses_the_runtime_paths_without_starting_the_core() {
+        let command = check_command(
+            Path::new("/versions/example/bin/sing-box"),
+            Path::new("/data/sing-box/config/check.json"),
+            Path::new("/data/sing-box/data"),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-D",
+                "/data/sing-box/data",
+                "-c",
+                "/data/sing-box/config/check.json",
+                "check"
+            ]
+        );
+    }
+
+    #[test]
+    fn native_check_rejection_does_not_expose_its_output() {
+        let refused = check(
+            shell("echo private-fixture-value >&2; exit 2"),
+            Duration::from_secs(2),
+        );
+        assert_eq!(refused, Err(Error::ConfigCheck));
+        assert!(!refused
+            .unwrap_err()
+            .to_string()
+            .contains("private-fixture-value"));
+        assert_eq!(check(shell("exit 0"), Duration::from_secs(2)), Ok(()));
+    }
+
+    #[test]
+    fn native_check_has_a_bounded_lifetime() {
+        let started = Instant::now();
+        let result = check(shell("exec sleep 30"), Duration::from_millis(50));
+        assert_eq!(
+            result,
+            Err(Error::Run {
+                reason: "the native configuration check timed out"
+            })
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn startup_observation_rejects_early_exits_even_when_the_exit_code_is_zero() {
+        for script in ["exit 0", "exit 3"] {
+            let runner = Runner::new();
+            let pid = runner.spawn(shell(script)).unwrap();
+            let result = runner.confirm_start(pid, Duration::from_secs(2));
+            runner.stop(Duration::from_secs(2)).unwrap();
+            assert_eq!(result, Err(Error::StartupExit));
+        }
+        let runner = Runner::new();
+        let pid = runner.spawn(shell("exec sleep 30")).unwrap();
+        let result = runner.confirm_start(pid, Duration::from_millis(20));
+        runner.stop(Duration::from_secs(2)).unwrap();
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

@@ -56,7 +56,7 @@ fn install(server: &Server) {
     std::fs::write(dirs.schema(&version), serde_json::to_vec(&schema).unwrap()).unwrap();
     std::fs::write(
         dirs.binary(&version),
-        "#!/bin/sh\necho started\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+        "#!/bin/sh\nif [ \"$5\" = check ]; then exit 0; fi\necho started\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
     )
     .unwrap();
     std::fs::set_permissions(

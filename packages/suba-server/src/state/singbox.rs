@@ -17,16 +17,19 @@
 //! preflight keeps concurrent requests from hitting the upstream separately.
 //! The process itself outlives any single request.
 //!
-//! **The order a start keeps.** The document is read, assembled, checked
-//! against the schema of the version that will run them, written out, and only
-//! then is a process started. A configuration that does not hold up is refused
-//! with the field it is about, and a core that is already serving is never
-//! touched by one — which is what makes "restart" safe to offer.
+//! **Preflight precedes interruption.** Schema and native validation use the
+//! exact assembled document and target identity before replacing the product
+//! or stopping a serving core. A replacement that then fails to spawn or exits
+//! during the one-second startup window stays stopped; there is no automatic
+//! rollback. Surviving that window is not a network-readiness guarantee.
 
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +57,10 @@ pub(crate) const DEFAULT_CONFIG: &str = "default";
 
 /// The longest a configuration name may be.
 const CONFIG_NAME_MAX: usize = 64;
+
+const CHECK_CONFIG: &str = "check.json";
+const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_GRACE: Duration = Duration::from_secs(1);
 
 /// The file a configuration is kept in.
 fn document_file(name: &str) -> String {
@@ -203,7 +210,12 @@ fn installation_failure(error: &Error) -> &'static str {
 
 fn runtime_failure(error: &Error) -> &'static str {
     match error {
-        Error::Document(_) => "the configuration did not pass validation",
+        Error::Document(_) | Error::Singbox(core::Error::ConfigCheck) => {
+            "the configuration did not pass validation"
+        }
+        Error::Singbox(core::Error::StartupExit) => {
+            "the core exited during startup; it remains stopped"
+        }
         Error::Schema(_) => "the installed schema could not be read",
         Error::Singbox(core::Error::Run { .. }) => {
             "the core process could not be started or stopped"
@@ -238,6 +250,8 @@ pub(crate) struct SingboxStore {
     /// memory and saves parsing 445 KB on every form save and every start.
     schemas: Mutex<Option<(String, Arc<Schema>)>>,
     installs: Mutex<HashMap<Version, InstallationTask>>,
+    lifecycle: Mutex<()>,
+    shutting_down: AtomicBool,
     selection: Mutex<()>,
     /// Held across read, check and write, so an `If-Match` answers for the
     /// document it is compared with.
@@ -264,6 +278,8 @@ impl SingboxStore {
             started: Mutex::new(None),
             schemas: Mutex::new(None),
             installs: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
             selection: Mutex::new(()),
             writing: Mutex::new(()),
             phase: Mutex::new(None),
@@ -960,8 +976,8 @@ impl SingboxStore {
         self.start_or_restart(generated, None)
     }
 
-    /// Binding and native-schema failures leave the serving core and product
-    /// untouched; launch reuses the exact document that passed preflight.
+    /// Binding, schema and native-check failures leave the serving core and
+    /// product untouched; launch reuses the exact document that passed preflight.
     pub(crate) fn restart(
         &self,
         generated: &OutboundSnapshot,
@@ -975,6 +991,9 @@ impl SingboxStore {
         generated: &OutboundSnapshot,
         restart: Option<Duration>,
     ) -> Result<u32, Error> {
+        // A stop or shutdown must not finish while an earlier start can still spawn.
+        let _lifecycle = self.lifecycle.lock().expect("core lifecycle");
+        self.ensure_not_shutting_down()?;
         // Keep selection and authored edits stable from preflight through spawn.
         // No async resolution runs while either synchronous lock is held.
         let _selection = self.selection.lock().expect("current selection");
@@ -1018,15 +1037,19 @@ impl SingboxStore {
         }
 
         let binary = std::fs::canonicalize(self.dirs.binary(&version))?;
+        fs::ensure_dir(self.dirs.work())?;
+        let work = std::fs::canonicalize(self.dirs.work())?;
+        self.check_native(&binary, &assembled.config, &work, drop_to)?;
+        self.ensure_not_shutting_down()?;
         if let Some(patience) = restart {
-            self.stop(patience)?;
+            self.stop_locked(patience)?;
+            *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Starting);
+        } else if let Some(pid) = self.runner.status().pid {
+            return Err(core::Error::Running { pid }.into());
         }
         // Preflight and launch share this exact expansion, even on restart.
-        fs::ensure_dir(self.dirs.work())?;
         self.write_product(&assembled.config)?;
-
         let config = std::fs::canonicalize(self.dirs.config().join(CONFIG))?;
-        let work = std::fs::canonicalize(self.dirs.work())?;
 
         let mut command = run::command(&binary, &config, &work);
         match drop_to {
@@ -1036,18 +1059,51 @@ impl SingboxStore {
             // interface, and its own log is the only place that shows up.
             None => tracing::info!("starting {version} with this instance's privileges"),
         }
-        if let Some((uid, gid)) = drop_to {
-            // SAFETY: between `fork` and `exec` this closure makes three
-            // syscalls and nothing else — no allocation, no lock, nothing a
-            // forked child of a threaded process may not do.
-            unsafe {
-                command.pre_exec(move || drop_identity(uid, gid));
-            }
-        }
+        apply_identity(&mut command, drop_to);
 
         let pid = self.runner.spawn(command)?;
         *self.started.lock().expect("the started version") = Some(version);
+        self.runner.confirm_start(pid, STARTUP_GRACE)?;
         Ok(pid)
+    }
+
+    fn check_native(
+        &self,
+        binary: &Path,
+        config: &Value,
+        work: &Path,
+        drop_to: Option<(u32, u32)>,
+    ) -> Result<(), Error> {
+        let directory = self.dirs.config();
+        fs::write_atomic(&directory, CHECK_CONFIG, serde_json::to_vec_pretty(config)?)?;
+        let checked = (|| -> Result<(), Error> {
+            let path = std::fs::canonicalize(directory.join(CHECK_CONFIG))?;
+            let mut command = run::check_command(binary, &path, work);
+            apply_identity(&mut command, drop_to);
+            Ok(run::check(command, CHECK_TIMEOUT)?)
+        })();
+        let removed = fs::remove(&directory, CHECK_CONFIG);
+        checked?;
+        Ok(removed?)
+    }
+
+    fn ensure_not_shutting_down(&self) -> Result<(), Error> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            Err(Error::ShuttingDown)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Reject starts as soon as graceful HTTP shutdown begins, before draining requests.
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    /// Finish any in-flight lifecycle operation before stopping its managed process.
+    pub(crate) fn shutdown(&self, patience: Duration) -> Result<(), Error> {
+        self.begin_shutdown();
+        self.stop(patience)
     }
 
     /// Who a started core runs as, or a refusal when it cannot be who the
@@ -1085,6 +1141,11 @@ impl SingboxStore {
 
     /// Ask the core to stop.
     pub(crate) fn stop(&self, patience: std::time::Duration) -> Result<(), Error> {
+        let _lifecycle = self.lifecycle.lock().expect("core lifecycle");
+        self.stop_locked(patience)
+    }
+
+    fn stop_locked(&self, patience: Duration) -> Result<(), Error> {
         *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Stopping);
         let result = self.runner.stop(patience).map_err(Error::from);
         *self.phase.lock().expect("runtime phase") = match &result {
@@ -1113,6 +1174,16 @@ impl SingboxStore {
                 version: version.clone(),
             })
         })
+    }
+}
+
+fn apply_identity(command: &mut std::process::Command, drop_to: Option<(u32, u32)>) {
+    if let Some((uid, gid)) = drop_to {
+        // SAFETY: this closure only makes identity syscalls between fork and exec;
+        // it neither allocates nor acquires locks inherited from other threads.
+        unsafe {
+            command.pre_exec(move || drop_identity(uid, gid));
+        }
     }
 }
 
@@ -1264,8 +1335,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
-    /// A fake release archive: a binary that writes a schema when asked and runs
-    /// until it is asked to stop, and a minimal schema that accepts one section.
+    /// The schema accepts drafts that native validation or startup can reject,
+    /// so lifecycle regressions distinguish preflight failures from early exits.
     fn archive() -> Vec<u8> {
         let schema = serde_json::json!({
             "type": "object",
@@ -1302,6 +1373,11 @@ mod tests {
              if [ \"$1\" = generate ]; then echo 'PrivateKey: {SENTINEL}'; exit 0; fi\n\
              cd \"$2\" || exit 1\n\
              if [ ! -f \"$4\" ]; then echo 'config not found' >&2; exit 1; fi\n\
+             if [ \"$5\" = check ]; then\n\
+             \tif grep -q native-invalid \"$4\"; then echo '{SENTINEL}' >&2; exit 2; fi\n\
+             \texit 0\n\
+             fi\n\
+             if grep -q startup-failure \"$4\"; then exit 3; fi\n\
              echo started\n\
              trap 'exit 0' TERM\n\
              while :; do sleep 1; done\n",
@@ -2059,6 +2135,170 @@ mod tests {
         assert_eq!(status.exits.len(), 0);
 
         store.stop(Duration::from_secs(2)).expect("a stop");
+    }
+
+    #[tokio::test]
+    async fn graceful_server_shutdown_stops_the_core_and_refuses_later_starts() {
+        let (_scratch, fixture) = store();
+        let server = crate::SubaServer::new(crate::ServerConfig {
+            listen: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: fixture.config_dir.clone(),
+            data_dir: fixture.dirs.root.parent().unwrap().to_path_buf(),
+            privileged: Default::default(),
+        })
+        .await
+        .unwrap();
+        let store = server.state.singbox();
+        let snapshot = OutboundSnapshot::default();
+        store.start(&snapshot).unwrap();
+        wait_for(&store, "started");
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(server.serve_until(
+            async move {
+                receive.await.unwrap();
+            },
+            Duration::from_millis(100),
+        ));
+        send.send(()).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), server).await;
+        let status = store.status();
+        let later = store.start(&snapshot);
+        store.stop(Duration::from_secs(2)).unwrap();
+
+        stopped.expect("shutdown finishes").unwrap().unwrap();
+        assert!(!status.running, "shutdown must not leave an unmanaged core");
+        assert!(matches!(later, Err(Error::ShuttingDown)));
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_http_request_cannot_hold_shutdown_open() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (_scratch, fixture) = store();
+        let server = crate::SubaServer::new(crate::ServerConfig {
+            listen: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: fixture.config_dir.clone(),
+            data_dir: fixture.dirs.root.parent().unwrap().to_path_buf(),
+            privileged: Default::default(),
+        })
+        .await
+        .unwrap();
+        let address = server.tcp.local_addr().unwrap();
+        let store = server.state.singbox();
+        store.start(&OutboundSnapshot::default()).unwrap();
+        wait_for(&store, "started");
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(server.serve_until(
+            async move {
+                receive.await.unwrap();
+            },
+            Duration::from_millis(100),
+        ));
+        let mut pending = tokio::net::TcpStream::connect(address).await.unwrap();
+        pending.write_all(b"POST /api/auth/password HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        send.send(()).unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(3), &mut server).await;
+        let status = store.status();
+        drop(pending);
+        if completed.is_err() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+        }
+        store.stop(Duration::from_secs(2)).unwrap();
+
+        completed
+            .expect("a partial HTTP body must not block shutdown")
+            .unwrap()
+            .unwrap();
+        assert!(!status.running);
+    }
+
+    #[test]
+    fn shutdown_rejects_a_start_waiting_for_the_lifecycle_lock() {
+        let (_scratch, store) = store();
+        let lifecycle = store.lifecycle.lock().unwrap();
+        let result = std::thread::scope(|scope| {
+            let pending = scope.spawn(|| store.start(&OutboundSnapshot::default()));
+            store.begin_shutdown();
+            drop(lifecycle);
+            pending.join().unwrap()
+        });
+        store.stop(Duration::from_secs(2)).unwrap();
+        assert!(matches!(result, Err(Error::ShuttingDown)));
+        assert!(!store.assembled());
+    }
+
+    #[test]
+    fn native_validation_preserves_the_running_core_and_product() {
+        let (_scratch, store) = store();
+        let snapshot = OutboundSnapshot::default();
+        let pid = store.start(&snapshot).unwrap();
+        wait_for(&store, "started");
+        let before = std::fs::read(store.dirs.config().join(CONFIG)).unwrap();
+        let saved = store
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "native-invalid" }),
+                None,
+                &snapshot,
+            )
+            .unwrap();
+        assert!(saved.warnings.is_empty());
+
+        let result = store.restart(&snapshot, Duration::from_secs(2));
+        let status = store.status();
+        let after = std::fs::read(store.dirs.config().join(CONFIG)).unwrap();
+        let log = store.log(run::LOG_LINES);
+        store.stop(Duration::from_secs(2)).unwrap();
+
+        assert!(
+            matches!(&result, Err(Error::Singbox(core::Error::ConfigCheck))),
+            "native validation must reject the restart: {result:?}"
+        );
+        assert!(!result.unwrap_err().to_string().contains(SENTINEL));
+        assert_eq!(status.pid, Some(pid));
+        assert_eq!(before, after);
+        assert!(!log.iter().any(|line| line.contains(SENTINEL)));
+        assert_eq!(fs::list(&store.dirs.config()).unwrap(), [CONFIG]);
+    }
+
+    #[test]
+    fn a_restart_that_exits_during_startup_reports_failure_without_rollback() {
+        let (_scratch, store) = store();
+        let snapshot = OutboundSnapshot::default();
+        store.start(&snapshot).unwrap();
+        wait_for(&store, "started");
+        store
+            .write_section(
+                NAME,
+                "log",
+                serde_json::json!({ "level": "startup-failure" }),
+                None,
+                &snapshot,
+            )
+            .unwrap();
+
+        let result = store.restart(&snapshot, Duration::from_secs(2));
+        for _ in 0..200 {
+            if !store.status().running {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = store.status();
+        let phase = store.runtime_phase();
+        store.stop(Duration::from_secs(2)).unwrap();
+
+        assert!(
+            matches!(&result, Err(Error::Singbox(core::Error::StartupExit))),
+            "an early exit must fail the restart request: {result:?}"
+        );
+        assert!(!status.running);
+        assert_eq!(status.exits.last().unwrap().code, Some(3));
+        assert!(matches!(phase, Some(RuntimePhase::Failed { .. })));
     }
 
     #[test]

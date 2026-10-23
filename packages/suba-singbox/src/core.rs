@@ -116,7 +116,13 @@ pub enum Error {
         version: String,
         reason: &'static str,
     },
-    /// The binary was asked to write its own schema and did not.
+    /// Native validation failed without exposing credential-bearing output.
+    #[error("configuration: rejected by the core's native validation")]
+    ConfigCheck,
+    /// A spawned process exited before the startup observation window ended.
+    #[error("runtime: the core exited during startup; it remains stopped")]
+    StartupExit,
+    /// The binary could not complete a process operation.
     #[error("the process did not do what it was asked: {reason}")]
     Run { reason: &'static str },
     /// The core was asked to generate something and did not.

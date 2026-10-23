@@ -31,15 +31,73 @@ impl SubaServer {
     }
 
     pub async fn serve(self) -> Result<(), Error> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        self.serve_until(
+            async move {
+                tokio::select! {
+                    _ = interrupt.recv() => {},
+                    _ = terminate.recv() => {},
+                }
+            },
+            std::time::Duration::from_secs(10),
+        )
+        .await
+    }
+
+    async fn serve_until(
+        self,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+        drain_timeout: std::time::Duration,
+    ) -> Result<(), Error> {
         let router = routers::AppRouter::route(self.state.web_dir()).with_state(self.state.clone());
 
         // Providers start refreshing as soon as the server does, so a
         // restart does not leave subscriptions stale until their next tick.
-        tokio::spawn(self.state.refresher().run());
+        let refresher = tokio::spawn(self.state.refresher().run());
+        #[cfg(feature = "singbox-core")]
+        let stopping = self.state.singbox();
 
         tracing::info!("SubA server running on http://{}", self.tcp.local_addr()?);
-        axum::serve(self.tcp, router.into_make_service()).await?;
+        let (notified, signal) = tokio::sync::oneshot::channel();
+        let serving = async move {
+            axum::serve(self.tcp, router.into_make_service())
+                .with_graceful_shutdown(async move {
+                    shutdown.await;
+                    #[cfg(feature = "singbox-core")]
+                    stopping.begin_shutdown();
+                    let _ = notified.send(());
+                })
+                .await
+        };
+        tokio::pin!(serving);
+        let finished = tokio::select! {
+            result = &mut serving => Some(result),
+            _ = signal => None,
+        };
+        refresher.abort();
+        let _ = refresher.await;
 
-        Ok(())
+        // An unfinished HTTP request must not keep the managed core alive.
+        #[cfg(feature = "singbox-core")]
+        let stopped = {
+            let store = self.state.singbox();
+            tokio::task::spawn_blocking(move || store.shutdown(std::time::Duration::from_secs(10)))
+        };
+        let served = match finished {
+            Some(result) => result,
+            None => match tokio::time::timeout(drain_timeout, &mut serving).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("HTTP shutdown grace period elapsed");
+                    Ok(())
+                }
+            },
+        };
+        #[cfg(feature = "singbox-core")]
+        stopped.await??;
+        Ok(served?)
     }
 }

@@ -172,6 +172,11 @@ pub enum Error {
     )]
     NoDropTarget,
 
+    /// Shutdown must not accept a new core after the managed process is stopped.
+    #[cfg(feature = "singbox-core")]
+    #[error("runtime: the server is shutting down")]
+    ShuttingDown,
+
     /// There is no version to run.
     #[cfg(feature = "singbox-core")]
     #[error("no version is installed and current")]
@@ -358,12 +363,17 @@ impl IntoHttpError for Error {
                     | Core::RunningVersion { .. }
                     | Core::Hash { .. }
                     | Core::Running { .. } => StatusCode::CONFLICT,
-                    Core::Generate { .. } | Core::TooOld { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+                    Core::Generate { .. } | Core::TooOld { .. } | Core::ConfigCheck => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
                     Core::Refused { .. } | Core::Network { .. } => StatusCode::BAD_GATEWAY,
                     _ => StatusCode::INTERNAL_SERVER_ERROR,
                 };
 
                 let message = match status_code {
+                    StatusCode::INTERNAL_SERVER_ERROR if error == Core::StartupExit => {
+                        error.to_string()
+                    }
                     StatusCode::INTERNAL_SERVER_ERROR => {
                         tracing::error!("sing-box: {error}");
 
@@ -377,6 +387,11 @@ impl IntoHttpError for Error {
                     message,
                 }
             }
+            #[cfg(feature = "singbox-core")]
+            Error::ShuttingDown => HttpError {
+                status_code: StatusCode::SERVICE_UNAVAILABLE,
+                message: "runtime: the server is shutting down".to_string(),
+            },
             #[cfg(feature = "singbox-core")]
             Error::Document(message) => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
@@ -475,6 +490,27 @@ mod tests {
 
     fn status(error: Error) -> StatusCode {
         error.into_http_error().status_code
+    }
+
+    #[test]
+    fn runtime_failures_have_static_actionable_http_responses() {
+        let checked = Error::Singbox(Core::ConfigCheck).into_http_error();
+        assert_eq!(checked.status_code, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            checked.message,
+            "configuration: rejected by the core's native validation"
+        );
+
+        let started = Error::Singbox(Core::StartupExit).into_http_error();
+        assert_eq!(started.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            started.message,
+            "runtime: the core exited during startup; it remains stopped"
+        );
+
+        let shutdown = Error::ShuttingDown.into_http_error();
+        assert_eq!(shutdown.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(shutdown.message, "runtime: the server is shutting down");
     }
 
     #[test]
