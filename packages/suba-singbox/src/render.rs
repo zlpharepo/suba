@@ -61,6 +61,11 @@ pub enum Reason {
     Protocol(Kind),
     /// How the node is carried has no representation.
     Transport(String),
+    /// A modelled option cannot be preserved; diagnostics never include its value.
+    Field {
+        field: &'static str,
+        reason: &'static str,
+    },
     /// A value sing-box has no spelling for.
     Value {
         /// Which field.
@@ -421,20 +426,32 @@ fn transport_of(transport: &Transport) -> Option<Result<Value, Reason>> {
             if let Some(early_data) = ws.early_data {
                 block.insert("max_early_data".to_string(), json!(early_data));
             }
+            if let Some(header_name) = &ws.header_name {
+                block.insert("early_data_header_name".to_string(), json!(header_name));
+            }
 
             Some(Ok(Value::Object(block)))
         }
         Transport::Grpc(grpc) => {
+            if grpc.authority.is_some() {
+                return Some(Err(Reason::Field {
+                    field: "transport.grpc.authority",
+                    reason: "an explicit authority cannot be represented by sing-box",
+                }));
+            }
+            // Multi mode changes the RPC framing, not keepalive without streams.
+            if grpc.multi_mode {
+                return Some(Err(Reason::Field {
+                    field: "transport.grpc.multi_mode",
+                    reason: "multi mode cannot be represented by sing-box",
+                }));
+            }
             let mut block = Map::new();
             block.insert("type".to_string(), json!("grpc"));
             block.insert(
                 "service_name".to_string(),
                 json!(grpc.service_name.as_ref()),
             );
-
-            if grpc.multi_mode {
-                block.insert("permit_without_stream".to_string(), json!(true));
-            }
 
             Some(Ok(Value::Object(block)))
         }
@@ -566,6 +583,70 @@ mod tests {
         let outbound = written("Trojan", "trojan://PASSWORD@example.com:443#Trojan");
 
         assert!(outbound.get("transport").is_none(), "{outbound}");
+    }
+
+    #[test]
+    fn websocket_early_data_keeps_its_explicit_header_name() {
+        for scheme in [
+            "vless://11111111-2222-3333-4444-555555555555",
+            "trojan://fixture-password",
+        ] {
+            let link = format!(
+                "{scheme}@example.com:443?type=ws&path=%2Fws&ed=2048&eh=Sec-WebSocket-Protocol"
+            );
+            let value = written("fixture", &link);
+            assert_eq!(value["transport"]["max_early_data"], 2048);
+            assert_eq!(
+                value["transport"]["early_data_header_name"],
+                "Sec-WebSocket-Protocol"
+            );
+        }
+    }
+
+    #[test]
+    fn grpc_multi_mode_is_not_reinterpreted_as_keepalive() {
+        let node = node(
+            "trojan://fixture-password@example.com:443?type=grpc&serviceName=fixture&mode=multi",
+        );
+        assert_eq!(
+            outbound("fixture", &node),
+            Err(Reason::Field {
+                field: "transport.grpc.multi_mode",
+                reason: "multi mode cannot be represented by sing-box",
+            })
+        );
+    }
+
+    #[test]
+    fn grpc_authority_is_not_silently_dropped() {
+        let node = node("trojan://fixture-password@example.com:443?type=grpc&serviceName=fixture&authority=private-authority.example.com");
+        let result = outbound("fixture", &node);
+        assert!(result.is_err(), "an explicit authority cannot be discarded");
+        assert!(!format!("{:?}", result.unwrap_err()).contains("private-authority"));
+    }
+
+    #[test]
+    fn grpc_refusals_leave_supported_transports_in_the_batch() {
+        let standard =
+            node("trojan://fixture-password@example.com:443?type=grpc&serviceName=fixture");
+        let multi = node(
+            "trojan://fixture-password@example.com:444?type=grpc&serviceName=fixture&mode=multi",
+        );
+        let authority = node("trojan://fixture-password@example.com:445?type=grpc&authority=private-authority.example.com");
+        let (values, refused) = outbounds(&[
+            ("standard", &standard),
+            ("multi", &multi),
+            ("authority", &authority),
+        ]);
+        assert_eq!(values.len(), 1);
+        assert_eq!(
+            values[0]["transport"],
+            json!({"type": "grpc", "service_name": "fixture"})
+        );
+        assert_eq!(
+            refused.iter().map(|item| item.index).collect::<Vec<_>>(),
+            [1, 2]
+        );
     }
 
     #[test]

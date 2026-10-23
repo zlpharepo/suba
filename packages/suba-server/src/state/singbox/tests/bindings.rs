@@ -96,6 +96,7 @@ fn snapshot(tags: &[(&str, &[&str])]) -> OutboundSnapshot {
             })
             .collect(),
         unavailable: false,
+        skipped: Vec::new(),
     }
 }
 

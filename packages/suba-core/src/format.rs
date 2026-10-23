@@ -309,12 +309,12 @@ fn refusals(
             reason: match refusal.reason {
                 suba_singbox::Reason::Protocol(kind) => SkipReason::Protocol(kind),
                 suba_singbox::Reason::Transport(carriage) => SkipReason::Transport(carriage),
-                // The dialect could not spell a value sing-box accepts; the
-                // field and what the node said are the whole explanation, and
-                // neither is a credential.
-                suba_singbox::Reason::Value { field, spelling } => SkipReason::Refused {
-                    kind: proto::ErrorKind::InvalidValue,
-                    reason: format!("{field}: {spelling} has no sing-box spelling"),
+                suba_singbox::Reason::Field { field, reason } => {
+                    SkipReason::Field { field, reason }
+                }
+                suba_singbox::Reason::Value { field, .. } => SkipReason::Field {
+                    field,
+                    reason: "the value cannot be represented by sing-box",
                 },
             },
         });
@@ -425,6 +425,11 @@ pub enum SkipReason {
     Protocol(Kind),
     /// The format has no representation for how the node is carried.
     Transport(String),
+    /// A known field cannot be preserved, without including its supplied value.
+    Field {
+        field: &'static str,
+        reason: &'static str,
+    },
     /// The model refused to write it, with a typed kind and the model's own
     /// static explanation — never a value from the node.
     Refused {
@@ -517,6 +522,44 @@ mod tests {
 
         assert_eq!(document["outbounds"], serde_json::Value::Array(outbounds));
         assert_eq!(rendered.skipped.len(), skipped.len());
+    }
+
+    #[cfg(feature = "singbox")]
+    #[test]
+    fn singbox_transport_refusals_keep_static_fields_and_partial_output() {
+        let fixtures = [
+            "trojan://fixture-secret@example.com:443?type=ws&ed=2048&eh=Sec-WebSocket-Protocol#supported".to_string(),
+            "trojan://fixture-secret@example.com:444?type=grpc&authority=private-authority.example.com#rejected".to_string(),
+            "trojan://fixture-secret@example.com:445?type=grpc&mode=multi#multi".to_string(),
+        ];
+        let index = index(&fixtures);
+        let nodes = entries(&index);
+        let (outbounds, skipped) = crate::outbounds(&nodes);
+        assert_eq!(outbounds.len(), 1);
+        assert_eq!(
+            outbounds[0]["transport"]["early_data_header_name"],
+            "Sec-WebSocket-Protocol"
+        );
+        assert_eq!(skipped.len(), 2);
+        for (refused, field) in skipped
+            .iter()
+            .zip(["transport.grpc.authority", "transport.grpc.multi_mode"])
+        {
+            assert!(
+                matches!(refused.reason, SkipReason::Field { field: held, .. } if held == field)
+            );
+            let reason = format!("{:?}", refused.reason);
+            assert!(!reason.contains("private-authority"));
+            assert!(!reason.contains("fixture-secret"));
+        }
+        let rendered = Format::Singbox
+            .render(&nodes, RenderIntent::Client)
+            .unwrap();
+        assert_eq!(rendered.skipped, skipped);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&rendered.body).unwrap()["outbounds"],
+            serde_json::json!(outbounds)
+        );
     }
 
     /// A node the dialect cannot write is reported against the entry it came

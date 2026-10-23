@@ -101,6 +101,48 @@ impl Drop for CoreGuard {
 }
 
 #[tokio::test]
+async fn collection_conversion_skips_remain_visible_without_blocking_usable_members() {
+    let server = Server::start().await;
+    install(&server);
+    assert_eq!(server.put_json("/api/providers/source", json!({
+        "type": "inline",
+        "payload": "trojan://fixture-password@example.com:443#working\ntrojan://private-password@example.com:444?type=grpc&mode=multi#private-node\n"
+    })).await.status(), 201);
+    assert_eq!(
+        server
+            .put_json("/api/collections/first", json!({"providers": ["source"]}))
+            .await
+            .status(),
+        201
+    );
+    choose(&server, &["first"]).await;
+    let authored = json!({"outbounds": [{"type": "selector", "tag": "group", "x-suba-collections": ["first"]}]});
+    assert_eq!(
+        server.put_json(CONFIG, authored.clone()).await.status(),
+        200
+    );
+    let references = get(&server, REFERENCES).await;
+    assert_eq!(
+        references["skipped"],
+        json!([{
+            "path": "nodes[1].transport.grpc.multi_mode",
+            "reason": "multi mode cannot be represented by sing-box"
+        }])
+    );
+    let started = action(&server, "start").await;
+    assert_eq!(started.status(), 200);
+    let pid = body(started).await["pid"].as_i64().unwrap() as i32;
+    let mut guard = CoreGuard(rustix::process::Pid::from_raw(pid));
+    let assembled = product(&server);
+    assert_eq!(assembled["outbounds"][0]["outbounds"], json!(["working"]));
+    assert_eq!(assembled["outbounds"].as_array().unwrap().len(), 2);
+    assert!(assembled.get("skipped").is_none());
+    assert_eq!(get(&server, CONFIG).await, authored);
+    assert_eq!(action(&server, "stop").await.status(), 200);
+    guard.0 = None;
+}
+
+#[tokio::test]
 async fn collection_bindings_http_writes_preserve_drafts_and_static_failures() {
     let server = Server::start().await;
     install(&server);

@@ -270,6 +270,67 @@ async fn reference_catalog_uses_selected_collections_without_refreshing() {
 
 #[cfg(feature = "singbox")]
 #[tokio::test]
+async fn reference_catalog_reports_conversion_skips_without_losing_usable_nodes() {
+    let server = Server::start().await;
+    let multi = "trojan://private-password@example.com:444?type=grpc&mode=multi#private-node";
+    for (provider, payload) in [
+        ("alpha", format!("trojan://fixture-password@example.com:443?type=ws&ed=2048&eh=Sec-WebSocket-Protocol#working\n{multi}\ntrojan://private-password@example.com:445?type=grpc&authority=private-authority.example.com#private-node\n")),
+        ("beta", format!("{multi}\n")),
+    ] {
+        assert_eq!(server.put_json(&format!("/api/providers/{provider}"), json!({"type": "inline", "payload": payload})).await.status(), 201);
+    }
+    for name in ["first", "again"] {
+        assert_eq!(
+            server
+                .put_json(
+                    &format!("/api/collections/{name}"),
+                    json!({"providers": ["alpha", "beta"]})
+                )
+                .await
+                .status(),
+            201
+        );
+    }
+    choose(&server, &["first", "again"]).await;
+    write_config(
+        &server,
+        "edited",
+        json!({"outbounds": [{"type": "selector", "tag": "group", "x-suba-collections": ["first"]}]}),
+    );
+    let response = server.authed(Method::GET, REFERENCES).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let catalog = body(response).await;
+    assert_eq!(catalog["tags"].as_array().unwrap().len(), 2);
+    assert_eq!(catalog["tags"][0]["tag"], "working");
+    assert_eq!(catalog["tags"][0]["collections"], json!(["first", "again"]));
+    assert_eq!(
+        catalog["tags"][0]["value"]["transport"]["early_data_header_name"],
+        "Sec-WebSocket-Protocol"
+    );
+    assert_eq!(
+        catalog["skipped"],
+        json!([
+            {"path": "nodes[1].transport.grpc.multi_mode", "reason": "multi mode cannot be represented by sing-box"},
+            {"path": "nodes[2].transport.grpc.authority", "reason": "an explicit authority cannot be represented by sing-box"},
+            {"path": "nodes[3].transport.grpc.multi_mode", "reason": "multi mode cannot be represented by sing-box"}
+        ])
+    );
+    assert!(!catalog["skipped"].to_string().contains("private-"));
+
+    let rendered = server
+        .authed(Method::GET, "/api/collections/first/content?format=singbox")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rendered.status(), 200);
+    assert_eq!(rendered.headers()["x-suba-skipped"], "3");
+    let value: Value = serde_json::from_str(&rendered.text().await.unwrap()).unwrap();
+    assert_eq!(value["outbounds"].as_array().unwrap().len(), 1);
+    assert_eq!(value["outbounds"][0]["tag"], "working");
+}
+
+#[cfg(feature = "singbox")]
+#[tokio::test]
 async fn reference_catalog_distinguishes_unavailable_selection_from_empty_collections() {
     let server = Server::start().await;
     let outbound = json!({"type": "selector", "tag": "authored", "x-suba-collections": ["empty"]});

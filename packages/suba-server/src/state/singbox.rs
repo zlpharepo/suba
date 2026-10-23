@@ -46,7 +46,7 @@ use crate::{error::Error, fs, identity::Identity};
 mod bindings;
 mod references;
 pub(crate) use bindings::OutboundSnapshot;
-pub(crate) use references::{GeneratedOutbound, Tag};
+pub(crate) use references::{ConversionSkip, GeneratedOutbound, Tag};
 
 /// The directory the operator's configurations live in, under the config
 /// directory.

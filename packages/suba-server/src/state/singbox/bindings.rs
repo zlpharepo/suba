@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 use suba_singbox::assemble::{self, Assembled, Fault, Unfit};
 
-use super::GeneratedOutbound;
+use super::{ConversionSkip, GeneratedOutbound};
 use crate::error::Error;
 
 const EXTENSION: &str = "x-suba-collections";
@@ -19,6 +19,7 @@ const EXTENSION: &str = "x-suba-collections";
 pub(crate) struct OutboundSnapshot {
     pub selected: Vec<String>,
     pub outbounds: Vec<GeneratedOutbound>,
+    pub skipped: Vec<ConversionSkip>,
     /// A missing selected collection must not masquerade as an empty one.
     pub unavailable: bool,
 }

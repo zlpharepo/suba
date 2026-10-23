@@ -13,7 +13,7 @@ use suba_core::format::{Format, RenderIntent};
 use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source};
 
 #[cfg(feature = "singbox-core")]
-use crate::state::singbox::GeneratedOutbound;
+use crate::state::singbox::{ConversionSkip, GeneratedOutbound};
 
 use crate::{
     dto::{Authenticated, ResponseResult},
@@ -650,7 +650,7 @@ mod artifact_tests {
         collection(&state, "main", &["alpha"]).await;
         collection(&state, "again", &["alpha"]).await;
 
-        let outbounds = outbounds_of(&state, &["main".to_string(), "again".to_string()])
+        let (outbounds, _) = outbounds_of(&state, &["main".to_string(), "again".to_string()])
             .await
             .unwrap();
         let tags: Vec<&str> = outbounds
@@ -737,7 +737,7 @@ mod artifact_tests {
             "second",
         ]
         .map(str::to_string);
-        let outbounds = outbounds_of(&state, &selected).await.unwrap();
+        let (outbounds, _) = outbounds_of(&state, &selected).await.unwrap();
         assert_eq!(outbounds.len(), 4);
         for (outbound, (port, tag, contributors)) in outbounds.iter().zip([
             (443, "[beta] shared-second", vec!["second"]),
@@ -773,7 +773,7 @@ mod artifact_tests {
             collection(&state, provider, &[provider]).await;
         }
         collection(&state, "shared", &["alpha"]).await;
-        let outbounds = outbounds_of(
+        let (outbounds, _) = outbounds_of(
             &state,
             &["rejected", "alpha", "beta", "shared"].map(str::to_string),
         )
@@ -830,7 +830,7 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
 pub(crate) async fn outbounds_of(
     state: &AppState,
     names: &[String],
-) -> Result<Vec<GeneratedOutbound>, Error> {
+) -> Result<(Vec<GeneratedOutbound>, Vec<ConversionSkip>), Error> {
     let observations = state.providers().observations().await?;
     let index = NodeIndex::from_observations(
         observations
@@ -868,14 +868,40 @@ pub(crate) async fn outbounds_of(
 
     suba_core::name_conflicts(&mut nodes);
     let (outbounds, skipped) = suba_core::outbounds(&nodes.iter().collect::<Vec<_>>());
-    let skipped: std::collections::BTreeSet<_> =
-        skipped.into_iter().map(|entry| entry.id).collect();
+    let refused: BTreeMap<_, _> = skipped
+        .iter()
+        .map(|entry| (entry.id, &entry.reason))
+        .collect();
+    let skipped = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let reason = refused.get(&entry.id)?;
+            let (field, reason) = match reason {
+                suba_core::format::SkipReason::Field { field, reason } => (*field, *reason),
+                suba_core::format::SkipReason::Protocol(_) => {
+                    ("protocol", "the protocol cannot be represented by sing-box")
+                }
+                suba_core::format::SkipReason::Transport(_) => (
+                    "transport",
+                    "the transport cannot be represented by sing-box",
+                ),
+                suba_core::format::SkipReason::Refused { .. } => {
+                    ("node", "the node cannot be represented by sing-box")
+                }
+            };
+            Some(ConversionSkip {
+                path: format!("nodes[{index}].{field}"),
+                reason,
+            })
+        })
+        .collect();
 
     // Rendering preserves input order minus the identities it refuses. Match
     // that same walk, not tags: even refused nodes can reserve a renamed tag.
-    Ok(nodes
+    let generated = nodes
         .into_iter()
-        .filter(|entry| !skipped.contains(&entry.id))
+        .filter(|entry| !refused.contains_key(&entry.id))
         .zip(outbounds)
         .map(|(entry, value)| GeneratedOutbound {
             value,
@@ -883,7 +909,8 @@ pub(crate) async fn outbounds_of(
                 .remove(&(entry.source.provider, entry.id))
                 .expect("resolved provider entry"),
         })
-        .collect())
+        .collect();
+    Ok((generated, skipped))
 }
 
 /// A build that cannot render sing-box documents contributes no outbounds: the
@@ -892,8 +919,8 @@ pub(crate) async fn outbounds_of(
 pub(crate) async fn outbounds_of(
     _state: &AppState,
     _names: &[String],
-) -> Result<Vec<GeneratedOutbound>, Error> {
-    Ok(Vec::new())
+) -> Result<(Vec<GeneratedOutbound>, Vec<ConversionSkip>), Error> {
+    Ok((Vec::new(), Vec::new()))
 }
 
 /// The compiled filter of every provider the collection names.

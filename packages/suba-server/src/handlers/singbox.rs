@@ -26,8 +26,8 @@ use crate::{
     error::Error,
     handlers::collections::outbounds_of,
     state::singbox::{
-        Document, InstallationTask, OutboundSnapshot, Privilege, RuntimePhase, Saved, Settings,
-        SingboxStore, Tag,
+        ConversionSkip, Document, InstallationTask, OutboundSnapshot, Privilege, RuntimePhase,
+        Saved, Settings, SingboxStore, Tag,
     },
     AppState,
 };
@@ -194,14 +194,15 @@ async fn generated(state: &AppState) -> Result<OutboundSnapshot, Error> {
     let selected = tokio::task::spawn_blocking(move || store.settings())
         .await??
         .collections;
-    let (outbounds, unavailable) = match outbounds_of(state, &selected).await {
-        Ok(outbounds) => (outbounds, false),
-        Err(Error::CollectionNotFound(_)) => (Vec::new(), true),
+    let (outbounds, skipped, unavailable) = match outbounds_of(state, &selected).await {
+        Ok((outbounds, skipped)) => (outbounds, skipped, false),
+        Err(Error::CollectionNotFound(_)) => (Vec::new(), Vec::new(), true),
         Err(error) => return Err(error),
     };
     Ok(OutboundSnapshot {
         selected,
         outbounds,
+        skipped,
         unavailable,
     })
 }
@@ -1150,6 +1151,9 @@ pub async fn generate(
 #[derive(Debug, Serialize)]
 pub struct References {
     pub tags: Vec<Tag>,
+    /// Partial conversion does not invalidate the usable portion of the catalog.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<ConversionSkip>,
     /// Catalog presence does not imply validation; retain runtime's stated gaps.
     pub unchecked: &'static [assemble::Unchecked],
 }
@@ -1162,12 +1166,14 @@ pub async fn references(
 ) -> ResponseResult<Json<References>> {
     let generated = generated(&state).await?;
     generated.ensure_available()?;
+    let skipped = generated.skipped;
     let store = state.singbox();
     let tags = tokio::task::spawn_blocking(move || store.references(&name, &generated.outbounds))
         .await??;
 
     Ok(Json(References {
         tags,
+        skipped,
         unchecked: assemble::UNCHECKED,
     }))
 }

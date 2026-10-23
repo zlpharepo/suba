@@ -16,6 +16,13 @@ pub(crate) struct GeneratedOutbound {
     pub collections: Vec<String>,
 }
 
+/// Input positions identify skipped entries without exposing node names or credentials.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct ConversionSkip {
+    pub path: String,
+    pub reason: &'static str,
+}
+
 /// Owned definitions keep editor previews from changing their source data.
 #[derive(Debug, Serialize)]
 pub(crate) struct Tag {
