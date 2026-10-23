@@ -26,7 +26,7 @@ use crate::{
     error::Error,
     handlers::collections::outbounds_of,
     state::singbox::{
-        Document, GeneratedOutbound, InstallationTask, Privilege, RuntimePhase, Saved, Settings,
+        Document, InstallationTask, OutboundSnapshot, Privilege, RuntimePhase, Saved, Settings,
         SingboxStore, Tag,
     },
     AppState,
@@ -187,22 +187,23 @@ pub async fn index(
     ))
 }
 
-/// The outbounds the chosen collections contribute right now.
-async fn generated(state: &AppState) -> Result<Vec<Value>, Error> {
-    Ok(generated_with_collections(state)
-        .await?
-        .into_iter()
-        .map(|outbound| outbound.value)
-        .collect())
-}
-
-async fn generated_with_collections(state: &AppState) -> Result<Vec<GeneratedOutbound>, Error> {
+/// Resolve once without refreshing; unavailable collections remain save warnings
+/// so a draft can be repaired, but cannot become a runtime product or preview.
+async fn generated(state: &AppState) -> Result<OutboundSnapshot, Error> {
     let store = state.singbox();
-    let names = tokio::task::spawn_blocking(move || store.settings())
+    let selected = tokio::task::spawn_blocking(move || store.settings())
         .await??
         .collections;
-
-    outbounds_of(state, &names).await
+    let (outbounds, unavailable) = match outbounds_of(state, &selected).await {
+        Ok(outbounds) => (outbounds, false),
+        Err(Error::CollectionNotFound(_)) => (Vec::new(), true),
+        Err(error) => return Err(error),
+    };
+    Ok(OutboundSnapshot {
+        selected,
+        outbounds,
+        unavailable,
+    })
 }
 
 /// What the process is doing, and the end of what it said.
@@ -244,7 +245,7 @@ pub async fn act(
     let store = state.singbox();
     let tail = query.tail.unwrap_or(run::LOG_LINES).min(run::LOG_LINES);
     let generated = match action.action {
-        Command::Stop => Vec::new(),
+        Command::Stop => OutboundSnapshot::default(),
         Command::Start | Command::Restart => generated(&state).await?,
     };
 
@@ -256,13 +257,7 @@ pub async fn act(
                 }
                 Command::Stop => store.stop(PATIENCE)?,
                 Command::Restart => {
-                    // Checked before the stop, so a configuration that does not
-                    // hold up — or a core that cannot be started as it is set
-                    // to — leaves the running core running.
-                    store.assemble(&generated)?;
-                    store.startable()?;
-                    store.stop(PATIENCE)?;
-                    store.start(&generated)?;
+                    store.restart(&generated, PATIENCE)?;
                 }
             }
 
@@ -793,7 +788,7 @@ mod version_view_tests {
             })
             .unwrap();
 
-        assert!(store.start(&[]).is_err());
+        assert!(store.start(&OutboundSnapshot::default()).is_err());
         // A broken record is reported as an error rather than used as a view.
         // Keep the metadata valid so the runtime view can be inspected.
         let metadata = Metadata {
@@ -1165,9 +1160,11 @@ pub async fn references(
     _auth: Authenticated,
     Path(name): Path<String>,
 ) -> ResponseResult<Json<References>> {
-    let generated = generated_with_collections(&state).await?;
+    let generated = generated(&state).await?;
+    generated.ensure_available()?;
     let store = state.singbox();
-    let tags = tokio::task::spawn_blocking(move || store.references(&name, &generated)).await??;
+    let tags = tokio::task::spawn_blocking(move || store.references(&name, &generated.outbounds))
+        .await??;
 
     Ok(Json(References {
         tags,

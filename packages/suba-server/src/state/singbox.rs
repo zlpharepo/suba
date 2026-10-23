@@ -8,7 +8,9 @@
 //! configurations the operator wrote, each edited whole or a section or an
 //! entry at a time, of which the settings name the one in use; and
 //! `data/sing-box/config/config.json` is what a start assembled from it, which
-//! is ours to overwrite.
+//! is ours to overwrite. Authored selector/urltest entries may bind collection
+//! names with `x-suba-collections`; their generated members exist only in the
+//! runtime product. Provider refreshes and selection changes never reload it.
 //!
 //! File and process operations run on the blocking pool. Release fetching is
 //! asynchronous; one in-memory cache shared by the releases route and install
@@ -29,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use suba_singbox::assemble::{self, Assembled};
+use suba_singbox::assemble::Assembled;
 use suba_singbox::core::{self, Asset, Dirs, Metadata, Release, Version};
 use suba_singbox::install::{self, Generate};
 use suba_singbox::run::{self, Runner, Status};
@@ -38,7 +40,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{error::Error, fs, identity::Identity};
 
+mod bindings;
 mod references;
+pub(crate) use bindings::OutboundSnapshot;
 pub(crate) use references::{GeneratedOutbound, Tag};
 
 /// The directory the operator's configurations live in, under the config
@@ -482,7 +486,7 @@ impl SingboxStore {
         name: &str,
         value: Value,
         if_match: Option<&str>,
-        generated: &[Value],
+        generated: &OutboundSnapshot,
     ) -> Result<Saved, Error> {
         self.edit(name, if_match, generated, |sections| {
             let Value::Object(replacement) = value else {
@@ -501,7 +505,7 @@ impl SingboxStore {
         section: &str,
         value: Value,
         if_match: Option<&str>,
-        generated: &[Value],
+        generated: &OutboundSnapshot,
     ) -> Result<Saved, Error> {
         self.edit(name, if_match, generated, |sections| {
             sections.insert(section.to_string(), value);
@@ -516,7 +520,7 @@ impl SingboxStore {
         name: &str,
         section: &str,
         if_match: Option<&str>,
-        generated: &[Value],
+        generated: &OutboundSnapshot,
     ) -> Result<Saved, Error> {
         self.edit(name, if_match, generated, |sections| {
             sections
@@ -539,7 +543,7 @@ impl SingboxStore {
         tag: &str,
         value: Value,
         if_match: Option<&str>,
-        generated: &[Value],
+        generated: &OutboundSnapshot,
     ) -> Result<Saved, Error> {
         let Value::Object(mut entry) = value else {
             return Err(Error::Document(format!(
@@ -585,7 +589,7 @@ impl SingboxStore {
         section: &str,
         tag: &str,
         if_match: Option<&str>,
-        generated: &[Value],
+        generated: &OutboundSnapshot,
     ) -> Result<Saved, Error> {
         self.edit(name, if_match, generated, |sections| {
             let index = sections
@@ -617,7 +621,7 @@ impl SingboxStore {
         &self,
         name: &str,
         if_match: Option<&str>,
-        generated: &[Value],
+        generated: &OutboundSnapshot,
         change: impl FnOnce(&mut Map<String, Value>) -> Result<(), Error>,
     ) -> Result<Saved, Error> {
         let _writing = self.writing.lock().expect("the configuration");
@@ -633,8 +637,9 @@ impl SingboxStore {
         change(&mut sections)?;
         let value = Value::Object(sections);
 
+        let native = bindings::project(&value)?;
         let (schema, _) = self.parsed_schema()?;
-        let verdict = match schema.validate(&value) {
+        let verdict = match schema.validate(&native) {
             Verdict::Failed(fault) => {
                 return Err(Error::Document(format!("{}: {}", fault.path, fault.reason)))
             }
@@ -645,9 +650,10 @@ impl SingboxStore {
         fs::ensure_dir(&self.document_dir)?;
         fs::write_atomic(&self.document_dir, &document_file(name), &body)?;
 
-        let warnings = match assemble::assemble(&value, generated) {
+        let warnings = match bindings::assemble(&value, generated) {
             Ok(_) => Vec::new(),
-            Err(unfit) => vec![unfit.to_string()],
+            Err(Error::Document(reason)) => vec![reason],
+            Err(error) => return Err(error),
         };
 
         Ok(Saved {
@@ -917,9 +923,8 @@ impl SingboxStore {
 
     /// The configuration the core would run: the operator's, and whatever the
     /// collections contributed.
-    pub(crate) fn assemble(&self, generated: &[Value]) -> Result<Assembled, Error> {
-        assemble::assemble(&self.current_document()?.value, generated)
-            .map_err(|unfit| Error::Document(unfit.to_string()))
+    pub(crate) fn assemble(&self, generated: &OutboundSnapshot) -> Result<Assembled, Error> {
+        bindings::assemble(&self.current_document()?.value, generated)
     }
 
     /// The configuration in use.
@@ -949,13 +954,34 @@ impl SingboxStore {
 
     /// Assemble the configuration, check it, write it, and run it.
     ///
-    /// `generated` is the outbound half a collection contributes; a build
-    /// without one passes nothing. Nothing is started until the document has
-    /// been assembled, checked and written.
-    pub(crate) fn start(&self, generated: &[Value]) -> Result<u32, Error> {
+    /// The snapshot keeps selected collection names and generated provenance
+    /// together; a changed selection requires a fresh resolution.
+    pub(crate) fn start(&self, generated: &OutboundSnapshot) -> Result<u32, Error> {
+        self.start_or_restart(generated, None)
+    }
+
+    /// Binding and native-schema failures leave the serving core and product
+    /// untouched; launch reuses the exact document that passed preflight.
+    pub(crate) fn restart(
+        &self,
+        generated: &OutboundSnapshot,
+        patience: Duration,
+    ) -> Result<u32, Error> {
+        self.start_or_restart(generated, Some(patience))
+    }
+
+    fn start_or_restart(
+        &self,
+        generated: &OutboundSnapshot,
+        restart: Option<Duration>,
+    ) -> Result<u32, Error> {
+        // Keep selection and authored edits stable from preflight through spawn.
+        // No async resolution runs while either synchronous lock is held.
+        let _selection = self.selection.lock().expect("current selection");
+        let _writing = self.writing.lock().expect("the configuration");
         let attempted = self.current().ok().flatten();
         *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Starting);
-        let result = self.start_checked(generated);
+        let result = self.start_checked(generated, restart);
         *self.phase.lock().expect("runtime phase") = match &result {
             Ok(_) => None,
             Err(error) => Some(RuntimePhase::Failed {
@@ -966,13 +992,23 @@ impl SingboxStore {
         result
     }
 
-    fn start_checked(&self, generated: &[Value]) -> Result<u32, Error> {
+    fn start_checked(
+        &self,
+        generated: &OutboundSnapshot,
+        restart: Option<Duration>,
+    ) -> Result<u32, Error> {
         let settings = self.settings()?;
+        if settings.collections != generated.selected {
+            return Err(Error::Document(
+                "outbounds.x-suba-collections: collection selection changed; retry the operation"
+                    .to_string(),
+            ));
+        }
         // Asked before the version is: how a core is run is a property of this
         // instance, and an operator who set that has to be told about it rather
         // than about something the module has not got to yet. Nothing is
         // written either way, so a refused start leaves the document alone.
-        let drop_to = self.run_as(settings.privilege)?;
+        let drop_to = self.startable()?;
         let version = settings.version.ok_or(Error::NoVersion)?;
 
         let assembled = self.assemble(generated)?;
@@ -981,11 +1017,14 @@ impl SingboxStore {
             return Err(Error::Document(format!("{}: {}", fault.path, fault.reason)));
         }
 
-        // The core's own working directory, which its cache lives in.
+        let binary = std::fs::canonicalize(self.dirs.binary(&version))?;
+        if let Some(patience) = restart {
+            self.stop(patience)?;
+        }
+        // Preflight and launch share this exact expansion, even on restart.
         fs::ensure_dir(self.dirs.work())?;
         self.write_product(&assembled.config)?;
 
-        let binary = std::fs::canonicalize(self.dirs.binary(&version))?;
         let config = std::fs::canonicalize(self.dirs.config().join(CONFIG))?;
         let work = std::fs::canonicalize(self.dirs.work())?;
 
@@ -1040,8 +1079,8 @@ impl SingboxStore {
     ///
     /// A caller that is about to replace a running core asks this first: a
     /// refusal here must not leave the operator with nothing running.
-    pub(crate) fn startable(&self) -> Result<(), Error> {
-        self.run_as(self.settings()?.privilege).map(drop)
+    pub(crate) fn startable(&self) -> Result<Option<(u32, u32)>, Error> {
+        self.run_as(self.settings()?.privilege)
     }
 
     /// Ask the core to stop.
@@ -1106,6 +1145,8 @@ fn tag_of(entry: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    mod bindings;
+
     use super::*;
     use std::time::Duration;
 
@@ -1230,7 +1271,16 @@ mod tests {
             "type": "object",
             "properties": {
                 "log": { "type": "object", "properties": { "level": { "type": "string" } } },
-                "outbounds": { "type": "array", "items": { "type": "object" } }
+                "outbounds": { "type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string" },
+                        "tag": { "type": "string" },
+                        "outbounds": { "type": "array", "items": { "type": "string" } },
+                        "default": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                } }
             },
             "additionalProperties": false,
             "$defs": {
@@ -1478,7 +1528,13 @@ mod tests {
     fn a_section_is_checked_as_part_of_the_whole_document() {
         let (_scratch, store) = store();
 
-        let refused = store.write_section(NAME, "bogus", serde_json::json!({}), None, &[]);
+        let refused = store.write_section(
+            NAME,
+            "bogus",
+            serde_json::json!({}),
+            None,
+            &OutboundSnapshot::default(),
+        );
         assert!(
             matches!(
                 &refused,
@@ -1495,7 +1551,7 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "info" }),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("a section");
         assert!(saved.unchecked.is_empty());
@@ -1518,7 +1574,7 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "info" }),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("a section");
         assert_eq!(store.configs().unwrap(), [NAME]);
@@ -1677,7 +1733,7 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "info" }),
                 Some(&before),
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("a write against the current document");
 
@@ -1687,7 +1743,7 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "warn" }),
                 Some(&before),
-                &[]
+                &OutboundSnapshot::default()
             ),
             Err(Error::Stale)
         ));
@@ -1702,7 +1758,7 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "warn" }),
                 Some(&saved.etag),
-                &[]
+                &OutboundSnapshot::default()
             )
             .is_ok());
     }
@@ -1720,7 +1776,7 @@ mod tests {
                 "outbounds",
                 serde_json::json!([direct("a"), direct("b")]),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .unwrap();
         store
@@ -1730,11 +1786,18 @@ mod tests {
                 "c",
                 serde_json::json!({ "type": "direct" }),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .unwrap();
         store
-            .write_entry(NAME, "outbounds", "a", direct("a"), None, &[])
+            .write_entry(
+                NAME,
+                "outbounds",
+                "a",
+                direct("a"),
+                None,
+                &OutboundSnapshot::default(),
+            )
             .unwrap();
 
         let tags = |store: &SingboxStore| -> Vec<String> {
@@ -1752,16 +1815,23 @@ mod tests {
         assert_eq!(store.entry(NAME, "outbounds", "c").unwrap().0, direct("c"));
 
         assert!(matches!(
-            store.write_entry(NAME, "outbounds", "a", direct("renamed"), None, &[]),
+            store.write_entry(
+                NAME,
+                "outbounds",
+                "a",
+                direct("renamed"),
+                None,
+                &OutboundSnapshot::default()
+            ),
             Err(Error::Document(_))
         ));
 
         store
-            .remove_entry(NAME, "outbounds", "b", None, &[])
+            .remove_entry(NAME, "outbounds", "b", None, &OutboundSnapshot::default())
             .unwrap();
         assert_eq!(tags(&store), ["a", "c"]);
         assert!(matches!(
-            store.remove_entry(NAME, "outbounds", "b", None, &[]),
+            store.remove_entry(NAME, "outbounds", "b", None, &OutboundSnapshot::default()),
             Err(Error::NoEntry { .. })
         ));
     }
@@ -1778,7 +1848,7 @@ mod tests {
                 "outbounds",
                 serde_json::json!([{ "type": "selector", "tag": "s", "outbounds": ["gone"] }]),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("saved anyway");
 
@@ -1819,11 +1889,17 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "warn" }),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("a section");
 
-        let generated = vec![serde_json::json!({ "type": "direct", "tag": "node 1" })];
+        let generated = OutboundSnapshot {
+            outbounds: vec![GeneratedOutbound {
+                value: serde_json::json!({ "type": "direct", "tag": "node 1" }),
+                collections: Vec::new(),
+            }],
+            ..Default::default()
+        };
         let assembled = store.assemble(&generated).expect("an assembly");
         store.write_product(&assembled.config).expect("a product");
 
@@ -1883,7 +1959,10 @@ mod tests {
             identity(),
         );
 
-        assert!(matches!(store.start(&[]), Err(Error::NoVersion)));
+        assert!(matches!(
+            store.start(&OutboundSnapshot::default()),
+            Err(Error::NoVersion)
+        ));
         assert!(!store.assembled());
     }
 
@@ -1896,11 +1975,15 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "info" }),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("a section");
-        store.assemble(&[]).expect("an assembly");
-        let assembled = store.assemble(&[]).expect("an assembly");
+        store
+            .assemble(&OutboundSnapshot::default())
+            .expect("an assembly");
+        let assembled = store
+            .assemble(&OutboundSnapshot::default())
+            .expect("an assembly");
         store.write_product(&assembled.config).expect("a product");
         let before = std::fs::read(store.dirs.config().join(CONFIG)).expect("the configuration");
 
@@ -1912,7 +1995,7 @@ mod tests {
         )
         .expect("a broken document");
 
-        let refused = store.start(&[]);
+        let refused = store.start(&OutboundSnapshot::default());
 
         assert!(matches!(refused, Err(Error::Document(_))), "{refused:?}");
         assert_eq!(
@@ -1952,11 +2035,11 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "info" }),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("a section");
 
-        let pid = store.start(&[]).expect("a start");
+        let pid = store.start(&OutboundSnapshot::default()).expect("a start");
         wait_for(&store, "started");
 
         // The one way to get a broken document past `edit`.
@@ -1966,7 +2049,7 @@ mod tests {
         )
         .expect("a broken document");
 
-        let refused = store.start(&[]);
+        let refused = store.start(&OutboundSnapshot::default());
 
         assert!(matches!(&refused, Err(Error::Document(_))), "{refused:?}");
 
@@ -1987,16 +2070,16 @@ mod tests {
                 "log",
                 serde_json::json!({ "level": "info" }),
                 None,
-                &[],
+                &OutboundSnapshot::default(),
             )
             .expect("a section");
 
-        let pid = store.start(&[]).expect("a start");
+        let pid = store.start(&OutboundSnapshot::default()).expect("a start");
         assert!(pid > 0);
         assert!(store.status().running);
         wait_for(&store, "started");
 
-        let refused = store.start(&[]);
+        let refused = store.start(&OutboundSnapshot::default());
         assert!(
             matches!(
                 refused,
@@ -2052,7 +2135,7 @@ mod tests {
             })
             .expect("a current version");
 
-        store.start(&[]).expect("a start");
+        store.start(&OutboundSnapshot::default()).expect("a start");
         wait_for(&store, "started");
         assert!(store.status().running, "the config was found after -D");
         store.stop(Duration::from_secs(2)).expect("a stop");

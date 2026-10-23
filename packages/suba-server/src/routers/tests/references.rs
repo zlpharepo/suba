@@ -268,6 +268,40 @@ async fn reference_catalog_uses_selected_collections_without_refreshing() {
     upstream.abort();
 }
 
+#[cfg(feature = "singbox")]
+#[tokio::test]
+async fn reference_catalog_distinguishes_unavailable_selection_from_empty_collections() {
+    let server = Server::start().await;
+    let outbound = json!({"type": "selector", "tag": "authored", "x-suba-collections": ["empty"]});
+    write_config(&server, "edited", json!({"outbounds": [outbound.clone()]}));
+    assert_eq!(
+        server
+            .put_json("/api/collections/empty", json!({"providers": []}))
+            .await
+            .status(),
+        201
+    );
+    choose(&server, &["empty"]).await;
+    let empty = server.authed(Method::GET, REFERENCES).send().await.unwrap();
+    assert_eq!(empty.status(), 200);
+    let catalog = body(empty).await;
+    assert_eq!(catalog["tags"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["tags"][0]["value"], outbound);
+
+    choose(&server, &["empty", "private-missing"]).await;
+    let before = files(&server.root);
+    let unavailable = server.authed(Method::GET, REFERENCES).send().await.unwrap();
+    assert_eq!(unavailable.status(), 422);
+    let error = body(unavailable).await;
+    assert_eq!(
+        error["message"],
+        "outbounds.x-suba-collections: a selected collection is unavailable"
+    );
+    assert!(error.get("tags").is_none());
+    assert!(!error.to_string().contains("private-missing"));
+    assert_eq!(files(&server.root), before);
+}
+
 #[cfg(not(feature = "singbox"))]
 #[tokio::test]
 async fn reference_catalog_without_rendering_keeps_only_authored_definitions() {
