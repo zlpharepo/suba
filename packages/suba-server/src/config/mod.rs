@@ -23,6 +23,11 @@ pub struct AppConfig {
     pub key_pair: Option<KeyPair>,
     /// Where subscriptions are handed out from, when the operator says.
     pub subscription: Option<SubscriptionConfig>,
+    /// The address clients reach this machine at: where every node exported
+    /// from its inbounds points. Belongs to the machine, not to the sing-box
+    /// module, because a host is more than the core it runs.
+    #[cfg(feature = "singbox-core")]
+    pub public_host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

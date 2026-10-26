@@ -10,21 +10,24 @@ use serde_json::Value;
 use suba_singbox::assemble::{self, Assembled, Fault, Unfit};
 
 use super::{ConversionSkip, GeneratedOutbound};
-use crate::error::Error;
+use crate::{error::Error, state::access::Access};
 
 const EXTENSION: &str = "x-suba-collections";
 
-/// Selection and provenance describe one resolution, including empty collections.
+/// What one run gets beside the operator's document, resolved before any lock:
+/// the selected collections' outbounds, with their provenance, and the users
+/// and pools that decide which inbounds get pool users.
 #[derive(Default)]
-pub(crate) struct OutboundSnapshot {
+pub(crate) struct Contributions {
     pub selected: Vec<String>,
     pub outbounds: Vec<GeneratedOutbound>,
     pub skipped: Vec<ConversionSkip>,
     /// A missing selected collection must not masquerade as an empty one.
     pub unavailable: bool,
+    pub access: Access,
 }
 
-impl OutboundSnapshot {
+impl Contributions {
     /// A failed resolution must not look like a valid empty contribution.
     pub(crate) fn ensure_available(&self) -> Result<(), Error> {
         if self.unavailable {
@@ -95,7 +98,7 @@ fn contains_extension(value: &Value) -> bool {
     }
 }
 
-pub(super) fn assemble(document: &Value, snapshot: &OutboundSnapshot) -> Result<Assembled, Error> {
+pub(super) fn assemble(document: &Value, snapshot: &Contributions) -> Result<Assembled, Error> {
     let mut native = project(document)?;
     snapshot.ensure_available()?;
     let mut bound = false;

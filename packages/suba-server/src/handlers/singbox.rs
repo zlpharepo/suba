@@ -26,8 +26,8 @@ use crate::{
     error::Error,
     handlers::collections::outbounds_of,
     state::singbox::{
-        ConversionSkip, Document, InstallationTask, OutboundSnapshot, Privilege, RuntimePhase,
-        Saved, Settings, SingboxStore, Tag,
+        Contributions, ConversionSkip, Document, InstallationTask, Privilege, RuntimePhase, Saved,
+        Settings, SingboxStore, Tag,
     },
     AppState,
 };
@@ -189,7 +189,8 @@ pub async fn index(
 
 /// Resolve once without refreshing; unavailable collections remain save warnings
 /// so a draft can be repaired, but cannot become a runtime product or preview.
-async fn generated(state: &AppState) -> Result<OutboundSnapshot, Error> {
+/// The users and pools are read here too, so one run sees one picture of them.
+async fn generated(state: &AppState) -> Result<Contributions, Error> {
     let store = state.singbox();
     let selected = tokio::task::spawn_blocking(move || store.settings())
         .await??
@@ -199,11 +200,12 @@ async fn generated(state: &AppState) -> Result<OutboundSnapshot, Error> {
         Err(Error::CollectionNotFound(_)) => (Vec::new(), Vec::new(), true),
         Err(error) => return Err(error),
     };
-    Ok(OutboundSnapshot {
+    Ok(Contributions {
         selected,
         outbounds,
         skipped,
         unavailable,
+        access: state.access().snapshot().await,
     })
 }
 
@@ -246,7 +248,7 @@ pub async fn act(
     let store = state.singbox();
     let tail = query.tail.unwrap_or(run::LOG_LINES).min(run::LOG_LINES);
     let generated = match action.action {
-        Command::Stop => OutboundSnapshot::default(),
+        Command::Stop => Contributions::default(),
         Command::Start | Command::Restart => generated(&state).await?,
     };
 
@@ -789,7 +791,7 @@ mod version_view_tests {
             })
             .unwrap();
 
-        assert!(store.start(&OutboundSnapshot::default()).is_err());
+        assert!(store.start(&Contributions::default()).is_err());
         // A broken record is reported as an error rather than used as a view.
         // Keep the metadata valid so the runtime view can be inspected.
         let metadata = Metadata {

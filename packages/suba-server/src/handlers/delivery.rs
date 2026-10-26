@@ -109,12 +109,20 @@ async fn deliver(
 
     // A token that addresses nothing and a token that was revoked are the same
     // answer, because they are the same thing from outside.
-    let Some((name, label)) = state.collections().by_token(token).await else {
-        return Err(Error::NoSuchDelivery);
+    let (holder, name, label) = match state.collections().by_token(token).await {
+        Some((name, label)) => (Holder::Collection, name, label),
+        None => match user_token(state, token).await {
+            Some((name, label)) => (Holder::User, name, label),
+            None => return Err(Error::NoSuchDelivery),
+        },
     };
 
-    // Counted by the token's name, never by the token.
-    if let Err(retry_after) = state.deliveries().check(&format!("{name}/{label}")) {
+    // Counted by the token's name, never by the token; a user and a collection
+    // of the same name are two different budgets.
+    if let Err(retry_after) = state
+        .deliveries()
+        .check(&format!("{}{name}/{label}", holder.prefix()))
+    {
         tracing::warn!("Delivery '{name}' via token '{label}': rate limited");
 
         return Err(Error::TooManyRequests { retry_after });
@@ -122,18 +130,24 @@ async fn deliver(
 
     let format = choice.resolve(request)?;
 
-    // The collection can go away between the lookup and the render; that is the
+    // The holder can go away between the lookup and the render; that is the
     // delivery's 404 too, never a message naming it.
-    let (artifact, cached) =
-        artifact_of(state, &name, format)
+    let (artifact, cached) = match holder {
+        Holder::Collection => artifact_of(state, &name, format).await,
+        Holder::User => user_artifact(state, &name, format)
             .await
-            .map_err(|error| match error {
-                Error::CollectionNotFound(_) => Error::NoSuchDelivery,
-                other => other,
-            })?;
+            .map(|artifact| (std::sync::Arc::new(artifact), false)),
+    }
+    .map_err(|error| match error {
+        Error::CollectionNotFound(_) => Error::NoSuchDelivery,
+        #[cfg(feature = "singbox-core")]
+        Error::UserNotFound(_) => Error::NoSuchDelivery,
+        other => other,
+    })?;
 
     tracing::info!(
-        "Delivered '{name}' via token '{label}': {} nodes as {}, {} bytes, {}",
+        "Delivered {}'{name}' via token '{label}': {} nodes as {}, {} bytes, {}",
+        holder.prefix(),
         artifact.nodes,
         artifact.format,
         artifact.body.len(),
@@ -151,6 +165,49 @@ async fn deliver(
     }
 
     Ok((headers, artifact.body.to_string()))
+}
+
+/// Who a token was minted for.
+enum Holder {
+    Collection,
+    User,
+}
+
+impl Holder {
+    fn prefix(&self) -> &'static str {
+        match self {
+            Self::Collection => "",
+            Self::User => "user ",
+        }
+    }
+}
+
+#[cfg(feature = "singbox-core")]
+async fn user_token(state: &AppState, token: &str) -> Option<(String, String)> {
+    state.access().by_token(token).await
+}
+
+#[cfg(not(feature = "singbox-core"))]
+async fn user_token(_: &AppState, _: &str) -> Option<(String, String)> {
+    None
+}
+
+#[cfg(feature = "singbox-core")]
+async fn user_artifact(
+    state: &AppState,
+    name: &str,
+    format: suba_core::format::Format,
+) -> Result<crate::state::render::Artifact, Error> {
+    crate::handlers::users::user_artifact(state, name, format).await
+}
+
+#[cfg(not(feature = "singbox-core"))]
+async fn user_artifact(
+    _: &AppState,
+    _: &str,
+    _: suba_core::format::Format,
+) -> Result<crate::state::render::Artifact, Error> {
+    Err(Error::NoSuchDelivery)
 }
 
 #[cfg(test)]

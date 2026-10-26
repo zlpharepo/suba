@@ -111,11 +111,7 @@ impl CollectionStore {
     /// working.
     pub(crate) async fn mint_token(&self, name: &str, label: &str) -> Result<String, Error> {
         token_name(label)?;
-
-        let mut bytes = [0u8; TOKEN_BYTES];
-        fill(&mut bytes).map_err(|error| Error::Entropy(error.to_string()))?;
-
-        let token: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let token = mint()?;
 
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
@@ -170,8 +166,16 @@ impl CollectionStore {
     }
 }
 
+/// A new delivery token, from the operating system's entropy.
+pub(crate) fn mint() -> Result<String, Error> {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    fill(&mut bytes).map_err(|error| Error::Entropy(error.to_string()))?;
+
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// Refuse a token name that could not be told apart in a URL or a log line.
-fn token_name(label: &str) -> Result<(), Error> {
+pub(crate) fn token_name(label: &str) -> Result<(), Error> {
     let usable = !label.is_empty()
         && label.len() <= TOKEN_NAME_MAX
         && label

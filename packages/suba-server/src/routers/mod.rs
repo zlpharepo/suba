@@ -94,6 +94,8 @@ mod tests {
     mod provider_snapshots;
     #[cfg(feature = "singbox-core")]
     mod references;
+    #[cfg(feature = "singbox-core")]
+    mod users;
 
     use http::header;
     use serde_json::{json, Value};
@@ -116,7 +118,21 @@ mod tests {
     impl Server {
         /// A server on a free port with an administrator logged in.
         async fn start() -> Self {
+            Self::start_with(None).await
+        }
+
+        /// The same, over an instance document the operator wrote first.
+        async fn start_with(app: Option<crate::config::AppConfig>) -> Self {
             let root = std::env::temp_dir().join(format!("suba-http-{}", uuid::Uuid::now_v7()));
+            if let Some(app) = app {
+                crate::config::write_config(
+                    root.join("config").to_str().unwrap(),
+                    crate::config::APP_CONFIG_BASENAME,
+                    &app,
+                )
+                .await
+                .unwrap();
+            }
             let config = ServerConfig {
                 listen: "127.0.0.1".parse().unwrap(),
                 port: 0,

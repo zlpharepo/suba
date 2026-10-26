@@ -48,7 +48,7 @@ fn collection_bindings_reject_wrong_shapes_owners_and_locations() {
     let unknown =
         json!({"outbounds": [{"type": "selector", "x-suba-collections": [], "unknown": true}]});
     assert!(
-        reason(store.write_document(NAME, unknown, None, &OutboundSnapshot::default()))
+        reason(store.write_document(NAME, unknown, None, &Contributions::default()))
             .contains("unknown")
     );
 }
@@ -57,7 +57,7 @@ fn collection_bindings_reject_wrong_shapes_owners_and_locations() {
 #[test]
 fn collection_bindings_require_rendering_even_with_manual_members() {
     let (_scratch, store) = store();
-    let snapshot = OutboundSnapshot {
+    let snapshot = Contributions {
         selected: vec!["selected".to_owned()],
         ..Default::default()
     };
@@ -81,8 +81,8 @@ fn collection_bindings_require_rendering_even_with_manual_members() {
 }
 
 #[cfg(feature = "singbox")]
-fn snapshot(tags: &[(&str, &[&str])]) -> OutboundSnapshot {
-    OutboundSnapshot {
+fn snapshot(tags: &[(&str, &[&str])]) -> Contributions {
+    Contributions {
         selected: vec![
             "first".to_string(),
             "second".to_string(),
@@ -97,11 +97,12 @@ fn snapshot(tags: &[(&str, &[&str])]) -> OutboundSnapshot {
             .collect(),
         unavailable: false,
         skipped: Vec::new(),
+        access: Default::default(),
     }
 }
 
 #[cfg(feature = "singbox")]
-fn select(store: &SingboxStore, snapshot: &OutboundSnapshot) {
+fn select(store: &SingboxStore, snapshot: &Contributions) {
     let mut settings = store.settings().unwrap();
     settings.collections = snapshot.selected.clone();
     store.set_settings(&settings).unwrap();

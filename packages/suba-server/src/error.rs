@@ -108,6 +108,21 @@ pub enum Error {
     #[error("subscription prefix: {reason}")]
     Prefix { reason: &'static str },
 
+    /// A proxy user this instance does not have.
+    #[cfg(feature = "singbox-core")]
+    #[error("there is no user named '{0}'")]
+    UserNotFound(String),
+
+    /// A user or pool name that could not be told apart in a log line or a URL.
+    #[cfg(feature = "singbox-core")]
+    #[error("{reason}")]
+    AccessName { reason: &'static str },
+
+    /// The configured public host is not one.
+    #[cfg(feature = "singbox-core")]
+    #[error("public host: {reason}")]
+    PublicHost { reason: &'static str },
+
     /// The sing-box module refused something.
     #[cfg(feature = "singbox-core")]
     #[error(transparent)]
@@ -318,6 +333,21 @@ impl IntoHttpError for Error {
             Error::Prefix { reason } => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
                 message: format!("subscription prefix: {reason}"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::UserNotFound(name) => HttpError {
+                status_code: StatusCode::NOT_FOUND,
+                message: format!("User '{name}' not found"),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::AccessName { reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: reason.to_string(),
+            },
+            #[cfg(feature = "singbox-core")]
+            Error::PublicHost { reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("public-host: {reason}"),
             },
             Error::TokenName { reason } => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,

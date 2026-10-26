@@ -5,3 +5,5 @@ pub mod providers;
 #[cfg(feature = "singbox-core")]
 pub mod singbox;
 pub mod system;
+#[cfg(feature = "singbox-core")]
+pub mod users;

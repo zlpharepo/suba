@@ -225,7 +225,7 @@ pub struct TokenView {
     pub path: String,
 }
 
-fn token_view(prefix: &str, name: String, token: String) -> TokenView {
+pub(crate) fn token_view(prefix: &str, name: String, token: String) -> TokenView {
     TokenView {
         path: format!("/{prefix}/{token}"),
         name,
@@ -378,7 +378,7 @@ async fn address(
 ///
 /// The shortest interval among the member providers: asking more often than
 /// the fastest one changes gets nothing new, and asking less often misses it.
-async fn update_hours(state: &AppState, collection: &Collection) -> Option<u64> {
+pub(crate) async fn update_hours(state: &AppState, collection: &Collection) -> Option<u64> {
     let mut shortest: Option<u64> = None;
 
     for name in &collection.providers {
@@ -930,7 +930,7 @@ pub(crate) async fn outbounds_of(
 /// of the definitions to keep in step with every edit; if this ever shows up in
 /// a profile, the answer is a cache keyed by the definition, not a filter that
 /// is quietly not applied.
-async fn provider_filters(
+pub(crate) async fn provider_filters(
     state: &AppState,
     collection: &Collection,
 ) -> Result<BTreeMap<String, NodeFilter>, Error> {

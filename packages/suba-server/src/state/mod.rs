@@ -1,3 +1,5 @@
+#[cfg(feature = "singbox-core")]
+pub(crate) mod access;
 mod collections;
 pub(crate) mod limiter;
 pub(crate) mod metrics;
@@ -17,7 +19,7 @@ use reqwest::Client;
 use crate::{config::ServerConfig, error::Error, identity::Identity};
 
 #[cfg(feature = "singbox-core")]
-use self::singbox::SingboxStore;
+use self::{access::AccessStore, singbox::SingboxStore};
 use self::{
     collections::CollectionStore, limiter::Limiter, metrics::MetricsStore,
     providers::ProviderStore, render::RenderMemo, scheduler::Refresher, sessions::SessionStore,
@@ -44,6 +46,8 @@ struct Inner {
     metrics: Arc<MetricsStore>,
     #[cfg(feature = "singbox-core")]
     singbox: Arc<SingboxStore>,
+    #[cfg(feature = "singbox-core")]
+    access: AccessStore,
 }
 
 impl AppState {
@@ -82,6 +86,8 @@ impl AppState {
                 http.clone(),
                 identity,
             )),
+            #[cfg(feature = "singbox-core")]
+            access: AccessStore::load(&config.config_dir)?,
         })))
     }
 
@@ -142,6 +148,12 @@ impl AppState {
 
     pub(crate) fn sessions(&self) -> &SessionStore {
         &self.0.sessions
+    }
+
+    /// The proxy users and the pools that grant them inbounds.
+    #[cfg(feature = "singbox-core")]
+    pub(crate) fn access(&self) -> &AccessStore {
+        &self.0.access
     }
 
     /// The sing-box module: its fragments, its configuration, its process.

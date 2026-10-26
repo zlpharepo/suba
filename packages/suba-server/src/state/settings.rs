@@ -7,6 +7,8 @@ use crate::{
 };
 
 use super::persisted::Persisted;
+#[cfg(feature = "singbox-core")]
+use suba_core::proto::Host;
 
 /// Where a subscription URL starts when the operator has not said otherwise.
 const DEFAULT_PREFIX: &str = "s";
@@ -45,6 +47,27 @@ impl SettingsStore {
                 reason: "a prefix is one path segment",
             }),
             false => Ok(prefix),
+        }
+    }
+
+    /// Where clients reach this machine, when the operator has said.
+    ///
+    /// Never guessed: a listen address, a private address and the address
+    /// traffic leaves by all differ from the one a client can dial once a
+    /// reverse proxy or a port forward sits in front.
+    #[cfg(feature = "singbox-core")]
+    pub(crate) async fn public_host(&self) -> Result<Option<Host>, Error> {
+        let written = self.file.read(|config| config.public_host.clone()).await;
+
+        match written
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+        {
+            None => Ok(None),
+            Some(host) => Host::parse(host).map(Some).map_err(|_| Error::PublicHost {
+                reason: "a public host is a domain name or an IP address",
+            }),
         }
     }
 
@@ -166,6 +189,51 @@ mod tests {
                 "{written:?} was accepted"
             );
         }
+    }
+
+    #[cfg(feature = "singbox-core")]
+    #[tokio::test]
+    async fn the_public_host_is_read_as_written_and_refused_when_it_is_not_one() {
+        let dir = test_dir();
+        let store = SettingsStore::load(&dir).unwrap();
+        assert_eq!(store.public_host().await.unwrap(), None, "never guessed");
+
+        for (written, read) in [
+            ("proxy.example.com", Some("proxy.example.com")),
+            (" 192.0.2.7 ", Some("192.0.2.7")),
+            ("", None),
+        ] {
+            let app = AppConfig {
+                public_host: Some(written.to_string()),
+                ..AppConfig::default()
+            };
+            crate::config::write_config(dir.to_str().unwrap(), APP_CONFIG_BASENAME, &app)
+                .await
+                .unwrap();
+
+            let host = SettingsStore::load(&dir)
+                .unwrap()
+                .public_host()
+                .await
+                .unwrap();
+            assert_eq!(
+                host.map(|host| host.to_string()).as_deref(),
+                read,
+                "{written:?}"
+            );
+        }
+
+        let app = AppConfig {
+            public_host: Some("https://proxy.example.com/".to_string()),
+            ..AppConfig::default()
+        };
+        crate::config::write_config(dir.to_str().unwrap(), APP_CONFIG_BASENAME, &app)
+            .await
+            .unwrap();
+        assert!(matches!(
+            SettingsStore::load(&dir).unwrap().public_host().await,
+            Err(Error::PublicHost { .. })
+        ));
     }
 
     #[tokio::test]

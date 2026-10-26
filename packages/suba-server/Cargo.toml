@@ -12,7 +12,7 @@ default = ["toml", "singbox", "singbox-core", "clash"]
 toml = ["dep:toml"]
 json = []
 singbox = ["suba-core/singbox"]
-singbox-core = ["suba-core/singbox-core", "dep:suba-singbox"]
+singbox-core = ["suba-core/singbox-core", "dep:suba-singbox", "dep:hmac", "dep:sha2"]
 clash = ["suba-core/clash"]
 
 [dependencies]
@@ -22,6 +22,9 @@ clash = ["suba-core/clash"]
 # a build that runs a core does not have to be able to render one.
 suba-core = { workspace = true, default-features = false }
 suba-singbox = { workspace = true, optional = true, default-features = false }
+# Pool users' credentials derive from one secret per user (`singbox-core`).
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 argon2 = { workspace = true }
 axum = { workspace = true }
