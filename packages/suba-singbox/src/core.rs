@@ -31,6 +31,13 @@ pub const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 /// same way, and one of them is not the one worth a size limit.
 pub const MAX_LICENSE_BYTES: u64 = 1024 * 1024;
 
+/// The largest library this will take out of an archive (128 MiB).
+///
+/// The one Linux has shipped since 1.14 is `libcronet.so`, about 12 MiB, and it
+/// is capped like the binary: it is not smaller because it is not the entry
+/// point.
+pub const MAX_LIBRARY_BYTES: u64 = MAX_BINARY_BYTES;
+
 /// The names the two members of a release archive are taken by.
 ///
 /// The archive holds `<release>/sing-box` and `<release>/LICENSE`; the directory
@@ -38,6 +45,14 @@ pub const MAX_LICENSE_BYTES: u64 = 1024 * 1024;
 /// matched by their file name.
 const BINARY_MEMBER: &str = "sing-box";
 const LICENSE_MEMBER: &str = "LICENSE";
+
+/// What a member that travels beside the binary is named.
+///
+/// A Linux archive holds a shared object next to `sing-box` — the cronet engine
+/// the binary opens by name when a configuration asks for it — and the binary
+/// looks for it beside itself. macOS archives hold only the binary and the
+/// licence, which is why an archive with a third member went unnoticed there.
+const LIBRARY_SUFFIX: &str = ".so";
 
 /// The oldest sing-box this build works with.
 ///
@@ -75,7 +90,7 @@ pub enum Error {
     MemberMissing { member: &'static str },
     /// A member is larger than this module will read.
     #[error("the archive member {member} is larger than this installer reads")]
-    MemberTooLarge { member: &'static str },
+    MemberTooLarge { member: String },
     /// The bytes are not the bytes that were recorded.
     #[error("the bytes hash to {found}, not the recorded {expected}")]
     Hash { expected: String, found: String },
@@ -394,28 +409,41 @@ pub fn platform() -> Result<&'static str, Error> {
     })
 }
 
-/// What a release archive held, once its two members are out of it.
+/// What a release archive held, once its members are out of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extracted {
     /// The binary.
     pub binary: Vec<u8>,
     /// The licence it is distributed under, which travels beside it.
     pub license: Vec<u8>,
+    /// The libraries it opens by name, which travel beside it too.
+    pub libraries: Vec<Library>,
 }
 
-/// Read a release archive: a gzipped tar holding a binary and a licence.
+/// A library a release ships next to its binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Library {
+    /// Its file name, which is the name the binary opens it by.
+    pub name: String,
+    /// Its bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// Read a release archive: a gzipped tar holding a binary, a licence, and the
+/// libraries the binary opens by name.
 ///
-/// Exactly two members are taken, by file name, and anything else in the
-/// archive is refused by name — an archive with a third file in it is not a
-/// release this installer understands, and silently ignoring it would be
-/// ignoring whatever it is. Member paths get the same treatment a file name
-/// does: absolute paths, `..` and anything that is not a plain name are refused
-/// rather than resolved.
+/// The binary and the licence are required, by file name; a shared object is
+/// taken beside them; anything else in the archive is refused by name — an
+/// archive with an unexpected file in it is not a release this installer
+/// understands, and silently ignoring it would be ignoring whatever it is.
+/// Member paths get the same treatment a file name does: absolute paths, `..`
+/// and anything that is not a plain name are refused rather than resolved.
 pub fn extract(archive: &[u8]) -> Result<Extracted, Error> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
 
     let mut binary = None;
     let mut license = None;
+    let mut libraries = Vec::new();
 
     let entries = tar.entries().map_err(|_| Error::Archive {
         reason: "not a gzipped tar archive",
@@ -434,37 +462,48 @@ pub fn extract(archive: &[u8]) -> Result<Extracted, Error> {
             continue;
         }
 
-        let name = plain_member_name(&path)?;
+        let name = plain_member_name(&path)?.to_string();
 
-        let (slot, limit) = match name {
-            name if name == BINARY_MEMBER => (&mut binary, MAX_BINARY_BYTES),
-            name if name == LICENSE_MEMBER => (&mut license, MAX_LICENSE_BYTES),
-            other => {
-                return Err(Error::Member {
-                    member: other.to_string(),
-                })
+        if name == BINARY_MEMBER || name == LICENSE_MEMBER {
+            let (slot, limit) = if name == BINARY_MEMBER {
+                (&mut binary, MAX_BINARY_BYTES)
+            } else {
+                (&mut license, MAX_LICENSE_BYTES)
+            };
+
+            if entry.header().size().unwrap_or_default() > limit {
+                return Err(Error::MemberTooLarge { member: name });
             }
-        };
 
-        let member = if limit == MAX_BINARY_BYTES {
-            BINARY_MEMBER
+            let mut bytes = Vec::new();
+            entry
+                .take(limit)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Error::Archive {
+                    reason: "a member could not be read",
+                })?;
+
+            *slot = Some(bytes);
+        } else if name.ends_with(LIBRARY_SUFFIX) {
+            // Taken with the binary, not dropped: the binary opens it by name,
+            // so a version installed without it is one that cannot do what the
+            // release it came from can.
+            if entry.header().size().unwrap_or_default() > MAX_LIBRARY_BYTES {
+                return Err(Error::MemberTooLarge { member: name });
+            }
+
+            let mut bytes = Vec::new();
+            entry
+                .take(MAX_LIBRARY_BYTES)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Error::Archive {
+                    reason: "a member could not be read",
+                })?;
+
+            libraries.push(Library { name, bytes });
         } else {
-            LICENSE_MEMBER
-        };
-
-        if entry.header().size().unwrap_or_default() > limit {
-            return Err(Error::MemberTooLarge { member });
+            return Err(Error::Member { member: name });
         }
-
-        let mut bytes = Vec::new();
-        entry
-            .take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(|_| Error::Archive {
-                reason: "a member could not be read",
-            })?;
-
-        *slot = Some(bytes);
     }
 
     let binary = binary.ok_or(Error::MemberMissing {
@@ -474,7 +513,11 @@ pub fn extract(archive: &[u8]) -> Result<Extracted, Error> {
         member: LICENSE_MEMBER,
     })?;
 
-    Ok(Extracted { binary, license })
+    Ok(Extracted {
+        binary,
+        license,
+        libraries,
+    })
 }
 
 /// The last part of a member's path, refusing anything that is not a plain name.
@@ -825,6 +868,29 @@ mod tests {
             Err(Error::Member {
                 member: "README.md".to_string()
             })
+        );
+    }
+
+    /// A Linux archive holds a shared object beside the binary. It is taken with
+    /// it rather than refused: the binary opens it by name, so a version
+    /// installed without it cannot do what the release it came from can.
+    #[test]
+    fn a_library_beside_the_binary_is_taken_with_it() {
+        let bytes = archive(&[
+            ("release/sing-box", b"a binary"),
+            ("release/LICENSE", b"GPL-3.0"),
+            ("release/libcronet.so", b"the cronet engine"),
+        ]);
+
+        let extracted = extract(&bytes).expect("a release archive");
+
+        assert_eq!(extracted.binary, b"a binary");
+        assert_eq!(
+            extracted.libraries,
+            vec![Library {
+                name: "libcronet.so".to_string(),
+                bytes: b"the cronet engine".to_vec(),
+            }]
         );
     }
 

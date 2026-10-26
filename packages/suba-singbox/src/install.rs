@@ -85,6 +85,12 @@ pub fn install(
 
         write(&bin.join(BINARY), &extracted.binary, true)?;
         write(&bin.join(LICENSE), &extracted.license, false)?;
+        // The libraries the binary opens by name go beside it: the archive
+        // shipped them for exactly this, and a release installed without one is
+        // a version that cannot do what the release can.
+        for library in &extracted.libraries {
+            write(&bin.join(&library.name), &library.bytes, false)?;
+        }
 
         let schema = staging.join("schema.json");
         let metadata = Metadata {
@@ -732,6 +738,41 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["1.14.2"]);
+    }
+
+    /// A Linux release ships a shared object beside the binary; it is installed
+    /// beside it, because the binary opens it by name.
+    #[test]
+    fn a_library_the_release_ships_is_installed_beside_the_binary() {
+        let (_root, dirs) = dirs();
+        let version = Version::from_tag("v1.14.2");
+        let binary = "#!/bin/sh\n\
+             if [ \"$1\" = schema ] && [ \"$2\" = -o ]; then\n\
+             \tprintf '%s' '{\"$defs\":{}}' > \"$3\"\n\
+             \texit 0\n\
+             fi\n\
+             exit 1\n";
+
+        let installed = install(
+            &dirs,
+            &version,
+            "linux-amd64",
+            "sing-box-1.14.2-linux-amd64.tar.gz",
+            &members(&[
+                ("release/sing-box", binary.as_bytes()),
+                ("release/LICENSE", b"a licence"),
+                ("release/libcronet.so", b"the cronet engine"),
+            ]),
+            None,
+            1_700_000_000,
+        )
+        .expect("an install");
+
+        assert_eq!(installed.version, version);
+        assert_eq!(
+            fs::read(dirs.version(&version).join("bin/libcronet.so")).expect("the library"),
+            b"the cronet engine"
+        );
     }
 
     #[test]
