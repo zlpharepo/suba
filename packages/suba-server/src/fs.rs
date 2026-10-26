@@ -118,9 +118,10 @@ pub fn write_atomic(dir: &Path, name: &str, contents: impl AsRef<[u8]>) -> io::R
         &directory,
         temp.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        // `Mode`'s bits are `mode_t`, which is narrower than a `u32` everywhere
-        // this runs; nothing above `0o777` is ever passed.
-        Mode::from_bits_truncate(FILE_MODE as u16),
+        // `Mode`'s bits are `mode_t`: wider than a `u16` on Linux and narrower
+        // than a `u32` on the BSDs, so the cast is inferred from the parameter
+        // rather than named. Nothing above `0o777` is ever passed.
+        Mode::from_bits_truncate(FILE_MODE as _),
     );
 
     let mut file = match opened {
