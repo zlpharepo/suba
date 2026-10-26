@@ -163,7 +163,7 @@ impl AppState {
         &self.0.sessions
     }
 
-    /// The proxy users and the pools that grant them inbounds.
+    /// The proxy users and the addresses their clients dial.
     #[cfg(feature = "singbox-core")]
     pub(crate) fn access(&self) -> &AccessStore {
         &self.0.access

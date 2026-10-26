@@ -1,6 +1,6 @@
 //! Inbound users, read from the server's side and handed to a client's.
 //!
-//! Three things a pool-managed user needs from a native inbound, and nothing
+//! Three things a managed user needs from a native inbound, and nothing
 //! else: whether the inbound can take one, the user entry the core reads, and
 //! the client node that reaches it. The inbound is read where it is written —
 //! the user's own JSON — and is never rewritten through a model.
@@ -25,7 +25,7 @@ use suba_proto::{
     Uuid,
 };
 
-/// The protocols a pool can grant today.
+/// The protocols a managed user can be granted on today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Vless,
@@ -54,14 +54,14 @@ fn unexportable(path: impl Into<String>, reason: &'static str) -> Unexportable {
     }
 }
 
-/// Whether a pool can grant this inbound's users, and as which protocol.
+/// Whether an inbound can take a managed user, and as which protocol.
 pub fn grantable(inbound: &Value) -> Result<Protocol, &'static str> {
     match inbound.get("type").and_then(Value::as_str) {
         Some("vless") => Ok(Protocol::Vless),
         Some("trojan") => Ok(Protocol::Trojan),
         Some("hysteria2") => Ok(Protocol::Hysteria2),
         Some("vmess" | "tuic" | "anytls" | "shadowsocks") => {
-            Err("this protocol is not granted by pools yet")
+            Err("this protocol is not granted to users yet")
         }
         Some("naive" | "hysteria" | "snell") => Err("this protocol cannot be exported yet"),
         Some("shadowtls") => {

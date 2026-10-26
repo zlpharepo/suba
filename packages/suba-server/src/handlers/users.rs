@@ -1,4 +1,4 @@
-//! Proxy users and pools, as resources of the sing-box module.
+//! Proxy users and the addresses clients dial, as resources of the module.
 //!
 //! A user's credentials never leave the server except as what a client needs:
 //! a share link or a sing-box outbound per inbound, and the subscription its
@@ -23,10 +23,10 @@ use crate::{
     handlers::collections::{
         artifact_headers, provider_filters, token_view, update_hours, Choice, TokenView,
     },
-    state::access::{Access, Entry, Pool},
+    state::access::{Access, Endpoint, Entry},
     state::render::Artifact,
     state::singbox::{
-        managed::{self, Export, InboundUsers, Serving, State as Applied},
+        managed::{self, Export, InboundUsers, Placement, Serving, State as Applied},
         SingboxStore,
     },
     tracing, AppState,
@@ -36,7 +36,7 @@ use crate::{
 #[derive(Debug, Deserialize)]
 pub struct UserBody {
     #[serde(default)]
-    pub pools: Vec<String>,
+    pub inbounds: Vec<Entry>,
     #[serde(default)]
     pub collections: Vec<String>,
 }
@@ -44,13 +44,13 @@ pub struct UserBody {
 #[derive(Debug, Serialize)]
 pub struct UserView {
     pub name: String,
-    pub pools: Vec<String>,
+    /// The inbounds this user may use, in the order they were chosen.
+    pub inbounds: Vec<Entry>,
     pub collections: Vec<String>,
     /// Named, and not there: stored anyway, like a collection's providers.
-    pub missing_pools: Vec<String>,
     pub missing_collections: Vec<String>,
     pub links: Vec<TokenView>,
-    /// Every inbound its pools grant, with the client that reaches it.
+    /// Every inbound it may use, with the client that reaches it.
     pub grants: Vec<GrantView>,
 }
 
@@ -58,29 +58,53 @@ pub struct UserView {
 pub struct GrantView {
     pub config: String,
     pub inbound: String,
-    pub via: Vec<String>,
-    /// Absent when the grant reaches no inbound a pool can give.
+    /// Absent when the entry reaches no inbound that can take users.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<Applied>,
     #[serde(flatten)]
     pub export: Export,
 }
 
+/// One inbound of one configuration, with the address a client dials.
 #[derive(Debug, Serialize)]
-pub struct PoolView {
-    pub name: String,
-    pub entries: Vec<EntryView>,
-    /// The users whose pools include this one.
-    pub members: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct EntryView {
+pub struct EndpointView {
     pub config: String,
     pub inbound: String,
-    /// Why the entry gives nobody anything, when it does not.
+    /// The stored override, when the operator set one.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Why this inbound cannot be exported at all, when it cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+}
+
+/// Every address override, and the instance default they fall back to.
+#[derive(Debug, Serialize)]
+pub struct EndpointsView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_host: Option<String>,
+    pub entries: Vec<EndpointView>,
+}
+
+/// What a form says about one inbound's address: omitted keeps the stored
+/// value, explicit null clears it.
+#[derive(Debug, Default, Deserialize)]
+pub struct EndpointBody {
+    #[serde(default, deserialize_with = "keep_or_clear")]
+    pub address: Option<Option<String>>,
+    #[serde(default, deserialize_with = "keep_or_clear")]
+    pub port: Option<Option<u16>>,
+}
+
+/// Tell an omitted field from an explicit `null`.
+fn keep_or_clear<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Every user of every inbound of one configuration, for its editor.
@@ -139,7 +163,7 @@ pub async fn exports(
     ))
 }
 
-/// Every user, with what its pools grant it and its links.
+/// Every user, with the inbounds it may use and its links.
 pub async fn index(
     State(state): State<AppState>,
     _auth: Operator,
@@ -183,24 +207,18 @@ fn views(
                 );
                 configs.insert(config.clone(), inbounds);
             }
-            grants.push(grant_view(&configs[config], grant.entry, grant.via, name));
+            grants.push(grant_view(&configs[config], grant.entry, name));
         }
 
         views.push(UserView {
             name: name.clone(),
-            missing_pools: user
-                .pools
-                .iter()
-                .filter(|pool| !access.pools.contains_key(*pool))
-                .cloned()
-                .collect(),
             missing_collections: user
                 .collections
                 .iter()
                 .filter(|collection| !collections.contains(*collection))
                 .cloned()
                 .collect(),
-            pools: user.pools.clone(),
+            inbounds: user.inbounds.clone(),
             collections: user.collections.clone(),
             links: user
                 .tokens
@@ -214,11 +232,10 @@ fn views(
     Ok(views)
 }
 
-fn grant_view(inbounds: &[InboundUsers], entry: Entry, via: Vec<String>, user: &str) -> GrantView {
+fn grant_view(inbounds: &[InboundUsers], entry: Entry, user: &str) -> GrantView {
     let refused = |reason: String| GrantView {
         config: entry.config.clone(),
         inbound: entry.inbound.clone(),
-        via: via.clone(),
         state: None,
         export: Export {
             reason: Some(reason),
@@ -244,11 +261,10 @@ fn grant_view(inbounds: &[InboundUsers], entry: Entry, via: Vec<String>, user: &
         export: managed.export.clone(),
         config: entry.config,
         inbound: entry.inbound,
-        via,
     }
 }
 
-/// Store a user's pools and collections; a new user gets its secret here.
+/// Store a user's inbounds and collections; a new user gets its secret here.
 pub async fn put(
     State(state): State<AppState>,
     _auth: Operator,
@@ -257,7 +273,7 @@ pub async fn put(
 ) -> ResponseResult<impl IntoResponse> {
     state
         .access()
-        .put_user(&name, body.pools, body.collections)
+        .put_user(&name, body.inbounds, body.collections)
         .await?;
     tracing::debug!("Stored user '{name}'");
 
@@ -327,8 +343,8 @@ pub async fn content(
     Ok((headers, artifact.body.to_string()))
 }
 
-/// A user's subscription: a node per inbound its pools grant in the
-/// configuration the core runs, then the nodes of its collections.
+/// A user's subscription: a node per inbound it may use in the configuration
+/// the core runs, then the nodes of its collections.
 ///
 /// Not memoised: it holds credentials derived on the way, and the address of
 /// the bytes would have to include the user's secret to be one.
@@ -414,70 +430,125 @@ pub(crate) async fn user_artifact(
     })
 }
 
-/// Every pool, with who is in it and what each entry gives.
-pub async fn pools(
+/// Every inbound of every saved configuration, with the address a client dials.
+///
+/// The list is complete whether or not an override is stored, so an operator
+/// sees every entry and what it would currently export, not only the ones
+/// somebody already edited.
+pub async fn endpoints(
     State(state): State<AppState>,
     _auth: Operator,
-) -> ResponseResult<Json<Vec<PoolView>>> {
+) -> ResponseResult<Json<EndpointsView>> {
     let access = state.access().snapshot().await;
+    let public_host = public_host(&state).await.ok().map(|host| host.to_string());
     let store = state.singbox();
 
     Ok(Json(
-        tokio::task::spawn_blocking(move || -> Result<Vec<PoolView>, Error> {
-            let mut documents = BTreeMap::new();
-            let mut views = Vec::new();
-            for (name, pool) in &access.pools {
-                let mut entries = Vec::new();
-                for entry in &pool.entries {
-                    if !documents.contains_key(&entry.config) {
-                        documents.insert(
-                            entry.config.clone(),
-                            store.config_document(&entry.config)?.value,
-                        );
-                    }
-                    entries.push(EntryView {
-                        reason: managed::unplaced(&documents[&entry.config], entry)
-                            .map(str::to_owned),
-                        config: entry.config.clone(),
-                        inbound: entry.inbound.clone(),
+        tokio::task::spawn_blocking(move || -> Result<EndpointsView, Error> {
+            let mut entries = Vec::new();
+            for name in store.configs()? {
+                let document = store.config_document(&name)?.value;
+                for inbound in document
+                    .get("inbounds")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(&[][..], Vec::as_slice)
+                {
+                    let Some(tag) = inbound.get("tag").and_then(serde_json::Value::as_str) else {
+                        // An inbound without a tag cannot be addressed at all,
+                        // so it has no address to store either.
+                        continue;
+                    };
+                    let at = Entry {
+                        config: name.clone(),
+                        inbound: tag.to_owned(),
+                    };
+                    let stored = access.endpoint(&at);
+                    entries.push(EndpointView {
+                        reason: managed::placement(&document, &at).reason(),
+                        config: name.clone(),
+                        inbound: tag.to_owned(),
+                        address: stored.and_then(|endpoint| endpoint.address.clone()),
+                        port: stored.and_then(|endpoint| endpoint.port),
                     });
                 }
-                views.push(PoolView {
-                    name: name.clone(),
-                    entries,
-                    members: access
-                        .users
-                        .iter()
-                        .filter(|(_, user)| user.pools.contains(name))
-                        .map(|(user, _)| user.clone())
-                        .collect(),
-                });
             }
 
-            Ok(views)
+            Ok(EndpointsView {
+                public_host,
+                entries,
+            })
         })
         .await??,
     ))
 }
 
-pub async fn put_pool(
+/// Store or clear one inbound's address override.
+pub async fn put_endpoint(
     State(state): State<AppState>,
     _auth: Operator,
-    Path(name): Path<String>,
-    Json(pool): Json<Pool>,
+    Path((config, inbound)): Path<(String, String)>,
+    Json(body): Json<EndpointBody>,
+) -> ResponseResult<Json<EndpointView>> {
+    let access = state.access().snapshot().await;
+    let at = Entry {
+        config: config.clone(),
+        inbound: inbound.clone(),
+    };
+    // An address for an inbound that is not there would never be read, so it is
+    // refused where an operator can still fix it rather than stored quietly.
+    let placement = placement(&state, &at).await?;
+    let stored = access.endpoint(&at).cloned().unwrap_or_default();
+    let endpoint = Endpoint {
+        address: match body.address {
+            Some(address) => address,
+            None => stored.address,
+        },
+        port: match body.port {
+            Some(port) => port,
+            None => stored.port,
+        },
+    };
+    state
+        .access()
+        .put_endpoint(&config, &inbound, endpoint.clone())
+        .await?;
+    tracing::debug!("Stored an address for {} :: {inbound}", config);
+
+    Ok(Json(EndpointView {
+        config,
+        inbound,
+        address: endpoint.address,
+        port: endpoint.port,
+        reason: placement.reason(),
+    }))
+}
+
+pub async fn delete_endpoint(
+    State(state): State<AppState>,
+    _auth: Operator,
+    Path((config, inbound)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
-    state.access().put_pool(&name, pool).await?;
-    tracing::debug!("Stored pool '{name}'");
+    state.access().remove_endpoint(&config, &inbound).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn delete_pool(
-    State(state): State<AppState>,
-    _auth: Operator,
-    Path(name): Path<String>,
-) -> ResponseResult<impl IntoResponse> {
-    state.access().remove_pool(&name).await?;
+/// Where an entry stands in its saved configuration document.
+///
+/// An entry naming no inbound of that configuration is refused: the address
+/// would never be read, and storing it would only look like it worked.
+async fn placement(state: &AppState, at: &Entry) -> Result<Placement, Error> {
+    let store = state.singbox();
+    let at = at.clone();
+    tokio::task::spawn_blocking(move || -> Result<Placement, Error> {
+        let document = store.config_document(&at.config)?.value;
 
-    Ok(StatusCode::NO_CONTENT)
+        match managed::placement(&document, &at) {
+            Placement::Unknown => Err(Error::Document(
+                "inbound: no inbound of this configuration has this tag".to_string(),
+            )),
+            placement => Ok(placement),
+        }
+    })
+    .await?
 }

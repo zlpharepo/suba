@@ -1,16 +1,16 @@
-//! Pool users in the configuration the core runs, and the clients that reach
-//! every user of an inbound.
+//! Managed users in the configuration the core runs, and the clients that
+//! reach every user of an inbound.
 //!
-//! **Injected, never written back.** A pool user exists only in the assembled
-//! document: the operator's configuration keeps its hand-written users and
-//! nothing else, so the two never become two truths about one user.
+//! **Injected, never written back.** A managed user exists only in the
+//! assembled document: the operator's configuration keeps its hand-written
+//! users and nothing else, so the two never become two truths about one user.
 //!
-//! **A pool user's name is reserved on the whole document.** The core puts the
+//! **A managed user's name is reserved on the whole document.** The core puts the
 //! name into the connection's metadata, and `auth_user` rules, the log and the
 //! stats all join on it, so a hand-written namesake in any inbound would be
 //! counted as the same person. Inside one inbound a hand-written credential
-//! equal to a pool user's is refused too: the core would keep one and drop the
-//! other without a word.
+//! equal to a managed user's is refused too: the core would keep one and drop
+//! the other without a word.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -22,7 +22,7 @@ use suba_singbox::users::{self, Protocol};
 use crate::error::Error;
 use crate::state::access::{Access, Entry};
 
-/// The pool users one inbound of a configuration gets.
+/// The managed users one inbound of a configuration gets.
 struct Planned {
     protocol: Protocol,
     users: Vec<PlannedUser>,
@@ -30,12 +30,11 @@ struct Planned {
 
 struct PlannedUser {
     name: String,
-    via: Vec<String>,
     entry: Value,
 }
 
-/// What pools add to each inbound of `config`, by inbound index, and every
-/// name that is a pool user's anywhere in it.
+/// What users add to each inbound of `config`, by inbound index, and every
+/// name that is a managed user's anywhere in it.
 struct Plan {
     inbounds: BTreeMap<usize, Planned>,
     reserved: BTreeSet<String>,
@@ -52,8 +51,9 @@ fn plan(document: &Value, config: &str, access: &Access) -> Plan {
         let Some(tag) = inbound.get("tag").and_then(Value::as_str) else {
             continue;
         };
-        // An inbound a pool cannot grant gets nothing, whatever a pool says:
-        // the pool view reports it, and the core keeps serving what it had.
+        // An inbound that cannot take users gets nothing, whatever a user
+        // selects: the entry view reports it, and the core keeps serving what
+        // it had.
         let Ok(protocol) = users::grantable(inbound) else {
             continue;
         };
@@ -68,7 +68,6 @@ fn plan(document: &Value, config: &str, access: &Access) -> Plan {
                 let material = access.material(&grant.user, &grant.entry)?;
                 Some(PlannedUser {
                     name: grant.user.clone(),
-                    via: grant.via.clone(),
                     entry: users::user(protocol, inbound, &grant.user, &material),
                 })
             })
@@ -90,11 +89,11 @@ fn plan(document: &Value, config: &str, access: &Access) -> Plan {
     plan
 }
 
-/// Why a hand-written user cannot run beside the pool users, with the field.
+/// Why a hand-written user cannot run beside the managed users, with the field.
 fn conflict(plan: &Plan, index: usize, at: usize, user: &Value) -> Option<String> {
     if name_of(user).is_some_and(|name| plan.reserved.contains(name)) {
         return Some(format!(
-            "inbounds[{index}].users[{at}].name: reserved for a pool user"
+            "inbounds[{index}].users[{at}].name: reserved for a managed user"
         ));
     }
 
@@ -103,11 +102,11 @@ fn conflict(plan: &Plan, index: usize, at: usize, user: &Value) -> Option<String
     planned
         .users
         .iter()
-        .any(|pooled| users::credential(planned.protocol, &pooled.entry) == Some(credential))
-        .then(|| format!("inbounds[{index}].users[{at}]: same credential as a pool user"))
+        .any(|managed| users::credential(planned.protocol, &managed.entry) == Some(credential))
+        .then(|| format!("inbounds[{index}].users[{at}]: same credential as a managed user"))
 }
 
-/// The document with every pool user of `config` added to its inbound.
+/// The document with every managed user of `config` added to its inbound.
 pub(super) fn inject(document: &Value, config: &str, access: &Access) -> Result<Value, Error> {
     let plan = plan(document, config, access);
 
@@ -140,7 +139,7 @@ pub(crate) enum Serving<'a> {
     Not { in_use: bool },
 }
 
-/// How far a pool user's credential has got.
+/// How far a managed user's credential has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum State {
@@ -171,7 +170,7 @@ pub(crate) struct Export {
 pub(crate) struct InboundUsers {
     pub index: usize,
     pub tag: Option<String>,
-    /// Why pools cannot grant this inbound, when they cannot.
+    /// Why an inbound cannot take users, when it cannot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused: Option<&'static str>,
     /// The flow every VLESS user of it has to use.
@@ -197,13 +196,12 @@ pub(crate) struct HandWritten {
 #[derive(Debug, Serialize)]
 pub(crate) struct Managed {
     pub user: String,
-    pub via: Vec<String>,
     pub state: State,
     #[serde(flatten)]
     pub export: Export,
 }
 
-/// Every user of every inbound of `config`, hand-written and pooled.
+/// Every user of every inbound of `config`, hand-written and managed.
 pub(crate) fn exports(
     document: &Value,
     config: &str,
@@ -224,7 +222,12 @@ pub(crate) fn exports(
                 .enumerate()
                 .map(|(at, user)| HandWritten {
                     index: at,
-                    export: hand_written_export(inbound, written, at, host),
+                    export: hand_written_export(
+                        inbound,
+                        written,
+                        at,
+                        address_of(inbound, tag, config, access, host),
+                    ),
                     conflict: conflict(&plan, index, at, user),
                 })
                 .collect();
@@ -238,13 +241,11 @@ pub(crate) fn exports(
                         .iter()
                         .map(|user| Managed {
                             user: user.name.clone(),
-                            via: user.via.clone(),
                             state: state(serving, tag, &user.entry),
                             export: export(
-                                inbound,
+                                address_of(inbound, tag, config, access, host),
                                 &user.entry,
                                 "users",
-                                host,
                                 tag.unwrap_or_default(),
                             ),
                         })
@@ -266,8 +267,8 @@ pub(crate) fn exports(
         .collect()
 }
 
-/// The client nodes of one pool user in `config`, each named after its inbound,
-/// or why one cannot be.
+/// The client nodes of one managed user in `config`, each named after its
+/// inbound, or why one cannot be.
 pub(crate) fn nodes(
     document: &Value,
     config: &str,
@@ -280,29 +281,63 @@ pub(crate) fn nodes(
     plan.inbounds
         .iter()
         .filter_map(|(index, planned)| {
-            let pooled = planned.users.iter().find(|pooled| pooled.name == user)?;
+            let managed = planned.users.iter().find(|held| held.name == user)?;
             let inbound = &inbounds(document)[*index];
             let tag = inbound
                 .get("tag")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            Some(match host {
-                Err(reason) => Err(format!("public-host: {reason}")),
-                Ok(host) => users::client(inbound, &pooled.entry, "users", host, tag)
-                    .map_err(|refused| refused.to_string()),
+            let at = Entry {
+                config: config.to_owned(),
+                inbound: tag.to_owned(),
+            };
+            Some(match address(inbound, access.endpoint(&at), host) {
+                Err(reason) => Err(reason),
+                Ok(dialable) => users::client(
+                    dialable.inbound(),
+                    &managed.entry,
+                    "users",
+                    &dialable.host,
+                    tag,
+                )
+                .map_err(|refused| refused.to_string()),
             })
         })
         .collect()
 }
 
-/// The grants of `config` that have no inbound a pool can give, and why.
-pub(crate) fn unplaced(document: &Value, entry: &Entry) -> Option<&'static str> {
+/// Where an entry stands against the configuration document it names.
+pub(crate) enum Placement {
+    /// The inbound is there and can take users.
+    Placed,
+    /// No inbound of this configuration has this tag.
+    Unknown,
+    /// The inbound is there but cannot take users.
+    Refused(&'static str),
+}
+
+impl Placement {
+    /// Why this entry cannot be exported, when it cannot.
+    pub(crate) fn reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Placed => None,
+            Self::Unknown => Some("no inbound has this tag"),
+            Self::Refused(refused) => Some(refused),
+        }
+    }
+}
+
+/// Where the inbound `entry` names stands in `document`.
+pub(crate) fn placement(document: &Value, entry: &Entry) -> Placement {
     match inbounds(document)
         .iter()
         .find(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(&entry.inbound))
     {
-        None => Some("no inbound has this tag"),
-        Some(inbound) => users::grantable(inbound).err(),
+        None => Placement::Unknown,
+        Some(inbound) => match users::grantable(inbound) {
+            Ok(_) => Placement::Placed,
+            Err(refused) => Placement::Refused(refused),
+        },
     }
 }
 
@@ -310,7 +345,7 @@ fn hand_written_export(
     inbound: &Value,
     written: &[Value],
     at: usize,
-    host: Result<&Host, &str>,
+    dialable: Result<Dialable<'_>, String>,
 ) -> Export {
     let path = format!("users[{at}]");
     let Some(name) = name_of(&written[at]) else {
@@ -331,21 +366,15 @@ fn hand_written_export(
         .get("tag")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    export(inbound, &written[at], &path, host, &format!("{tag}-{name}"))
+    export(dialable, &written[at], &path, &format!("{tag}-{name}"))
 }
 
-fn export(
-    inbound: &Value,
-    user: &Value,
-    path: &str,
-    host: Result<&Host, &str>,
-    name: &str,
-) -> Export {
-    let host = match host {
-        Ok(host) => host,
-        Err(reason) => return refusal(format!("public-host: {reason}")),
+fn export(dialable: Result<Dialable<'_>, String>, user: &Value, path: &str, name: &str) -> Export {
+    let dialable = match dialable {
+        Ok(dialable) => dialable,
+        Err(reason) => return refusal(reason),
     };
-    match users::client(inbound, user, path, host, name) {
+    match users::client(dialable.inbound(), user, path, &dialable.host, name) {
         Err(refused) => refusal(refused.to_string()),
         Ok(node) => Export {
             link: write_link(&node).ok(),
@@ -363,6 +392,64 @@ fn outbound(tag: &str, node: &Node<Client>) -> Option<Value> {
 #[cfg(not(feature = "singbox"))]
 fn outbound(_: &str, _: &Node<Client>) -> Option<Value> {
     None
+}
+
+/// The host a client dials for one inbound, with the port override already
+/// applied to the inbound it will be read from.
+///
+/// The operator's address wins; otherwise the instance's public host is used.
+/// The port is the inbound's own unless an override says otherwise, so a
+/// forwarded or proxied entry can differ from what the core listens on.
+struct Dialable<'a> {
+    host: Host,
+    inbound: std::borrow::Cow<'a, Value>,
+}
+
+impl Dialable<'_> {
+    fn inbound(&self) -> &Value {
+        &self.inbound
+    }
+}
+
+fn address_of<'a>(
+    inbound: &'a Value,
+    tag: Option<&str>,
+    config: &str,
+    access: &Access,
+    public: Result<&Host, &str>,
+) -> Result<Dialable<'a>, String> {
+    let at = Entry {
+        config: config.to_owned(),
+        inbound: tag.unwrap_or_default().to_owned(),
+    };
+    address(inbound, access.endpoint(&at), public)
+}
+
+fn address<'a>(
+    inbound: &'a Value,
+    endpoint: Option<&crate::state::access::Endpoint>,
+    public: Result<&Host, &str>,
+) -> Result<Dialable<'a>, String> {
+    let host = match (
+        endpoint.and_then(|endpoint| endpoint.address.as_deref()),
+        public,
+    ) {
+        (Some(stored), _) => Host::parse(stored).map_err(|_| {
+            "address: the stored address is not a host name or IP address".to_string()
+        })?,
+        (None, Ok(host)) => host.clone(),
+        (None, Err(reason)) => return Err(format!("public-host: {reason}")),
+    };
+    let inbound = match endpoint.and_then(|endpoint| endpoint.port) {
+        Some(port) => {
+            let mut inbound = inbound.clone();
+            inbound["listen_port"] = Value::from(port);
+            std::borrow::Cow::Owned(inbound)
+        }
+        None => std::borrow::Cow::Borrowed(inbound),
+    };
+
+    Ok(Dialable { host, inbound })
 }
 
 fn refusal(reason: String) -> Export {
@@ -384,7 +471,7 @@ fn state(serving: &Serving<'_>, tag: Option<&str>, entry: &Value) -> State {
 }
 
 /// Names the running core serves here that neither this configuration's own
-/// users nor its pool users have any more.
+/// users nor its managed users have any more.
 fn departing(
     serving: &Serving<'_>,
     tag: Option<&str>,
@@ -445,7 +532,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::state::access::{Pool, User};
+    use crate::state::access::{Endpoint, User};
 
     const PRIVATE_KEY: &str = "UPLJ7jF8V4gCQx8Fq4aJ3ux3Tx7GgSj2dX8JX0X7S2E";
 
@@ -475,15 +562,19 @@ mod tests {
         }
     }
 
-    /// Alice through `standard` (both proxies, and the mixed inbound a pool
-    /// cannot grant), bob through `light` in another configuration.
+    /// Alice uses both proxies and the mixed inbound that cannot take users;
+    /// bob uses another configuration's inbound.
     fn access() -> Access {
         Access {
             users: BTreeMap::from([
                 (
                     "alice".to_string(),
                     User {
-                        pools: vec!["standard".into()],
+                        inbounds: vec![
+                            entry("server", "vless-in"),
+                            entry("server", "trojan-in"),
+                            entry("server", "mixed-in"),
+                        ],
                         secret: "11".repeat(32),
                         ..User::default()
                     },
@@ -491,31 +582,30 @@ mod tests {
                 (
                     "bob".to_string(),
                     User {
-                        pools: vec!["light".into()],
+                        inbounds: vec![entry("other", "trojan-in")],
                         secret: "22".repeat(32),
                         ..User::default()
                     },
                 ),
             ]),
-            pools: BTreeMap::from([
-                (
-                    "standard".to_string(),
-                    Pool {
-                        entries: vec![
-                            entry("server", "vless-in"),
-                            entry("server", "trojan-in"),
-                            entry("server", "mixed-in"),
-                        ],
-                    },
-                ),
-                (
-                    "light".to_string(),
-                    Pool {
-                        entries: vec![entry("other", "trojan-in")],
-                    },
-                ),
-            ]),
+            ..Access::default()
         }
+    }
+
+    /// The same users, with an address override on one of the inbounds.
+    fn access_with_address() -> Access {
+        let mut access = access();
+        access.endpoints.insert(
+            "server".to_string(),
+            BTreeMap::from([(
+                "trojan-in".to_string(),
+                Endpoint {
+                    address: Some("cdn.example.com".to_string()),
+                    port: Some(8444),
+                },
+            )]),
+        );
+        access
     }
 
     fn names(document: &Value, index: usize) -> Vec<&str> {
@@ -526,18 +616,18 @@ mod tests {
     }
 
     #[test]
-    fn pool_users_join_the_inbounds_of_their_configuration_only() {
+    fn managed_users_join_the_inbounds_of_their_configuration_only() {
         let injected = inject(&document(), "server", &access()).unwrap();
 
         assert_eq!(names(&injected, 0), ["guest", "alice"]);
         assert_eq!(
             names(&injected, 1),
             ["alice"],
-            "bob's pool is another configuration's"
+            "bob's other inbound is another configuration's"
         );
         assert!(
             injected["inbounds"][2].get("users").is_none(),
-            "a pool cannot turn authentication on"
+            "a mixed inbound cannot take users"
         );
         assert_eq!(
             injected["inbounds"][0]["users"][1]["flow"],
@@ -559,12 +649,12 @@ mod tests {
 
         assert!(matches!(
             refused,
-            Error::Document(ref fault) if fault == "inbounds[2].users[0].name: reserved for a pool user"
+            Error::Document(ref fault) if fault == "inbounds[2].users[0].name: reserved for a managed user"
         ));
     }
 
     #[test]
-    fn a_hand_written_credential_equal_to_a_pool_users_is_refused() {
+    fn a_hand_written_credential_equal_to_a_managed_users_is_refused() {
         let injected = inject(&document(), "server", &access()).unwrap();
         let pooled = injected["inbounds"][1]["users"][0]["password"].clone();
         let mut written = document();
@@ -574,7 +664,7 @@ mod tests {
 
         assert!(matches!(
             refused,
-            Error::Document(ref fault) if fault == "inbounds[1].users[0]: same credential as a pool user"
+            Error::Document(ref fault) if fault == "inbounds[1].users[0]: same credential as a managed user"
         ));
     }
 
@@ -671,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn a_users_nodes_are_its_pool_users_in_one_configuration() {
+    fn a_users_nodes_are_its_managed_users_in_one_configuration() {
         let nodes = super::nodes(&document(), "server", &access(), "alice", Ok(&host()));
 
         let names: Vec<String> = nodes
@@ -687,5 +777,129 @@ mod tests {
                     .as_ref()
                     .is_err_and(|reason| reason == "public-host: not set"))
         );
+    }
+
+    /// A stored address replaces the public host for the clients that reach
+    /// that one inbound; a stored port replaces what the inbound listens on,
+    /// without the operator's document being touched.
+    #[test]
+    fn an_address_override_reaches_the_node_and_leaves_the_inbound_alone() {
+        let nodes = super::nodes(
+            &document(),
+            "server",
+            &access_with_address(),
+            "alice",
+            Ok(&host()),
+        );
+
+        assert!(
+            nodes[0]
+                .as_ref()
+                .unwrap()
+                .endpoint
+                .host
+                .to_string()
+                .eq("proxy.example.com"),
+            "an inbound without an override still uses the public host"
+        );
+        assert_eq!(nodes[0].as_ref().unwrap().endpoint.port.to_string(), "443");
+        assert_eq!(
+            nodes[1].as_ref().unwrap().endpoint.host.to_string(),
+            "cdn.example.com"
+        );
+        assert_eq!(nodes[1].as_ref().unwrap().endpoint.port.to_string(), "8444");
+
+        let injected = inject(&document(), "server", &access_with_address()).unwrap();
+        let inbounds = exports(
+            &document(),
+            "server",
+            &access_with_address(),
+            Ok(&host()),
+            &Serving::Running(&injected),
+        );
+        assert!(inbounds[1].managed[0]
+            .export
+            .link
+            .as_deref()
+            .unwrap()
+            .contains("@cdn.example.com:8444"));
+        assert_eq!(inbounds[1].index, 1, "the document keeps its own inbound");
+    }
+
+    /// An address without a port keeps the inbound's own, and a port alone
+    /// reuses the host it would otherwise inherit.
+    #[test]
+    fn either_half_of_an_override_stands_on_its_own() {
+        for (endpoint, expected_host, port) in [
+            (
+                Endpoint {
+                    address: Some("cdn.example.com".to_string()),
+                    port: None,
+                },
+                "cdn.example.com",
+                "8443",
+            ),
+            (
+                Endpoint {
+                    address: None,
+                    port: Some(443),
+                },
+                "proxy.example.com",
+                "443",
+            ),
+        ] {
+            let mut access = access();
+            access.endpoints.insert(
+                "server".to_string(),
+                BTreeMap::from([("trojan-in".to_string(), endpoint)]),
+            );
+            let nodes = super::nodes(&document(), "server", &access, "alice", Ok(&host()));
+
+            assert_eq!(
+                nodes[1].as_ref().unwrap().endpoint.host.to_string(),
+                expected_host
+            );
+            assert_eq!(nodes[1].as_ref().unwrap().endpoint.port.to_string(), port);
+        }
+    }
+
+    /// A stored address that is not a host is refused with its own reason
+    /// rather than silently falling back to the public host.
+    #[test]
+    fn an_unparseable_stored_address_is_refused() {
+        let mut access = access();
+        access.endpoints.insert(
+            "server".to_string(),
+            BTreeMap::from([(
+                "trojan-in".to_string(),
+                Endpoint {
+                    address: Some("not a host".to_string()),
+                    port: None,
+                },
+            )]),
+        );
+        let nodes = super::nodes(&document(), "server", &access, "alice", Ok(&host()));
+
+        assert_eq!(
+            nodes[1].as_ref().unwrap_err().as_str(),
+            "address: the stored address is not a host name or IP address"
+        );
+    }
+
+    /// An entry that reaches no inbound, or one that cannot take users, has a
+    /// reason to show beside its address.
+    #[test]
+    fn an_inbound_that_cannot_be_addressed_says_why() {
+        let unknown = super::placement(&document(), &entry("server", "gone"));
+        assert_eq!(unknown.reason(), Some("no inbound has this tag"));
+        assert!(matches!(unknown, Placement::Unknown));
+
+        let refused = super::placement(&document(), &entry("server", "mixed-in"));
+        assert!(refused.reason().is_some());
+        assert!(matches!(refused, Placement::Refused(_)));
+
+        let placed = super::placement(&document(), &entry("server", "trojan-in"));
+        assert_eq!(placed.reason(), None);
+        assert!(matches!(placed, Placement::Placed));
     }
 }

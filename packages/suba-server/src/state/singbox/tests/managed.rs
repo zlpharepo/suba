@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::state::access::{Access, Entry, Pool, User};
+use crate::state::access::{Access, Entry, User};
 
 fn written() -> Value {
     json!({"inbounds": [
@@ -19,20 +19,15 @@ fn contributions(user: &str) -> Contributions {
             users: BTreeMap::from([(
                 user.to_string(),
                 User {
-                    pools: vec!["standard".into()],
+                    inbounds: vec![Entry {
+                        config: NAME.to_string(),
+                        inbound: "trojan-in".to_string(),
+                    }],
                     secret: "44".repeat(32),
                     ..User::default()
                 },
             )]),
-            pools: BTreeMap::from([(
-                "standard".to_string(),
-                Pool {
-                    entries: vec![Entry {
-                        config: NAME.to_string(),
-                        inbound: "trojan-in".to_string(),
-                    }],
-                },
-            )]),
+            ..Access::default()
         },
         ..Contributions::default()
     }
@@ -43,7 +38,7 @@ fn product(store: &SingboxStore) -> Value {
 }
 
 #[test]
-fn a_start_runs_the_pool_users_without_writing_them_into_the_document() {
+fn a_start_runs_the_managed_users_without_writing_them_into_the_document() {
     let (_scratch, store) = store();
     store
         .write_document(NAME, written(), None, &Contributions::default())
@@ -70,7 +65,7 @@ fn a_namesake_stops_a_start_and_is_a_warning_when_saved() {
         .unwrap();
     assert_eq!(
         saved.warnings,
-        ["inbounds[1].users[0].name: reserved for a pool user"]
+        ["inbounds[1].users[0].name: reserved for a managed user"]
     );
 
     let refused = store.start(&contributions("alice"));

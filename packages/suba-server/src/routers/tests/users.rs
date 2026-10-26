@@ -5,6 +5,7 @@ use super::{body, Server};
 use crate::config::AppConfig;
 
 const USERS: &str = "/api/cores/sing-box/users";
+const ENDPOINTS: &str = "/api/cores/sing-box/endpoints";
 
 async fn server(public_host: Option<&str>) -> Server {
     let server = Server::start_with(Some(AppConfig {
@@ -39,22 +40,12 @@ async fn server(public_host: Option<&str>) -> Server {
     assert_eq!(
         server
             .put_json(
-                "/api/cores/sing-box/pools/standard",
-                json!({"entries": [
+                &format!("{USERS}/alice"),
+                json!({"inbounds": [
                     {"config": "server", "inbound": "trojan-in"},
                     {"config": "server", "inbound": "mixed-in"},
                     {"config": "server", "inbound": "gone"}
                 ]}),
-            )
-            .await
-            .status(),
-        204
-    );
-    assert_eq!(
-        server
-            .put_json(
-                &format!("{USERS}/alice"),
-                json!({"pools": ["standard", "missing"]})
             )
             .await
             .status(),
@@ -89,7 +80,7 @@ fn secret(server: &Server) -> String {
 }
 
 #[tokio::test]
-async fn a_pool_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
+async fn a_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
     let server = server(Some("proxy.example.com")).await;
     let minted = server
         .authed(Method::PUT, &format!("{USERS}/alice/tokens/phone"))
@@ -101,7 +92,8 @@ async fn a_pool_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
 
     let listed = alice(&server).await;
     assert_eq!(listed["name"], "alice");
-    assert_eq!(listed["missing_pools"], json!(["missing"]));
+    assert_eq!(listed["inbounds"][0]["inbound"], "trojan-in");
+    assert_eq!(listed["missing_collections"], json!([]));
     assert_eq!(listed["links"][0]["path"], json!(format!("/s/{token}")));
     let grants = listed["grants"].as_array().unwrap();
     assert_eq!(grants.len(), 3);
@@ -186,20 +178,174 @@ async fn without_a_public_host_a_node_says_why_and_the_subscription_leaves_it_ou
 }
 
 #[tokio::test]
-async fn pools_say_what_each_entry_gives_and_who_is_in_them() {
+async fn an_address_override_is_what_a_client_dials() {
     let server = server(Some("proxy.example.com")).await;
 
-    let pools = body(get(&server, "/api/cores/sing-box/pools").await).await;
+    let set = server
+        .put_json(
+            &format!("{ENDPOINTS}/server/trojan-in"),
+            json!({"address": "cdn.example.net", "port": 443}),
+        )
+        .await;
+    assert_eq!(set.status(), 200);
+    let answer = body(set).await;
+    assert_eq!(answer["address"], "cdn.example.net");
+    assert_eq!(answer["port"], 443);
+    assert!(answer.get("reason").is_none());
 
-    assert_eq!(pools[0]["name"], "standard");
-    assert_eq!(pools[0]["members"], json!(["alice"]));
-    let entries = pools[0]["entries"].as_array().unwrap();
+    let grant = &alice(&server).await["grants"][0];
+    assert!(
+        grant["link"]
+            .as_str()
+            .unwrap()
+            .contains("@cdn.example.net:443"),
+        "{}",
+        grant["link"]
+    );
+
+    // The inbound keeps listening where it did; only what a client dials
+    // changed, and the operator's document is untouched.
+    let editor = body(get(&server, "/api/cores/sing-box/configs/server/exports").await).await;
+    assert_eq!(editor["inbounds"][0]["index"], 0);
+
+    // An omitted field keeps what is stored, an explicit null clears it.
+    let kept = body(
+        server
+            .put_json(
+                &format!("{ENDPOINTS}/server/trojan-in"),
+                json!({"port": 8443}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(kept["address"], "cdn.example.net");
+    assert_eq!(kept["port"], 8443);
+
+    let cleared = body(
+        server
+            .put_json(
+                &format!("{ENDPOINTS}/server/trojan-in"),
+                json!({"address": null}),
+            )
+            .await,
+    )
+    .await;
+    assert!(cleared.get("address").is_none());
+    assert_eq!(cleared["port"], 8443);
+
+    let removed = server
+        .authed(Method::DELETE, &format!("{ENDPOINTS}/server/trojan-in"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 204);
+    assert!(alice(&server).await["grants"][0]["link"]
+        .as_str()
+        .unwrap()
+        .contains("@proxy.example.com:8443"));
+}
+
+#[tokio::test]
+async fn endpoints_list_every_inbound_whether_or_not_one_is_stored() {
+    let server = server(Some("proxy.example.com")).await;
+
+    let listed = body(get(&server, ENDPOINTS).await).await;
+    assert_eq!(listed["public_host"], "proxy.example.com");
+    let entries = listed["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["config"], "server");
+    assert_eq!(entries[0]["inbound"], "trojan-in");
+    assert!(entries[0].get("address").is_none());
     assert!(entries[0].get("reason").is_none());
     assert!(
         entries[1]["reason"].is_string(),
         "a mixed inbound cannot be granted"
     );
-    assert_eq!(entries[2]["reason"], "no inbound has this tag");
+
+    // An address belongs to one inbound: the other one keeps its own, so an
+    // override cannot be read off whatever entry happens to be first.
+    server
+        .put_json(
+            &format!("{ENDPOINTS}/server/trojan-in"),
+            json!({"address": "cdn.example.net"}),
+        )
+        .await;
+    server
+        .put_json(
+            &format!("{ENDPOINTS}/server/mixed-in"),
+            json!({"address": "other.example.net", "port": 1080}),
+        )
+        .await;
+
+    let stored = body(get(&server, ENDPOINTS).await).await;
+    let entries = stored["entries"].as_array().unwrap();
+    assert_eq!(entries[0]["address"], "cdn.example.net");
+    assert_eq!(entries[0]["port"], Value::Null);
+    assert_eq!(entries[1]["address"], "other.example.net");
+    assert_eq!(entries[1]["port"], 1080);
+
+    // Only an inbound that exists can be addressed.
+    for path in ["server/no-such-inbound", "no-such-config/trojan-in"] {
+        assert_eq!(
+            server
+                .put_json(
+                    &format!("{ENDPOINTS}/{path}"),
+                    json!({"address": "cdn.example.net"}),
+                )
+                .await
+                .status(),
+            422,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_address_that_is_not_a_host_is_refused() {
+    let server = server(Some("proxy.example.com")).await;
+
+    for address in [
+        "",
+        "a b",
+        "example.com/path",
+        "2001:db8::1",
+        "example.com:443",
+    ] {
+        assert_eq!(
+            server
+                .put_json(
+                    &format!("{ENDPOINTS}/server/trojan-in"),
+                    json!({"address": address}),
+                )
+                .await
+                .status(),
+            422,
+            "{address}"
+        );
+    }
+    for address in ["cdn.example.net", "10.0.0.1", "[2001:db8::1]"] {
+        assert_eq!(
+            server
+                .put_json(
+                    &format!("{ENDPOINTS}/server/trojan-in"),
+                    json!({"address": address}),
+                )
+                .await
+                .status(),
+            200,
+            "{address}"
+        );
+    }
+    assert_eq!(
+        server
+            .put_json(
+                &format!("{ENDPOINTS}/server/trojan-in"),
+                json!({"port": 70000}),
+            )
+            .await
+            .status(),
+        422
+    );
 }
 
 #[tokio::test]
@@ -228,8 +374,8 @@ async fn names_that_cannot_be_told_apart_are_refused_and_unknown_users_are_not_f
     assert_eq!(
         server
             .put_json(
-                "/api/cores/sing-box/pools/broken",
-                json!({"entries": [{"config": "../etc", "inbound": "x"}]}),
+                &format!("{USERS}/alice"),
+                json!({"inbounds": [{"config": "../etc", "inbound": "x"}]}),
             )
             .await
             .status(),

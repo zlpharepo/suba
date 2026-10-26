@@ -1244,7 +1244,7 @@ fn drop_identity(uid: u32, gid: u32) -> std::io::Result<()> {
 }
 
 /// The tag an entry is addressed by.
-/// The operator's document named `config`, with its pool users and the
+/// The operator's document named `config`, with its managed users and the
 /// collections' outbounds, checked as the core would.
 fn assemble_document(
     document: &Value,

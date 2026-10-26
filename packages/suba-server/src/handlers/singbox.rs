@@ -186,7 +186,7 @@ pub async fn index(State(state): State<AppState>, _auth: Operator) -> ResponseRe
 
 /// Resolve once without refreshing; unavailable collections remain save warnings
 /// so a draft can be repaired, but cannot become a runtime product or preview.
-/// The users and pools are read here too, so one run sees one picture of them.
+/// The users are read here too, so one run sees one picture of them.
 async fn generated(state: &AppState) -> Result<Contributions, Error> {
     let store = state.singbox();
     let selected = tokio::task::spawn_blocking(move || store.settings())

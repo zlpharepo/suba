@@ -128,7 +128,7 @@ pub enum Error {
     #[error("there is no user named '{0}'")]
     UserNotFound(String),
 
-    /// A user or pool name that could not be told apart in a log line or a URL.
+    /// A user name that could not be told apart in a log line or a URL.
     #[cfg(feature = "singbox-core")]
     #[error("{reason}")]
     AccessName { reason: &'static str },

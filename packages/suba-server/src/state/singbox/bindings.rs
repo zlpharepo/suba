@@ -16,7 +16,7 @@ const EXTENSION: &str = "x-suba-collections";
 
 /// What one run gets beside the operator's document, resolved before any lock:
 /// the selected collections' outbounds, with their provenance, and the users
-/// and pools that decide which inbounds get pool users.
+/// that decide which inbounds get managed users.
 #[derive(Default)]
 pub(crate) struct Contributions {
     pub selected: Vec<String>,

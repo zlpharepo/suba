@@ -42,10 +42,10 @@ pub fn route() -> Router<AppState> {
             "/users/{name}/tokens/{token}",
             put(users::mint_token).delete(users::revoke_token),
         )
-        .route("/pools", get(users::pools))
+        .route("/endpoints", get(users::endpoints))
         .route(
-            "/pools/{name}",
-            put(users::put_pool).delete(users::delete_pool),
+            "/endpoints/{config}/{tag}",
+            put(users::put_endpoint).delete(users::delete_endpoint),
         )
         .route(
             "/configs/{name}/sections/{section}",
