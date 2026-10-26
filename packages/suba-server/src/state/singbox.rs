@@ -41,6 +41,7 @@ use suba_singbox::run::{self, Runner, Status};
 use suba_singbox::schema::{Schema, Skipped, Verdict};
 use tokio::sync::Mutex as AsyncMutex;
 
+use super::observation::Run as ObservedRun;
 use crate::{error::Error, fs, identity::Identity};
 
 mod bindings;
@@ -245,6 +246,8 @@ pub(crate) struct SingboxStore {
     runner: Arc<Runner>,
     /// Which version was started, while that process is the one in the runner.
     started: Mutex<Option<Version>>,
+    /// Observation follows the launched product even after selection or authored edits change.
+    observed_run: Mutex<Option<ObservedRun>>,
     /// The last schema read, with the hash it was read at.
     ///
     /// A schema is addressed by its bytes (I3), so holding one costs nothing but
@@ -277,6 +280,7 @@ impl SingboxStore {
             releases: AsyncMutex::new(None),
             runner: Arc::new(Runner::new()),
             started: Mutex::new(None),
+            observed_run: Mutex::new(None),
             schemas: Mutex::new(None),
             installs: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(()),
@@ -1072,9 +1076,17 @@ impl SingboxStore {
         }
         apply_identity(&mut command, drop_to);
 
+        self.observed_run.lock().expect("observed run").take();
         let pid = self.runner.spawn(command)?;
         *self.started.lock().expect("the started version") = Some(version);
         self.runner.confirm_start(pid, STARTUP_GRACE)?;
+        *self.observed_run.lock().expect("observed run") = Some(ObservedRun::new(
+            pid,
+            settings
+                .config
+                .unwrap_or_else(|| DEFAULT_CONFIG.to_string()),
+            &assembled.config,
+        ));
         Ok(pid)
     }
 
@@ -1159,6 +1171,9 @@ impl SingboxStore {
     fn stop_locked(&self, patience: Duration) -> Result<(), Error> {
         *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Stopping);
         let result = self.runner.stop(patience).map_err(Error::from);
+        if result.is_ok() {
+            self.observed_run.lock().expect("observed run").take();
+        }
         *self.phase.lock().expect("runtime phase") = match &result {
             Ok(()) => None,
             Err(error) => Some(RuntimePhase::Failed {
@@ -1166,6 +1181,14 @@ impl SingboxStore {
             }),
         };
         result
+    }
+
+    /// Reject a descriptor left behind by a dead or not-yet-confirmed replacement process.
+    pub(crate) fn observation_run(&self) -> Option<ObservedRun> {
+        let held = self.observed_run.lock().expect("observed run");
+        let run = held.as_ref()?;
+        let status = self.runner.status();
+        (status.running && status.pid == Some(run.pid)).then(|| run.clone())
     }
 
     /// What the process is doing.
@@ -1242,6 +1265,7 @@ fn tag_of(entry: &Value) -> Option<&str> {
 mod tests {
     mod bindings;
     mod managed;
+    mod observation;
 
     use super::*;
     use std::time::Duration;

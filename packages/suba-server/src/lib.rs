@@ -59,6 +59,8 @@ impl SubaServer {
         let refresher = tokio::spawn(self.state.refresher().run());
         #[cfg(feature = "singbox-core")]
         let stopping = self.state.singbox();
+        #[cfg(feature = "singbox-core")]
+        let observing = tokio::spawn(self.state.observation().run(self.state.singbox()));
 
         tracing::info!("SubA server running on http://{}", self.tcp.local_addr()?);
         let (notified, signal) = tokio::sync::oneshot::channel();
@@ -79,6 +81,11 @@ impl SubaServer {
         };
         refresher.abort();
         let _ = refresher.await;
+        #[cfg(feature = "singbox-core")]
+        {
+            observing.abort();
+            let _ = observing.await;
+        }
 
         // An unfinished HTTP request must not keep the managed core alive.
         #[cfg(feature = "singbox-core")]

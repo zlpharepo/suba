@@ -3,6 +3,8 @@ pub(crate) mod access;
 mod collections;
 pub(crate) mod limiter;
 pub(crate) mod metrics;
+#[cfg(feature = "singbox-core")]
+pub(crate) mod observation;
 mod persisted;
 pub(crate) mod providers;
 pub(crate) mod render;
@@ -48,6 +50,8 @@ struct Inner {
     singbox: Arc<SingboxStore>,
     #[cfg(feature = "singbox-core")]
     access: AccessStore,
+    #[cfg(feature = "singbox-core")]
+    observation: Arc<observation::Observation>,
 }
 
 impl AppState {
@@ -88,6 +92,8 @@ impl AppState {
             )),
             #[cfg(feature = "singbox-core")]
             access: AccessStore::load(&config.config_dir)?,
+            #[cfg(feature = "singbox-core")]
+            observation: Arc::new(observation::Observation::new()),
         })))
     }
 
@@ -154,6 +160,11 @@ impl AppState {
     #[cfg(feature = "singbox-core")]
     pub(crate) fn access(&self) -> &AccessStore {
         &self.0.access
+    }
+
+    #[cfg(feature = "singbox-core")]
+    pub(crate) fn observation(&self) -> Arc<observation::Observation> {
+        Arc::clone(&self.0.observation)
     }
 
     /// The sing-box module: its fragments, its configuration, its process.

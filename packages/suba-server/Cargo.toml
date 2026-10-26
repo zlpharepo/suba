@@ -12,7 +12,15 @@ default = ["toml", "singbox", "singbox-core", "clash"]
 toml = ["dep:toml"]
 json = []
 singbox = ["suba-core/singbox"]
-singbox-core = ["suba-core/singbox-core", "dep:suba-singbox", "dep:hmac", "dep:sha2"]
+singbox-core = [
+  "suba-core/singbox-core",
+  "dep:suba-singbox",
+  "dep:hmac",
+  "dep:sha2",
+  "dep:tonic",
+  "dep:prost",
+  "dep:tonic-prost",
+]
 clash = ["suba-core/clash"]
 
 [dependencies]
@@ -50,6 +58,9 @@ tracing-subscriber = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
+tonic = { version = "0.14", default-features = false, features = ["channel", "codegen"], optional = true }
+prost = { version = "0.14", optional = true }
+tonic-prost = { version = "0.14", optional = true }
 
 [dev-dependencies]
 # For the sing-box store's tests, which install a release archive they build

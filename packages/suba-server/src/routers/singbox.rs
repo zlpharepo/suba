@@ -10,7 +10,7 @@ use axum::{
 };
 
 use crate::{
-    handlers::{singbox, users},
+    handlers::{observation, singbox, users},
     AppState,
 };
 
@@ -20,6 +20,8 @@ pub fn route() -> Router<AppState> {
         .route("/", put(singbox::choose))
         .route("/status", get(singbox::status))
         .route("/status", put(singbox::act))
+        .route("/connections", get(observation::connections))
+        .route("/metrics", get(observation::metrics))
         .route(
             "/configs",
             get(singbox::configs).post(singbox::create_config),

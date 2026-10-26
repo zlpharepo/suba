@@ -91,6 +91,8 @@ impl AppRouter {
 mod tests {
     #[cfg(all(feature = "singbox", feature = "singbox-core"))]
     mod collection_bindings;
+    #[cfg(feature = "singbox-core")]
+    mod observation;
     mod provider_snapshots;
     #[cfg(feature = "singbox-core")]
     mod references;
@@ -582,6 +584,8 @@ mod tests {
             "/api/cores/sing-box",
             "/api/cores/sing-box/configs/default/references",
             "/api/cores/sing-box/references",
+            "/api/cores/sing-box/connections",
+            "/api/cores/sing-box/metrics",
         ] {
             let absent = server
                 .authed(reqwest::Method::GET, path)
