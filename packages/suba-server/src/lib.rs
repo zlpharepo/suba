@@ -61,6 +61,8 @@ impl SubaServer {
         let stopping = self.state.singbox();
         #[cfg(feature = "singbox-core")]
         let observing = tokio::spawn(self.state.observation().run(self.state.singbox()));
+        // The edge node connection is one task per process, not per request.
+        let edging = tokio::spawn(crate::state::peers::edge::run(self.state.clone()));
 
         tracing::info!("SubA server running on http://{}", self.tcp.local_addr()?);
         let (notified, signal) = tokio::sync::oneshot::channel();
@@ -81,6 +83,9 @@ impl SubaServer {
         };
         refresher.abort();
         let _ = refresher.await;
+        self.state.peers().edge.shutdown();
+        edging.abort();
+        let _ = edging.await;
         #[cfg(feature = "singbox-core")]
         {
             observing.abort();

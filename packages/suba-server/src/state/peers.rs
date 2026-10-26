@@ -4,6 +4,7 @@
 //! replay challenges expire in memory; restarting invalidates them. A peer
 //! proof authorizes a bounded resource router, never login or further delegation.
 
+pub(crate) mod edge;
 mod identity;
 mod transport;
 
@@ -36,15 +37,32 @@ const PENDING_LIMIT: usize = 256;
 pub(crate) struct Host {
     pub id: Uuid,
     pub name: String,
-    pub endpoint: String,
+    pub endpoint: Option<String>,
     pub identity: Identity,
     pub mode: Mode,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Mode {
+    #[default]
     Direct,
+    Edge,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EdgeUpstream {
+    pub manager: Identity,
+    pub endpoint: String,
+    pub proxy: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct HostView {
+    #[serde(flatten)]
+    pub host: Host,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection: Option<edge::EdgeStatus>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -71,6 +89,8 @@ struct Configuration {
     hosts: BTreeMap<Uuid, Host>,
     #[serde(default)]
     trusted: BTreeMap<Uuid, TrustedPeer>,
+    #[serde(default)]
+    edge: Option<EdgeUpstream>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -81,10 +101,13 @@ pub(crate) struct Invitation {
     pub identity: Identity,
     pub secret: String,
     pub expires_at: i64,
+    #[serde(default)]
+    pub mode: Mode,
 }
 
 struct PendingInvitation {
     name: String,
+    mode: Mode,
     secret: String,
     until: Instant,
 }
@@ -93,7 +116,14 @@ struct PendingInvitation {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Purpose {
     Pair,
+    EdgePair,
+    EdgeSession,
     Request,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct EdgeSessionProof {
+    pub challenge: Challenge,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +197,7 @@ pub(crate) struct Peers {
     file: Persisted<Configuration>,
     pending: Mutex<Pending>,
     http: reqwest::Client,
+    pub(crate) edge: edge::EdgeHub,
 }
 
 impl Peers {
@@ -175,12 +206,10 @@ impl Peers {
             file: Persisted::load(config, "peers")?,
             pending: Mutex::new(Pending::default()),
             // Control must not depend on environment proxy settings or follow redirects with proofs.
-            http: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(5))
+            http: outbound_builder(None)?
                 .timeout(Duration::from_secs(30))
                 .build()?,
+            edge: edge::EdgeHub::new(),
         })
     }
 
@@ -188,6 +217,36 @@ impl Peers {
         self.file
             .read(|file| file.hosts.values().cloned().collect())
             .await
+    }
+
+    pub(crate) fn host_view(&self, host: Host) -> HostView {
+        let connection = (host.mode == Mode::Edge).then(|| self.edge.host_status(host.id));
+        HostView { host, connection }
+    }
+
+    pub(crate) async fn edge_upstream(&self) -> Option<EdgeUpstream> {
+        self.file.read(|file| file.edge.clone()).await
+    }
+
+    pub(crate) async fn edge_host(&self, id: Uuid) -> Result<Host, Error> {
+        let host = self.host(id).await?;
+        if host.mode != Mode::Edge {
+            return Err(Error::Unauthorized);
+        }
+        Ok(host)
+    }
+
+    pub(crate) async fn edge_manager_authorized(&self, manager: &Identity) -> Result<(), Error> {
+        if self
+            .edge_upstream()
+            .await
+            .as_ref()
+            .map(|link| &link.manager)
+            != Some(manager)
+        {
+            return Err(Error::Unauthorized);
+        }
+        self.require_trusted(manager).await
     }
 
     pub(crate) async fn trusted(&self) -> Vec<TrustedPeer> {
@@ -207,13 +266,18 @@ impl Peers {
         &self,
         id: Uuid,
         name: String,
-        url: String,
+        url: Option<String>,
     ) -> Result<Host, Error> {
         valid_name(&name)?;
-        let endpoint = endpoint(&url)?;
+        let endpoint = url.as_deref().map(endpoint).transpose()?;
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
         let host = file.hosts.get_mut(&id).ok_or(Error::PeerNotFound)?;
+        if host.mode == Mode::Direct && endpoint.is_none() {
+            return Err(Error::PeerRequest {
+                reason: "endpoint: a Direct host requires an address",
+            });
+        }
         host.name = name;
         host.endpoint = endpoint;
         let result = host.clone();
@@ -225,7 +289,9 @@ impl Peers {
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
         file.hosts.remove(&id).ok_or(Error::PeerNotFound)?;
-        Ok(locked.commit(file).await?)
+        locked.commit(file).await?;
+        self.edge.disconnect(id);
+        Ok(())
     }
 
     pub(crate) async fn revoke(&self, id: Uuid) -> Result<(), Error> {
@@ -240,6 +306,7 @@ impl Peers {
         signer: &IdentitySigner,
         name: String,
         url: String,
+        mode: Mode,
     ) -> Result<Invitation, Error> {
         valid_name(&name)?;
         let endpoint = endpoint(&url)?;
@@ -255,6 +322,7 @@ impl Peers {
             id,
             PendingInvitation {
                 name,
+                mode,
                 secret: secret.clone(),
                 until: Instant::now() + INVITE_TTL,
             },
@@ -266,6 +334,7 @@ impl Peers {
             identity: signer.identity.clone(),
             secret,
             expires_at,
+            mode,
         })
     }
 
@@ -287,11 +356,15 @@ impl Peers {
         let mut pending = self.pending.lock().await;
         pending.prune();
         let (purpose, invitation) = if let Some(invitation) = request.invitation {
-            pending
+            let held = pending
                 .invitations
                 .get(&invitation)
                 .ok_or(Error::Unauthorized)?;
-            (Purpose::Pair, Some(invitation))
+            let purpose = match held.mode {
+                Mode::Edge => Purpose::EdgePair,
+                Mode::Direct => Purpose::Pair,
+            };
+            (purpose, Some(invitation))
         } else {
             self.require_trusted(&request.actor).await?;
             (Purpose::Request, None)
@@ -299,22 +372,9 @@ impl Peers {
         if pending.challenges.len() >= PENDING_LIMIT {
             return Err(Error::PeerBusy);
         }
-        let challenge = Challenge {
-            nonce: random()?,
-            actor: request.actor,
-            target: signer.identity.clone(),
-            purpose,
-            expires_at: chrono::Utc::now().timestamp() + CHALLENGE_TTL.as_secs() as i64,
-        };
-        pending.challenges.insert(
-            challenge.nonce.clone(),
-            PendingChallenge {
-                challenge: challenge.clone(),
-                invitation,
-                until: Instant::now() + CHALLENGE_TTL,
-            },
-        );
-        signer.sign("challenge", challenge)
+        drop(pending);
+        self.challenge_actor(signer, request.actor, purpose, invitation)
+            .await
     }
 
     pub(crate) async fn accept(
@@ -324,13 +384,23 @@ impl Peers {
     ) -> Result<Signed<PairReceipt>, Error> {
         proof.verify("pair", &proof.payload.challenge.actor)?;
         let challenge = proof.payload.challenge;
+        if !matches!(challenge.purpose, Purpose::Pair | Purpose::EdgePair) {
+            return Err(Error::Unauthorized);
+        }
         let mut pending = self.pending.lock().await;
-        let held = consume(&mut pending, &challenge, &signer.identity, Purpose::Pair)?;
+        let held = consume(
+            &mut pending,
+            &challenge,
+            &signer.identity,
+            challenge.purpose.clone(),
+        )?;
         let invitation_id = held.invitation.ok_or(Error::Unauthorized)?;
         let invitation = pending
             .invitations
             .get(&invitation_id)
             .ok_or(Error::Unauthorized)?;
+        let mode = invitation.mode;
+        let label = invitation.name.clone();
         verify_invitation(
             &invitation.secret,
             &challenge,
@@ -339,13 +409,24 @@ impl Peers {
         let actor = &challenge.actor;
         let trusted = TrustedPeer {
             id: actor.id,
-            name: invitation.name.clone(),
+            name: label.clone(),
             public_key: actor.public_key.clone(),
             fingerprint: actor.fingerprint.clone(),
         };
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
         file.trusted.insert(actor.id, trusted);
+        if mode == Mode::Edge {
+            // The manager keeps the node it invited so it can dial it back over
+            // the session the node opens. It has no address of its own to reach.
+            file.hosts.entry(actor.id).or_insert(Host {
+                id: actor.id,
+                name: label,
+                endpoint: None,
+                identity: actor.clone(),
+                mode: Mode::Edge,
+            });
+        }
         locked.commit(file).await?;
         pending.invitations.remove(&invitation_id);
         signer.sign(
@@ -379,6 +460,204 @@ impl Peers {
 
     pub(crate) async fn allows(&self, grant: &PeerGrant) -> Result<(), Error> {
         self.require_trusted(&grant.actor).await
+    }
+
+    /// A manager's own inbound side: prove an agent is the one this instance invited,
+    /// without granting it any authority over this instance's resources.
+    pub(crate) async fn edge_challenge(
+        &self,
+        signer: &IdentitySigner,
+        id: Uuid,
+    ) -> Result<Signed<Challenge>, Error> {
+        let host = self.edge_host(id).await?;
+        if host.identity.id == signer.identity.id {
+            return Err(Error::Unauthorized);
+        }
+        self.challenge_actor(signer, host.identity, Purpose::EdgeSession, None)
+            .await
+    }
+
+    pub(crate) async fn authorize_edge_session(
+        &self,
+        signer: &IdentitySigner,
+        proof: &Signed<EdgeSessionProof>,
+    ) -> Result<Host, Error> {
+        proof.verify("edge-session", &proof.payload.challenge.actor)?;
+        let challenge = proof.payload.challenge.clone();
+        let mut pending = self.pending.lock().await;
+        consume(
+            &mut pending,
+            &challenge,
+            &signer.identity,
+            Purpose::EdgeSession,
+        )?;
+        let host = self.edge_host(challenge.actor.id).await?;
+        if host.identity != challenge.actor {
+            return Err(Error::Unauthorized);
+        }
+        self.require_trusted(&challenge.actor).await?;
+        Ok(host)
+    }
+
+    /// The node side of an Edge pairing: prove the invitation, then remember the
+    /// manager this instance will dial. Only one upstream is kept, and pairing is
+    /// never retried automatically.
+    pub(crate) async fn join_edge(
+        &self,
+        signer: &IdentitySigner,
+        invitation: Invitation,
+        proxy: Option<String>,
+    ) -> Result<EdgeUpstream, Error> {
+        if invitation.mode != Mode::Edge {
+            return Err(Error::PeerRequest {
+                reason: "invitation.mode: this invitation is for a Direct connection",
+            });
+        }
+        let endpoint = endpoint(&invitation.endpoint)?;
+        invitation.identity.key()?;
+        if invitation.version != 1
+            || invitation.identity.id == signer.identity.id
+            || invitation.identity.fingerprint == signer.identity.fingerprint
+            || invitation.secret.len() != 64
+            || !invitation
+                .secret
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(Error::PeerRequest {
+                reason: "invitation: invalid invitation or the local instance",
+            });
+        }
+        let proxy = proxy.map(|url| proxy_url(&url)).transpose()?.flatten();
+        if self.edge_upstream().await.is_some() {
+            return Err(Error::PeerConflict {
+                reason: "edge: this instance already has an upstream manager; disconnect first",
+            });
+        }
+        let challenge = self
+            .remote_challenge(
+                signer,
+                &endpoint,
+                &invitation.identity,
+                Some(invitation.id),
+                Purpose::EdgePair,
+            )
+            .await?;
+        let receipt: Signed<PairReceipt> = self
+            .post(
+                &endpoint,
+                "pairings",
+                &signer.sign(
+                    "pair",
+                    PairClaim {
+                        invitation_proof: invitation_proof(&invitation.secret, &challenge)?,
+                        challenge: challenge.clone(),
+                    },
+                )?,
+            )
+            .await
+            .map_err(|_| Error::PeerUncertain)?;
+        receipt
+            .verify("paired", &invitation.identity)
+            .map_err(|_| Error::PeerUncertain)?;
+        if receipt.payload.nonce != challenge.nonce
+            || receipt.payload.actor != signer.identity.id
+            || receipt.payload.target != invitation.identity
+        {
+            return Err(Error::PeerUncertain);
+        }
+        let link = EdgeUpstream {
+            manager: invitation.identity,
+            endpoint,
+            proxy,
+        };
+        let locked = self.file.lock().await;
+        let mut file = locked.get().clone();
+        if file.edge.is_some() {
+            return Err(Error::PeerConflict {
+                reason: "edge: this instance already has an upstream manager; disconnect first",
+            });
+        }
+        file.edge = Some(link.clone());
+        // The manager that invited this instance is the one allowed to operate it.
+        file.trusted.insert(
+            link.manager.id,
+            TrustedPeer {
+                id: link.manager.id,
+                name: "Manager".to_string(),
+                public_key: link.manager.public_key.clone(),
+                fingerprint: link.manager.fingerprint.clone(),
+            },
+        );
+        locked
+            .commit(file)
+            .await
+            .map_err(|_| Error::PeerUncertain)?;
+        self.edge.reconnect();
+        Ok(link)
+    }
+
+    pub(crate) async fn leave_edge(&self) -> Result<(), Error> {
+        let locked = self.file.lock().await;
+        let mut file = locked.get().clone();
+        let link = file.edge.take().ok_or(Error::PeerNotFound)?;
+        // Leaving also revokes the manager's incoming resource grant.
+        file.trusted.remove(&link.manager.id);
+        locked.commit(file).await?;
+        // A configuration change, not a process shutdown: the loop stays alive to
+        // notice the upstream is gone and to accept a new one later.
+        self.edge.reconnect();
+        Ok(())
+    }
+
+    pub(crate) async fn edit_edge_upstream(
+        &self,
+        endpoint: Option<String>,
+        proxy: Option<Option<String>>,
+    ) -> Result<EdgeUpstream, Error> {
+        let locked = self.file.lock().await;
+        let mut file = locked.get().clone();
+        let link = file.edge.as_mut().ok_or(Error::PeerNotFound)?;
+        if let Some(url) = endpoint {
+            link.endpoint = super::peers::endpoint(&url)?;
+        }
+        if let Some(proxy) = proxy {
+            link.proxy = proxy.map(|url| proxy_url(&url)).transpose()?.flatten();
+        }
+        let result = link.clone();
+        locked.commit(file).await?;
+        self.edge.reconnect();
+        Ok(result)
+    }
+
+    async fn challenge_actor(
+        &self,
+        signer: &IdentitySigner,
+        actor: Identity,
+        purpose: Purpose,
+        invitation: Option<Uuid>,
+    ) -> Result<Signed<Challenge>, Error> {
+        let mut pending = self.pending.lock().await;
+        pending.prune();
+        if pending.challenges.len() >= PENDING_LIMIT {
+            return Err(Error::PeerBusy);
+        }
+        let challenge = Challenge {
+            nonce: random()?,
+            actor,
+            target: signer.identity.clone(),
+            purpose,
+            expires_at: chrono::Utc::now().timestamp() + CHALLENGE_TTL.as_secs() as i64,
+        };
+        pending.challenges.insert(
+            challenge.nonce.clone(),
+            PendingChallenge {
+                challenge: challenge.clone(),
+                invitation,
+                until: Instant::now() + CHALLENGE_TTL,
+            },
+        );
+        signer.sign("challenge", challenge)
     }
 
     async fn require_trusted(&self, actor: &Identity) -> Result<(), Error> {
@@ -420,6 +699,47 @@ fn valid_name(name: &str) -> Result<(), Error> {
         });
     }
     Ok(())
+}
+
+/// An outbound client that never inherits the environment's proxy settings and
+/// never follows a redirect with a proof attached. An explicit proxy is the only
+/// way one is used, and it may carry credentials that are never logged.
+pub(crate) fn outbound_builder(proxy: Option<&str>) -> Result<reqwest::ClientBuilder, Error> {
+    let builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(5));
+    match proxy {
+        None => Ok(builder),
+        Some(url) => Ok(builder.proxy(
+            reqwest::Proxy::all(proxy_url(url)?.ok_or(Error::PeerRequest {
+                reason: "proxy: expected an HTTP or HTTPS proxy URL",
+            })?)
+            .map_err(|_| Error::PeerRequest {
+                reason: "proxy: expected an HTTP or HTTPS proxy URL",
+            })?,
+        )),
+    }
+}
+
+/// Validate an optional proxy URL: HTTP or HTTPS, a host and port, no path.
+fn proxy_url(value: &str) -> Result<Option<String>, Error> {
+    let invalid = || Error::PeerRequest {
+        reason: "proxy: use an HTTP or HTTPS proxy URL without a path, query or fragment",
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    let url = url::Url::parse(value).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(Some(url.as_str().trim_end_matches('/').to_string()))
 }
 
 pub(crate) fn endpoint(value: &str) -> Result<String, Error> {

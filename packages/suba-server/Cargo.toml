@@ -33,7 +33,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 
 argon2 = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 axum-extra = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -61,6 +61,8 @@ prost = { version = "0.14", optional = true }
 tonic-prost = { version = "0.14", optional = true }
 tower = { version = "0.5", features = ["util"] }
 base64.workspace = true
+reqwest-websocket = "0.6"
+futures-util = { version = "0.3", features = ["sink"] }
 
 [dev-dependencies]
 axum-server = { version = "0.8", features = ["tls-rustls"] }

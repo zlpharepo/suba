@@ -37,7 +37,13 @@ impl Peers {
             });
         }
         let challenge = self
-            .remote_challenge(signer, &endpoint, &invitation.identity, Some(invitation.id))
+            .remote_challenge(
+                signer,
+                &endpoint,
+                &invitation.identity,
+                Some(invitation.id),
+                Purpose::Pair,
+            )
             .await?;
         let receipt: Signed<PairReceipt> = self
             .post(
@@ -65,9 +71,9 @@ impl Peers {
         let host = Host {
             id: invitation.identity.id,
             name,
-            endpoint,
+            endpoint: Some(endpoint),
             identity: invitation.identity,
-            mode: Mode::Direct,
+            mode: invitation.mode,
         };
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
@@ -96,8 +102,9 @@ impl Peers {
         if !resource_allowed(&method, &path) {
             return Err(Error::PeerNotFound);
         }
+        let address = host.endpoint.as_deref().ok_or(Error::PeerUnavailable)?;
         let challenge = self
-            .remote_challenge(signer, &host.endpoint, &host.identity, None)
+            .remote_challenge(signer, address, &host.identity, None, Purpose::Request)
             .await?;
         let proof = signer.sign(
             "request",
@@ -118,7 +125,7 @@ impl Peers {
             }
         };
         let reply: Signed<ResourceReply> = self
-            .post(&host.endpoint, "requests", &proof)
+            .post(address, "requests", &proof)
             .await
             .map_err(|_| outcome())?;
         reply
@@ -133,18 +140,14 @@ impl Peers {
         Ok(reply.payload)
     }
 
-    async fn remote_challenge(
+    pub(super) async fn remote_challenge(
         &self,
         signer: &IdentitySigner,
         endpoint: &str,
         target: &Identity,
         invitation: Option<Uuid>,
+        purpose: Purpose,
     ) -> Result<Challenge, Error> {
-        let purpose = if invitation.is_some() {
-            Purpose::Pair
-        } else {
-            Purpose::Request
-        };
         let challenge: Signed<Challenge> = self
             .post(
                 endpoint,
@@ -167,7 +170,7 @@ impl Peers {
         Ok(challenge.payload)
     }
 
-    async fn post<T: Serialize, R: DeserializeOwned>(
+    pub(super) async fn post<T: Serialize, R: DeserializeOwned>(
         &self,
         endpoint: &str,
         path: &str,

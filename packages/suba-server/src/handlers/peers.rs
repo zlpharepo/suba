@@ -23,9 +23,11 @@ use crate::{
 };
 
 #[derive(Deserialize)]
-pub struct NamedEndpoint {
+pub struct PendingInvite {
     name: String,
     endpoint: String,
+    #[serde(default)]
+    mode: peers::Mode,
 }
 
 #[derive(Deserialize)]
@@ -60,7 +62,7 @@ pub async fn revoke(
 pub async fn invite(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Json(body): Json<NamedEndpoint>,
+    Json(body): Json<PendingInvite>,
 ) -> ResponseResult<impl IntoResponse> {
     let signer = state.settings().peer_signer().await?;
     Ok((
@@ -68,7 +70,7 @@ pub async fn invite(
         Json(
             state
                 .peers()
-                .invite(&signer, body.name, body.endpoint)
+                .invite(&signer, body.name, body.endpoint, body.mode)
                 .await?,
         ),
     ))
@@ -99,8 +101,19 @@ pub async fn accept(
     Ok(Json(state.peers().accept(&signer, proof).await?))
 }
 
-pub async fn hosts(State(state): State<AppState>, _auth: Authenticated) -> Json<Vec<Host>> {
-    Json(state.peers().hosts().await)
+pub async fn hosts(
+    State(state): State<AppState>,
+    _auth: Authenticated,
+) -> Json<Vec<peers::HostView>> {
+    Json(
+        state
+            .peers()
+            .hosts()
+            .await
+            .into_iter()
+            .map(|host| state.peers().host_view(host))
+            .collect(),
+    )
 }
 
 pub async fn add_host(
@@ -109,29 +122,31 @@ pub async fn add_host(
     Json(body): Json<AddHost>,
 ) -> ResponseResult<impl IntoResponse> {
     let signer = state.settings().peer_signer().await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(
-            state
-                .peers()
-                .pair(&signer, body.name, body.invitation)
-                .await?,
-        ),
-    ))
+    let host = state
+        .peers()
+        .pair(&signer, body.name, body.invitation)
+        .await?;
+    Ok((StatusCode::CREATED, Json(state.peers().host_view(host))))
 }
 
 pub async fn update_host(
     State(state): State<AppState>,
     _auth: Authenticated,
     Path(id): Path<Uuid>,
-    Json(body): Json<NamedEndpoint>,
-) -> ResponseResult<Json<Host>> {
-    Ok(Json(
-        state
-            .peers()
-            .update_host(id, body.name, body.endpoint)
-            .await?,
-    ))
+    Json(body): Json<EditHost>,
+) -> ResponseResult<Json<peers::HostView>> {
+    let host = state
+        .peers()
+        .update_host(id, body.name, body.endpoint)
+        .await?;
+    Ok(Json(state.peers().host_view(host)))
+}
+
+#[derive(Deserialize)]
+pub struct EditHost {
+    name: String,
+    #[serde(default)]
+    endpoint: Option<String>,
 }
 
 pub async fn remove_host(
@@ -149,6 +164,28 @@ pub async fn execute(
 ) -> ResponseResult<Json<Signed<ResourceReply>>> {
     let signer = state.settings().existing_peer_signer().await?;
     let grant = state.peers().authorize(&signer, &proof).await?;
+    let reply = run_resource(state.clone(), signer, grant, proof).await?;
+    Ok(Json(reply))
+}
+
+/// Run one signed resource request against the local resource router and sign the
+/// result. Shared by Direct forwarding and the agent side of an Edge session, so
+/// both paths enforce the same scope, size and header rules.
+pub(crate) async fn execute_resource(
+    state: AppState,
+    proof: Signed<ResourceRequest>,
+) -> Result<Signed<ResourceReply>, Error> {
+    let signer = state.settings().existing_peer_signer().await?;
+    let grant = state.peers().authorize(&signer, &proof).await?;
+    run_resource(state, signer, grant, proof).await
+}
+
+async fn run_resource(
+    state: AppState,
+    signer: crate::state::peers::IdentitySigner,
+    grant: crate::state::peers::PeerGrant,
+    proof: Signed<ResourceRequest>,
+) -> Result<Signed<ResourceReply>, Error> {
     let claim = proof.payload;
     if !peers::resource_allowed(&claim.method, &claim.path) {
         return Err(Error::PeerNotFound);
@@ -198,7 +235,7 @@ pub async fn execute(
     let body = to_bytes(response.into_body(), peers::REPLY_LIMIT)
         .await
         .map_err(|_| Error::PeerUncertain)?;
-    Ok(Json(signer.sign(
+    signer.sign(
         "response",
         ResourceReply {
             nonce: claim.challenge.nonce,
@@ -208,7 +245,7 @@ pub async fn execute(
             headers,
             body: URL_SAFE_NO_PAD.encode(body),
         },
-    )?))
+    )
 }
 
 pub async fn forward(
@@ -252,10 +289,17 @@ pub async fn forward(
         )
     };
     let signer = state.settings().peer_signer().await?;
-    let reply = state
-        .peers()
-        .forward(&signer, &host, method, path, if_match, body)
-        .await?;
+    let reply = match host.mode {
+        peers::Mode::Direct => {
+            state
+                .peers()
+                .forward(&signer, &host, method, path, if_match, body)
+                .await?
+        }
+        peers::Mode::Edge => {
+            edge_forward(&state, &signer, &host, method, path, if_match, body).await?
+        }
+    };
     let status = StatusCode::from_u16(reply.status).map_err(|_| Error::PeerUnavailable)?;
     // A remote authentication failure must not sign the local administrator out.
     if status == StatusCode::UNAUTHORIZED || status.is_informational() {
@@ -290,4 +334,55 @@ fn reply_header(name: &str) -> bool {
             | "x-suba-nodes"
             | "x-suba-skipped"
     )
+}
+
+/// One resource exchange over a live Edge session: the challenge is asked first,
+/// then the resource itself, both as manager-initiated calls.
+async fn edge_forward(
+    state: &AppState,
+    signer: &crate::state::peers::IdentitySigner,
+    host: &Host,
+    method: String,
+    path: String,
+    if_match: Option<String>,
+    body: Option<String>,
+) -> Result<ResourceReply, Error> {
+    let challenge = match state
+        .peers()
+        .edge
+        .exchange(
+            host.id,
+            peers::edge::EdgeCall::Challenge(ChallengeRequest {
+                actor: signer.identity.clone(),
+                invitation: None,
+            }),
+        )
+        .await?
+    {
+        peers::edge::EdgeAnswer::Challenge(proof) => proof,
+        peers::edge::EdgeAnswer::Resource(_) => return Err(Error::PeerUnavailable),
+    };
+    let challenge = challenge.payload;
+    if challenge.actor != signer.identity || challenge.target != host.identity {
+        return Err(Error::PeerUnavailable);
+    }
+    let proof = signer.sign(
+        "request",
+        ResourceRequest {
+            challenge,
+            method,
+            path,
+            if_match,
+            body,
+        },
+    )?;
+    match state
+        .peers()
+        .edge
+        .exchange(host.id, peers::edge::EdgeCall::Resource(proof))
+        .await?
+    {
+        peers::edge::EdgeAnswer::Resource(reply) => Ok(reply.payload),
+        peers::edge::EdgeAnswer::Challenge(_) => Err(Error::PeerUnavailable),
+    }
 }

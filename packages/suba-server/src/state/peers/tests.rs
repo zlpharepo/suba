@@ -58,6 +58,7 @@ async fn paired() -> (Scratch, Peers, IdentitySigner, IdentitySigner) {
             &receiver,
             "Example operator".into(),
             "https://server.example.com/base/".into(),
+            Mode::Direct,
         )
         .await
         .unwrap();
@@ -181,6 +182,7 @@ async fn invitations_bind_both_identities_and_are_consumed_once_without_persisti
             &receiver,
             "Example operator".into(),
             "https://server.example.com".into(),
+            Mode::Direct,
         )
         .await
         .unwrap();
@@ -220,6 +222,7 @@ async fn an_invitation_mac_cannot_be_transplanted_to_another_identity_or_challen
             &receiver,
             "Example".into(),
             "https://server.example.com".into(),
+            Mode::Direct,
         )
         .await
         .unwrap();
@@ -259,6 +262,7 @@ async fn expired_and_revoked_invitations_cannot_create_trust() {
             &receiver,
             "Example".into(),
             "https://server.example.com".into(),
+            Mode::Direct,
         )
         .await
         .unwrap();
@@ -270,6 +274,7 @@ async fn expired_and_revoked_invitations_cannot_create_trust() {
             &receiver,
             "Example".into(),
             "https://server.example.com".into(),
+            Mode::Direct,
         )
         .await
         .unwrap();
@@ -363,7 +368,12 @@ async fn direct_https_checks_certificate_hostnames_and_the_pinned_instance() {
     let endpoint = format!("https://localhost:{port}");
     let invitation = state
         .peers()
-        .invite(&remote, "Example operator".into(), endpoint.clone())
+        .invite(
+            &remote,
+            "Example operator".into(),
+            endpoint.clone(),
+            Mode::Direct,
+        )
         .await
         .unwrap();
     let tampering = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
@@ -451,7 +461,7 @@ async fn direct_https_checks_certificate_hostnames_and_the_pinned_instance() {
     }
     tampering.store(0, std::sync::atomic::Ordering::SeqCst);
     let mut mismatch = host.clone();
-    mismatch.endpoint = format!("https://127.0.0.1:{port}");
+    mismatch.endpoint = Some(format!("https://127.0.0.1:{port}"));
     assert!(
         local
             .forward(
