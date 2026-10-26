@@ -18,7 +18,7 @@ use suba_core::proto::Host;
 use suba_core::{IndexEntry, NodeIndex, Source};
 
 use crate::{
-    dto::{Authenticated, ResponseResult},
+    dto::{Operator, ResponseResult},
     error::Error,
     handlers::collections::{
         artifact_headers, provider_filters, token_view, update_hours, Choice, TokenView,
@@ -111,7 +111,7 @@ fn serving<'a>(config: &str, in_use: &str, product: Option<&'a serde_json::Value
 /// The users of every inbound of one configuration.
 pub async fn exports(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<Json<ConfigUsers>> {
     let access = state.access().snapshot().await;
@@ -142,7 +142,7 @@ pub async fn exports(
 /// Every user, with what its pools grant it and its links.
 pub async fn index(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
 ) -> ResponseResult<Json<Vec<UserView>>> {
     let access = state.access().snapshot().await;
     let host = public_host(&state).await;
@@ -251,7 +251,7 @@ fn grant_view(inbounds: &[InboundUsers], entry: Entry, via: Vec<String>, user: &
 /// Store a user's pools and collections; a new user gets its secret here.
 pub async fn put(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
     Json(body): Json<UserBody>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -266,7 +266,7 @@ pub async fn put(
 
 pub async fn delete(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
     state.access().remove_user(&name).await?;
@@ -278,7 +278,7 @@ pub async fn delete(
 /// each host serves them once it applies.
 pub async fn renew(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
     state.access().renew_secret(&name).await?;
@@ -289,7 +289,7 @@ pub async fn renew(
 
 pub async fn mint_token(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, label)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
     let token = state.access().mint_token(&name, &label).await?;
@@ -301,7 +301,7 @@ pub async fn mint_token(
 
 pub async fn revoke_token(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, label)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
     state.access().revoke_token(&name, &label).await?;
@@ -313,7 +313,7 @@ pub async fn revoke_token(
 /// What a user's links hand out, for the operator.
 pub async fn content(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
     Query(choice): Query<Choice>,
     request: HeaderMap,
@@ -417,7 +417,7 @@ pub(crate) async fn user_artifact(
 /// Every pool, with who is in it and what each entry gives.
 pub async fn pools(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
 ) -> ResponseResult<Json<Vec<PoolView>>> {
     let access = state.access().snapshot().await;
     let store = state.singbox();
@@ -462,7 +462,7 @@ pub async fn pools(
 
 pub async fn put_pool(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
     Json(pool): Json<Pool>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -474,7 +474,7 @@ pub async fn put_pool(
 
 pub async fn delete_pool(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
     state.access().remove_pool(&name).await?;

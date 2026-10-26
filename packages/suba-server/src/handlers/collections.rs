@@ -16,7 +16,7 @@ use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Sour
 use crate::state::singbox::{ConversionSkip, GeneratedOutbound};
 
 use crate::{
-    dto::{Authenticated, ResponseResult},
+    dto::{Operator, ResponseResult},
     error::Error,
     state::render::Artifact,
     tracing, AppState,
@@ -102,7 +102,7 @@ pub struct CollectionSummary {
 
 /// Every collection, with what a list needs to show without asking again.
 pub async fn index(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
 ) -> ResponseResult<impl IntoResponse> {
     let collections = state.collections().list().await;
@@ -146,7 +146,7 @@ pub async fn index(
 }
 
 pub async fn get(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -165,7 +165,7 @@ pub async fn get(
 /// used is refused with the field that is wrong rather than accepted and
 /// discovered when a client asks for the subscription.
 pub async fn insert(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(collection): Json<Collection>,
@@ -184,7 +184,7 @@ pub async fn insert(
 }
 
 pub async fn delete(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -235,7 +235,7 @@ pub(crate) fn token_view(prefix: &str, name: String, token: String) -> TokenView
 
 /// A collection's delivery tokens, by name.
 pub async fn tokens(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -255,7 +255,7 @@ pub async fn tokens(
 /// Minting a name that exists rotates that token: its URL stops working, which
 /// is what a leaked token needs, and the collection's other tokens keep theirs.
 pub async fn mint_token(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path((name, label)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -270,7 +270,7 @@ pub async fn mint_token(
 
 /// Take one of a collection's delivery tokens out of service.
 pub async fn revoke_token(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path((name, label)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -407,7 +407,7 @@ fn encode<T: Serialize>(value: &T) -> Result<String, Error> {
 /// The body is the document itself; what was left out is reported in headers
 /// rather than in the body, which belongs to the client's core.
 pub async fn content(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
     Query(choice): Query<Choice>,
@@ -467,7 +467,7 @@ pub(crate) fn attachment(artifact: &Artifact, name: &str) -> Option<HeaderValue>
 /// who serves it, and what was left out. Serving the document is the delivery
 /// path's job, and this is the same resolution underneath it.
 pub async fn nodes(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {

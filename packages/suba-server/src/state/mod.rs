@@ -5,6 +5,7 @@ pub(crate) mod limiter;
 pub(crate) mod metrics;
 #[cfg(feature = "singbox-core")]
 pub(crate) mod observation;
+pub(crate) mod peers;
 mod persisted;
 pub(crate) mod providers;
 pub(crate) mod render;
@@ -39,6 +40,7 @@ struct Inner {
     data_dir: PathBuf,
     http: Client,
     settings: SettingsStore,
+    peers: peers::Peers,
     /// Shared with the refresher, which outlives any single request.
     providers: Arc<ProviderStore>,
     collections: CollectionStore,
@@ -77,6 +79,7 @@ impl AppState {
             data_dir: config.data_dir.clone(),
             http: http.clone(),
             settings: SettingsStore::load(&config.config_dir)?,
+            peers: peers::Peers::load(&config.config_dir)?,
             providers: Arc::new(ProviderStore::load(&config.config_dir, &config.data_dir)?),
             collections: CollectionStore::load(&config.config_dir)?,
             rendered: RenderMemo::new(),
@@ -129,6 +132,10 @@ impl AppState {
     /// The configured subscription-backed providers.
     pub(crate) fn providers(&self) -> &ProviderStore {
         &self.0.providers
+    }
+
+    pub(crate) fn peers(&self) -> &peers::Peers {
+        &self.0.peers
     }
 
     /// The configured collections.

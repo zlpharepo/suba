@@ -15,8 +15,6 @@ singbox = ["suba-core/singbox"]
 singbox-core = [
   "suba-core/singbox-core",
   "dep:suba-singbox",
-  "dep:hmac",
-  "dep:sha2",
   "dep:tonic",
   "dep:prost",
   "dep:tonic-prost",
@@ -30,9 +28,9 @@ clash = ["suba-core/clash"]
 # a build that runs a core does not have to be able to render one.
 suba-core = { workspace = true, default-features = false }
 suba-singbox = { workspace = true, optional = true, default-features = false }
-# Pool users' credentials derive from one secret per user (`singbox-core`).
-hmac = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+# Managed credentials and invitation proofs use separate domain-bound MACs.
+hmac = { workspace = true }
+sha2 = { workspace = true }
 
 argon2 = { workspace = true }
 axum = { workspace = true }
@@ -61,9 +59,13 @@ url = { workspace = true }
 tonic = { version = "0.14", default-features = false, features = ["channel", "codegen"], optional = true }
 prost = { version = "0.14", optional = true }
 tonic-prost = { version = "0.14", optional = true }
+tower = { version = "0.5", features = ["util"] }
+base64.workspace = true
 
 [dev-dependencies]
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 # For the sing-box store's tests, which install a release archive they build
 # themselves rather than fetching one.
 flate2 = { workspace = true }
+rcgen = "0.14"
 tar = { workspace = true }

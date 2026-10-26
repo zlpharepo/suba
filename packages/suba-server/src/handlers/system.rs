@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use suba_core::{Format, ProtocolSupport};
 
 use crate::{
-    dto::{Authenticated, ResponseResult},
+    dto::{Operator, ResponseResult},
     AppState,
 };
 
@@ -16,7 +16,7 @@ pub struct SystemStatus {
     administrator_configured: bool,
 }
 
-/// Authenticated status: what this instance is, and what it can serve.
+/// Operator status: what this instance is, and what it can serve.
 #[derive(Serialize)]
 pub struct SystemInfo {
     pub version: String,
@@ -67,7 +67,7 @@ pub async fn status(State(state): State<AppState>) -> Json<SystemStatus> {
 
 /// The machine this instance runs on: CPU, memory, disk and network.
 pub async fn metrics(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
 ) -> ResponseResult<Json<crate::state::metrics::Metrics>> {
     let metrics = state.metrics();
@@ -77,7 +77,7 @@ pub async fn metrics(
     ))
 }
 
-pub async fn info(_auth: Authenticated, State(state): State<AppState>) -> Json<SystemInfo> {
+pub async fn info(_auth: Operator, State(state): State<AppState>) -> Json<SystemInfo> {
     Json(SystemInfo {
         version: VERSION.to_string(),
         administrator_configured: state.settings().administrator().await.is_some(),

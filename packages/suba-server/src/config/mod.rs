@@ -21,6 +21,8 @@ pub struct AppConfig {
     pub administrator: Option<Administrator>,
     #[serde(rename = "ed25519")]
     pub key_pair: Option<KeyPair>,
+    /// Stable across key rotation and transport changes; never derived from an address.
+    pub instance_id: Option<uuid::Uuid>,
     /// Where subscriptions are handed out from, when the operator says.
     pub subscription: Option<SubscriptionConfig>,
     /// The address clients reach this machine at: where every node exported

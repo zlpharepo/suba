@@ -1,5 +1,6 @@
 mod auth;
 mod collections;
+mod peers;
 mod providers;
 #[cfg(feature = "singbox-core")]
 mod singbox;
@@ -52,15 +53,20 @@ pub(crate) async fn web_file(state: &AppState, request: Request) -> Response {
 }
 
 impl AppRouter {
-    pub fn route(web_path: impl AsRef<Path>) -> Router<AppState> {
-        let api_router = Router::new()
+    pub(crate) fn resources() -> Router<AppState> {
+        let router = Router::new()
             .nest("/system", system::route())
-            .nest("/auth", auth::route())
             .nest("/providers", providers::route())
             .nest("/collections", collections::route());
-
         #[cfg(feature = "singbox-core")]
-        let api_router = api_router.nest("/cores/sing-box", singbox::route());
+        let router = router.nest("/cores/sing-box", singbox::route());
+        router
+    }
+
+    pub fn route(web_path: impl AsRef<Path>) -> Router<AppState> {
+        let api_router = Self::resources()
+            .nest("/auth", auth::route())
+            .merge(peers::route());
 
         let not_found_service = not_found.into_service();
         let web_service = web_files(web_path).not_found_service(not_found_service);
@@ -93,6 +99,7 @@ mod tests {
     mod collection_bindings;
     #[cfg(feature = "singbox-core")]
     mod observation;
+    mod peers;
     mod provider_snapshots;
     #[cfg(feature = "singbox-core")]
     mod references;

@@ -9,6 +9,21 @@ pub enum Error {
     #[error("unauthorized")]
     Unauthorized,
 
+    #[error("{reason}")]
+    PeerRequest { reason: &'static str },
+    #[error("{reason}")]
+    PeerConflict { reason: &'static str },
+    #[error("peer.identity: the configured key pair is invalid or does not match")]
+    PeerIdentity,
+    #[error("peer: not found")]
+    PeerNotFound,
+    #[error("peer.challenges: too many pending handshakes")]
+    PeerBusy,
+    #[error("remote.connection: the peer could not be reached or authenticated")]
+    PeerUnavailable,
+    #[error("remote.operation: the outcome could not be confirmed; inspect the remote state before retrying")]
+    PeerUncertain,
+
     /// The runtime observation store failed.
     #[error(transparent)]
     Store(#[from] crate::store::StoreError),
@@ -236,6 +251,30 @@ impl IntoHttpError for Error {
             Error::Unauthorized => HttpError {
                 status_code: StatusCode::UNAUTHORIZED,
                 message: "Unauthorized".to_string(),
+            },
+            Error::PeerRequest { reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: reason.to_string(),
+            },
+            Error::PeerConflict { reason } => HttpError {
+                status_code: StatusCode::CONFLICT,
+                message: reason.to_string(),
+            },
+            error @ Error::PeerIdentity => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: error.to_string(),
+            },
+            Error::PeerNotFound => HttpError {
+                status_code: StatusCode::NOT_FOUND,
+                message: "Not found".to_string(),
+            },
+            error @ Error::PeerBusy => HttpError {
+                status_code: StatusCode::TOO_MANY_REQUESTS,
+                message: error.to_string(),
+            },
+            error @ (Error::PeerUnavailable | Error::PeerUncertain) => HttpError {
+                status_code: StatusCode::BAD_GATEWAY,
+                message: error.to_string(),
             },
             Error::Store(error) => {
                 tracing::error!("store error: {error}");

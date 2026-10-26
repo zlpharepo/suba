@@ -1,4 +1,4 @@
-//! Authenticated views of the shared collector, without forwarding native credentials.
+//! Operator views of the shared collector, without forwarding native credentials.
 
 use axum::{
     extract::{Query, State},
@@ -7,11 +7,11 @@ use axum::{
 };
 use http::header;
 
-use crate::{dto::Authenticated, state::observation::Filter, AppState};
+use crate::{dto::Operator, state::observation::Filter, AppState};
 
 pub async fn metrics(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Query(filter): Query<Filter>,
 ) -> impl IntoResponse {
     let run = state.singbox().observation_run();
@@ -23,7 +23,7 @@ pub async fn metrics(
 
 pub async fn connections(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Query(filter): Query<Filter>,
 ) -> impl IntoResponse {
     let run = state.singbox().observation_run();

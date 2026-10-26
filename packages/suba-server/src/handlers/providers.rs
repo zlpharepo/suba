@@ -12,7 +12,7 @@ use suba_core::NodeIndex;
 use suba_core::RefreshStatus;
 
 use crate::{
-    dto::{Authenticated, ErrorResponse, ResponseResult},
+    dto::{ErrorResponse, Operator, ResponseResult},
     error::Error,
     handlers::collections::NodeView,
     provider::Provider,
@@ -62,7 +62,7 @@ pub struct ProviderSummary {
 }
 
 pub async fn index(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
 ) -> ResponseResult<Json<BTreeMap<String, ProviderSummary>>> {
     Ok(Json(summaries(&state).await?))
@@ -88,7 +88,7 @@ async fn summaries(state: &AppState) -> Result<BTreeMap<String, ProviderSummary>
 }
 
 pub async fn get(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
@@ -106,7 +106,7 @@ pub async fn get(
 }
 
 pub async fn insert(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
     Json(provider): Json<Provider>,
@@ -125,7 +125,7 @@ pub async fn insert(
 /// The refresh path is the same one the scheduler follows, so a manual
 /// refresh cannot race an automatic one.
 pub async fn refresh(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -157,7 +157,7 @@ pub struct Nodes {
 
 /// What this provider holds, read into nodes.
 pub async fn nodes(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -201,7 +201,7 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
 /// server's point of view; conversion into nodes is a separate resource, and
 /// into a concrete format a separate step.
 pub async fn payload(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {
@@ -215,7 +215,7 @@ pub async fn payload(
 }
 
 pub async fn delete(
-    _auth: Authenticated,
+    _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> ResponseResult<impl IntoResponse> {

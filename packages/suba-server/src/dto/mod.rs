@@ -12,6 +12,29 @@ pub use response::*;
 
 pub struct Authenticated(pub Claims);
 
+/// A local administrator or a verified, non-delegating peer resource request.
+pub struct Operator;
+
+impl FromRequestParts<AppState> for Operator {
+    type Rejection = crate::error::Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(grant) = parts
+            .extensions
+            .get::<crate::state::peers::PeerGrant>()
+            .cloned()
+        {
+            state.peers().allows(&grant).await?;
+        } else {
+            Authenticated::from_request_parts(parts, state).await?;
+        }
+        Ok(Self)
+    }
+}
+
 fn bearer_token(headers: &HeaderMap) -> Result<String, crate::error::Error> {
     let value = headers
         .get(header::AUTHORIZATION)

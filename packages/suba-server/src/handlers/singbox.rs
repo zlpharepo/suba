@@ -22,7 +22,7 @@ use suba_singbox::install::{Generate, Needs};
 use suba_singbox::run::{self, Exit, Status};
 
 use crate::{
-    dto::{Authenticated, ResponseResult},
+    dto::{Operator, ResponseResult},
     error::Error,
     handlers::collections::outbounds_of,
     state::singbox::{
@@ -149,7 +149,7 @@ pub enum Command {
 /// the change has taken effect.
 pub async fn choose(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Json(choose): Json<Choose>,
 ) -> ResponseResult<Json<Core>> {
     let store = state.singbox();
@@ -176,10 +176,7 @@ pub async fn choose(
 }
 
 /// The module, as this instance knows it.
-pub async fn index(
-    State(state): State<AppState>,
-    _auth: Authenticated,
-) -> ResponseResult<Json<Core>> {
+pub async fn index(State(state): State<AppState>, _auth: Operator) -> ResponseResult<Json<Core>> {
     let store = state.singbox();
 
     Ok(Json(
@@ -212,7 +209,7 @@ async fn generated(state: &AppState) -> Result<Contributions, Error> {
 /// What the process is doing, and the end of what it said.
 pub async fn status(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Query(query): Query<Tail>,
 ) -> ResponseResult<Json<Running>> {
     let store = state.singbox();
@@ -241,7 +238,7 @@ pub async fn status(
 /// and leaves a running core running.
 pub async fn act(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Query(query): Query<Tail>,
     Json(action): Json<Action>,
 ) -> ResponseResult<Json<Running>> {
@@ -305,7 +302,7 @@ fn saved(saved: Saved) -> (HeaderMap, Json<Saved>) {
 /// The configurations this instance has.
 pub async fn configs(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
 ) -> ResponseResult<Json<Vec<ConfigView>>> {
     let store = state.singbox();
 
@@ -329,7 +326,7 @@ pub async fn configs(
 /// Make a configuration, from a copy of another or empty.
 pub async fn create_config(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Json(new): Json<NewConfig>,
 ) -> ResponseResult<(StatusCode, Json<ConfigView>)> {
     let store = state.singbox();
@@ -351,7 +348,7 @@ pub async fn create_config(
 /// Forget a configuration.
 pub async fn delete_config(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<Response> {
     let store = state.singbox();
@@ -363,7 +360,7 @@ pub async fn delete_config(
 /// One configuration, whole.
 pub async fn config(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<(HeaderMap, Json<Value>)> {
     let store = state.singbox();
@@ -376,7 +373,7 @@ pub async fn config(
 /// Replace the whole configuration.
 pub async fn write_config(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
     request: HeaderMap,
     Json(value): Json<Value>,
@@ -396,7 +393,7 @@ pub async fn write_config(
 /// One section of a configuration.
 pub async fn section(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, section)): Path<(String, String)>,
 ) -> ResponseResult<(HeaderMap, Json<Value>)> {
     let store = state.singbox();
@@ -409,7 +406,7 @@ pub async fn section(
 /// Replace one section; the whole document is checked and written.
 pub async fn write_section(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, section)): Path<(String, String)>,
     request: HeaderMap,
     Json(value): Json<Value>,
@@ -429,7 +426,7 @@ pub async fn write_section(
 /// Remove one section.
 pub async fn delete_section(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, section)): Path<(String, String)>,
     request: HeaderMap,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
@@ -448,7 +445,7 @@ pub async fn delete_section(
 /// One entry of an array section, by its tag.
 pub async fn entry(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, section, tag)): Path<(String, String, String)>,
 ) -> ResponseResult<(HeaderMap, Json<Value>)> {
     let store = state.singbox();
@@ -461,7 +458,7 @@ pub async fn entry(
 /// Put one entry of an array section under its tag.
 pub async fn write_entry(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, section, tag)): Path<(String, String, String)>,
     request: HeaderMap,
     Json(value): Json<Value>,
@@ -488,7 +485,7 @@ pub async fn write_entry(
 /// Remove one entry of an array section.
 pub async fn delete_entry(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path((name, section, tag)): Path<(String, String, String)>,
     request: HeaderMap,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
@@ -827,7 +824,7 @@ mod version_view_tests {
 /// The versions this machine has.
 pub async fn versions(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
 ) -> ResponseResult<Json<Vec<VersionView>>> {
     let store = state.singbox();
 
@@ -846,7 +843,7 @@ pub async fn versions(
 /// One version, as this instance knows it.
 pub async fn version(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(asked): Path<String>,
 ) -> ResponseResult<Json<VersionView>> {
     let store = state.singbox();
@@ -865,7 +862,7 @@ pub async fn version(
 /// An accepted request reserves the task and answers before network work begins.
 pub async fn install_version(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(asked): Path<String>,
 ) -> ResponseResult<(StatusCode, Json<VersionView>)> {
     let store = state.singbox();
@@ -912,7 +909,7 @@ pub async fn install_version(
 /// Remove an installed version.
 pub async fn delete_version(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(asked): Path<String>,
 ) -> ResponseResult<StatusCode> {
     let store = state.singbox();
@@ -974,7 +971,7 @@ fn offered(installable: &[&Release]) -> Releases {
 /// The versions this build can install.
 pub async fn releases(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
 ) -> ResponseResult<Json<Releases>> {
     let store = state.singbox();
     let listed = store.releases().await?;
@@ -1057,7 +1054,7 @@ mod releases_tests {
 /// that version's own binary.
 pub async fn schema(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
 ) -> ResponseResult<impl IntoResponse> {
     let store = state.singbox();
     let file = tokio::task::spawn_blocking(move || store.schema_bytes()).await??;
@@ -1104,7 +1101,7 @@ pub struct Generated {
 /// Ask the core to generate something.
 pub async fn generate(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Json(asked): Json<Generation>,
 ) -> ResponseResult<Json<Generated>> {
     let store = state.singbox();
@@ -1163,7 +1160,7 @@ pub struct References {
 /// The named configuration and selected collections, without assembly or refresh.
 pub async fn references(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<Json<References>> {
     let generated = generated(&state).await?;

@@ -3,6 +3,7 @@ pub mod collections;
 pub mod delivery;
 #[cfg(feature = "singbox-core")]
 pub mod observation;
+pub mod peers;
 pub mod providers;
 #[cfg(feature = "singbox-core")]
 pub mod singbox;
