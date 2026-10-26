@@ -29,6 +29,9 @@ pub mod install;
 pub mod run;
 
 #[cfg(feature = "core")]
+pub mod users;
+
+#[cfg(feature = "core")]
 pub mod schema;
 
 #[cfg(feature = "render")]
