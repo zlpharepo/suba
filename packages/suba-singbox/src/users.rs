@@ -17,7 +17,9 @@
 //!   server is where probes go, not a name a client sends.
 
 use serde_json::{json, Value};
-use suba_proto::protocol::{hysteria2, trojan, vless};
+use suba_proto::protocol::{
+    anytls, http, hysteria2, shadowsocks, socks, trojan, tuic, vless, vmess,
+};
 use suba_proto::tls::{Alpn, Fingerprint, RealityClient, RealityServer, ShortId};
 use suba_proto::transport::{Grpc, HttpUpgrade, Ws};
 use suba_proto::{
@@ -25,12 +27,38 @@ use suba_proto::{
     Uuid,
 };
 
-/// The protocols a managed user can be granted on today.
+/// The protocols a managed user can be granted on, and what each needs.
+///
+/// Every protocol whose inbound takes per-user credentials is here. What the
+/// core demands of a user differs by protocol, and it is measured rather than
+/// assumed (sing-box 1.14.3, `option/*.go` and a real `sing-box check`):
+///
+/// * VLESS, VMess, TUIC and Shadowsocks key a user by a UUID or a key.
+/// * Trojan, Hysteria2, AnyTLS and ShadowTLS key a user by a password.
+/// * Snell keys a user by a `userkey` beside the inbound's own `psk`.
+/// * Hysteria v1 keys a user by `auth_str`, beside the inbound's `obfs`.
+/// * HTTP, SOCKS and Naive take `auth.User`, which is `username` and
+///   `password` and **no** `name` — see [`user`], where these get a `username`
+///   from the user's name because the core refuses a `name` field.
+///
+/// Shadowsocks is the one with a shape of its own: multi-user needs the
+/// inbound's own `password` as well, and the 2022 ciphers need every key the
+/// same length as the cipher's, which is why [`user`] can refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Vless,
     Trojan,
+    Vmess,
+    Tuic,
+    AnyTls,
     Hysteria2,
+    Hysteria,
+    ShadowTls,
+    Snell,
+    Shadowsocks,
+    Http,
+    Socks,
+    Naive,
 }
 
 /// Why something about a user cannot be exported, and the field it is about.
@@ -59,20 +87,81 @@ pub fn grantable(inbound: &Value) -> Result<Protocol, &'static str> {
     match inbound.get("type").and_then(Value::as_str) {
         Some("vless") => Ok(Protocol::Vless),
         Some("trojan") => Ok(Protocol::Trojan),
+        Some("vmess") => Ok(Protocol::Vmess),
+        Some("tuic") => Ok(Protocol::Tuic),
+        Some("anytls") => Ok(Protocol::AnyTls),
         Some("hysteria2") => Ok(Protocol::Hysteria2),
-        Some("vmess" | "tuic" | "anytls" | "shadowsocks") => {
-            Err("this protocol is not granted to users yet")
+        Some("hysteria") => Ok(Protocol::Hysteria),
+        Some("shadowtls") => Ok(Protocol::ShadowTls),
+        Some("snell") => Ok(Protocol::Snell),
+        Some("http") => Ok(Protocol::Http),
+        Some("socks") => Ok(Protocol::Socks),
+        Some("naive") => Ok(Protocol::Naive),
+        // A `mixed` listener *can* take users, but it is the plaintext
+        // local entry — the one an operator runs for their own machine. Giving
+        // it managed users would turn authentication on for everyone already
+        // using it, which is a decision about the operator's document and not
+        // one a grant should make silently.
+        Some("mixed") => Err("a mixed listener is a local entry; users are not granted on it"),
+        Some("shadowsocks") => shadowsocks(inbound),
+        Some("direct" | "tun" | "redirect" | "tproxy" | "cloudflared") => {
+            Err("this is not a proxy inbound users dial")
         }
-        Some("naive" | "hysteria" | "snell") => Err("this protocol cannot be exported yet"),
-        Some("shadowtls") => {
-            Err("ShadowTLS wraps another inbound, whose users are the ones to grant")
-        }
-        // Without users these listen with no authentication at all, so a
-        // grant would quietly turn authentication on for everyone else.
-        Some("mixed" | "http" | "socks") => {
-            Err("an inbound without users needs no authentication; a grant would require it")
-        }
+        // ShadowsocksR was removed from the core in 1.6.0; a grant here would
+        // write a document the core refuses to load.
+        Some("shadowsocksr") => Err("ShadowsocksR is removed from sing-box"),
         _ => Err("this inbound has no users"),
+    }
+}
+
+/// Whether a Shadowsocks inbound can carry managed users, and why not when it
+/// cannot.
+///
+/// Multi-user is a mode of its own: the core refuses `users` beside
+/// `destinations` and beside `managed`, and it needs the inbound's own
+/// `password` to derive per-user keys. It is never a matter of scaling the
+/// single-user case up.
+fn shadowsocks(inbound: &Value) -> Result<Protocol, &'static str> {
+    let method = inbound
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if inbound.get("destinations").is_some() {
+        return Err("a relay inbound takes destinations, not users");
+    }
+    // `managed` is a plain flag, not an `{enabled}` block, and the core
+    // refuses users beside it: a managed server sizes its own users, and
+    // injecting ours would stop it from starting.
+    if inbound.get("managed").and_then(Value::as_bool) == Some(true) {
+        return Err("a managed Shadowsocks server sizes its own users");
+    }
+    if inbound
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|key| !key.is_empty())
+        .is_none()
+    {
+        return Err("multi-user Shadowsocks needs the inbound's own password");
+    }
+    // Measured: every 2022 cipher refuses a user key that is not its own length,
+    // and the chacha20-poly1305 one refuses multi-user outright.
+    if method == "2022-blake3-chacha20-poly1305" {
+        return Err("this cipher cannot have more than one user");
+    }
+    if method.starts_with("2022-blake3-") && shadowsocks_key_len(method).is_none() {
+        return Err("only the 2022 key lengths can be derived");
+    }
+
+    Ok(Protocol::Shadowsocks)
+}
+
+/// How many raw bytes a 2022 user key is, for the ciphers that take one.
+fn shadowsocks_key_len(method: &str) -> Option<usize> {
+    match method {
+        "2022-blake3-aes-128-gcm" => Some(16),
+        "2022-blake3-aes-256-gcm" => Some(32),
+        _ => None,
     }
 }
 
@@ -91,33 +180,85 @@ pub fn flow(inbound: &Value) -> Option<&'static str> {
 /// The user entry the core reads, shaped for `protocol` from 32 random bytes.
 ///
 /// The first half makes a UUID and the second a password, so a protocol that
-/// needs both never repeats one in the other.
-pub fn user(protocol: Protocol, inbound: &Value, name: &str, material: &[u8; 32]) -> Value {
-    match protocol {
+/// needs both never repeats one in the other. `None` when this inbound cannot
+/// take a user at all — today only a 2022 Shadowsocks one, whose cipher decides
+/// how long a key has to be.
+pub fn user(protocol: Protocol, inbound: &Value, name: &str, material: &[u8; 32]) -> Option<Value> {
+    let uuid = derive_uuid(material);
+    let entry = match protocol {
         Protocol::Vless => {
-            let mut bytes: [u8; 16] = material[..16].try_into().expect("sixteen bytes");
-            // Version 4, variant 1: a random UUID, as any client expects one.
-            bytes[6] = (bytes[6] & 0x0f) | 0x40;
-            bytes[8] = (bytes[8] & 0x3f) | 0x80;
-
-            let mut entry = json!({ "name": name, "uuid": Uuid::from_bytes(bytes).to_string() });
+            let mut entry = json!({ "name": name, "uuid": uuid });
             if let Some(flow) = flow(inbound) {
                 entry["flow"] = json!(flow);
             }
             entry
         }
-        Protocol::Trojan | Protocol::Hysteria2 => json!({
-            "name": name,
-            "password": suba_proto::base64::encode(&material[16..]),
-        }),
-    }
+        Protocol::Vmess => json!({ "name": name, "uuid": uuid, "alterId": 0 }),
+        Protocol::Tuic => {
+            json!({ "name": name, "uuid": uuid, "password": derive_password(material) })
+        }
+        Protocol::Trojan | Protocol::AnyTls | Protocol::Hysteria2 | Protocol::ShadowTls => {
+            json!({ "name": name, "password": derive_password(material) })
+        }
+        // Snell's user key and Hysteria v1's auth are each named for what they
+        // are beside the inbound's own key, and the core takes no other name.
+        Protocol::Snell => json!({ "name": name, "userkey": derive_password(material) }),
+        Protocol::Hysteria => json!({ "name": name, "auth_str": derive_password(material) }),
+        Protocol::Shadowsocks => {
+            let method = inbound
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let key = match shadowsocks_key_len(method) {
+                None => derive_password(material),
+                Some(len) => suba_proto::base64::encode_standard(&material[..len]),
+            };
+            json!({ "name": name, "password": key })
+        }
+        // `auth.User` has a `username` and a `password` and no `name` at all:
+        // the core refuses a `name` field here, and the username is what it
+        // reports as the connection's user. The password is therefore the only
+        // private half, and the username has to travel as the user's name.
+        Protocol::Http | Protocol::Socks | Protocol::Naive => {
+            json!({ "username": name, "password": derive_password(material) })
+        }
+    };
+
+    Some(entry)
+}
+
+/// A UUID from the first half of `material`, version 4 and variant 1, as any
+/// client expects one.
+fn derive_uuid(material: &[u8; 32]) -> String {
+    let mut bytes: [u8; 16] = material[..16].try_into().expect("sixteen bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    Uuid::from_bytes(bytes).to_string()
+}
+
+/// A password from the second half of `material`.
+fn derive_password(material: &[u8; 32]) -> String {
+    suba_proto::base64::encode(&material[16..])
 }
 
 /// The credential a server keys this user by, for finding two that collide.
+///
+/// Names the field the core itself keys by, per protocol, so two users the core
+/// would consider one are the two this reports as one.
 pub fn credential(protocol: Protocol, user: &Value) -> Option<&str> {
     let field = match protocol {
-        Protocol::Vless => "uuid",
-        Protocol::Trojan | Protocol::Hysteria2 => "password",
+        Protocol::Vless | Protocol::Vmess | Protocol::Tuic => "uuid",
+        Protocol::Trojan
+        | Protocol::AnyTls
+        | Protocol::Hysteria2
+        | Protocol::ShadowTls
+        | Protocol::Shadowsocks => "password",
+        Protocol::Snell => "userkey",
+        Protocol::Hysteria => "auth_str",
+        // For these the username is the name the core reports, so the pair is
+        // the identity and neither half alone is.
+        Protocol::Http | Protocol::Socks | Protocol::Naive => "username",
     };
 
     user.get(field).and_then(Value::as_str)
@@ -164,7 +305,30 @@ pub fn client(
                 encryption: None,
             })
         }
+        Protocol::Vmess => Outbound::Vmess(vmess::Client {
+            id: Secret::new(uuid_field(user, user_path)?),
+            // Always zero: AEAD is the only header format current clients
+            // speak, and a non-zero counter would be a downgrade.
+            alter_id: 0,
+            security: vmess::Security::Auto,
+        }),
+        Protocol::Tuic => {
+            if tls.is_none() {
+                return Err(unexportable("tls", "TUIC runs over TLS"));
+            }
+
+            Outbound::Tuic(tuic::Client {
+                uuid: Secret::new(uuid_field(user, user_path)?),
+                password: password(user, user_path)?,
+                congestion_control: Default::default(),
+                udp_relay_mode: None,
+                zero_rtt_handshake: false,
+            })
+        }
         Protocol::Trojan => Outbound::Trojan(trojan::Client {
+            password: password(user, user_path)?,
+        }),
+        Protocol::AnyTls => Outbound::AnyTls(anytls::Client {
             password: password(user, user_path)?,
         }),
         Protocol::Hysteria2 => {
@@ -193,6 +357,72 @@ pub fn client(
                 pin_sha256: None,
             })
         }
+        Protocol::Shadowsocks => {
+            let method = text(inbound, "method")
+                .ok_or_else(|| unexportable("method", "a cipher is needed"))?;
+            let user_key = password(user, user_path)?;
+            // Multi-user 2022 keys are per-user and the inbound's own password
+            // is never a client's: the client carries `<server key>:<user key>`,
+            // which is the pair the core splits to find the user.
+            let password = match shadowsocks_key_len(method) {
+                None => user_key.into_inner(),
+                Some(_) => {
+                    let server = text(inbound, "password").ok_or_else(|| {
+                        unexportable(
+                            "password",
+                            "multi-user Shadowsocks needs the inbound's own password",
+                        )
+                    })?;
+                    format!("{server}:{}", user_key.as_str()).into_boxed_str()
+                }
+            };
+
+            Outbound::Shadowsocks(shadowsocks::Client {
+                method: Box::from(method),
+                password: Secret::new(password),
+                plugin: None,
+            })
+        }
+        // A listener this build can dial as a proxy: the user's name is the
+        // username, and the credential is the password.
+        Protocol::Http => Outbound::Http(http::Client {
+            username: Some(Box::from(username(user, user_path)?)),
+            password: Some(password(user, user_path)?),
+        }),
+        Protocol::Socks => Outbound::Socks(socks::Client {
+            version: socks::Version::V5,
+            username: Some(Box::from(username(user, user_path)?)),
+            password: Some(password(user, user_path)?),
+        }),
+        // Snell, Hysteria v1 and ShadowTLS each need a client shape this build
+        // does not have yet. The credential is injected and the core serves it;
+        // only the subscription is missing the node.
+        Protocol::Snell => {
+            return Err(unexportable(
+                "type",
+                "Snell has no client model yet, so this user's node cannot be written",
+            ))
+        }
+        Protocol::Hysteria => {
+            return Err(unexportable(
+                "type",
+                "Hysteria v1 has no client model yet, so this user's node cannot be written",
+            ))
+        }
+        Protocol::ShadowTls => {
+            return Err(unexportable(
+                "type",
+                "ShadowTLS has no client model yet, so this user's node cannot be written",
+            ))
+        }
+        // Naive serves HTTPS and HTTP/3 rather than a TLS proxy inbound, so it
+        // has no client model here even though the credential pair is the same.
+        Protocol::Naive => {
+            return Err(unexportable(
+                "type",
+                "Naive has no client model yet, so this user's node cannot be written",
+            ))
+        }
     };
 
     Ok(Node {
@@ -204,6 +434,19 @@ pub fn client(
         protocol,
         extra: RawParams::new(),
     })
+}
+
+/// A `uuid` field, parsed.
+fn uuid_field(user: &Value, user_path: &str) -> Result<Uuid, Unexportable> {
+    text(user, "uuid")
+        .and_then(|id| Uuid::parse(id).ok())
+        .ok_or_else(|| unexportable(format!("{user_path}.uuid"), "only a UUID can be exported"))
+}
+
+/// A `username`, which is what an authenticated listener reports as the user.
+fn username<'a>(user: &'a Value, user_path: &str) -> Result<&'a str, Unexportable> {
+    text(user, "username")
+        .ok_or_else(|| unexportable(format!("{user_path}.username"), "a username is needed"))
 }
 
 fn password(user: &Value, user_path: &str) -> Result<Secret<Box<str>>, Unexportable> {
@@ -399,17 +642,265 @@ mod tests {
         })
     }
 
+    /// Every inbound type the shipped schema knows, and whether it exposes a
+    /// `users` field. Frozen here because the schema is a runtime artefact:
+    /// `data/sing-box/versions/<v>/schema.json`, `$defs.Inbound`, 1.14.3.
+    ///
+    /// The rule the owner set is exactly this list minus `mixed`: an inbound
+    /// that has nowhere to put a user cannot be granted one, and `mixed` is the
+    /// one that has a place and still must not, because it is the plaintext
+    /// local entry.
+    const SCHEMA_INBOUNDS: &[(&str, bool)] = &[
+        ("anytls", true),
+        ("cloudflared", false),
+        ("direct", false),
+        ("http", true),
+        ("hysteria", true),
+        ("hysteria2", true),
+        ("mixed", true),
+        ("naive", true),
+        ("redirect", false),
+        ("shadowsocks", true),
+        ("shadowtls", true),
+        ("snell", true),
+        ("socks", true),
+        ("tproxy", false),
+        ("trojan", true),
+        ("tuic", true),
+        ("tun", false),
+        ("vless", true),
+        ("vmess", true),
+    ];
+
+    /// Every protocol whose inbound takes per-user credentials is grantable,
+    /// and what cannot be is refused with the reason that makes it true.
     #[test]
-    fn only_the_first_protocols_are_grantable_and_the_rest_say_why() {
+    fn every_protocol_with_users_is_grantable_and_the_rest_say_why() {
         assert_eq!(grantable(&reality()), Ok(Protocol::Vless));
-        assert_eq!(grantable(&json!({"type": "trojan"})), Ok(Protocol::Trojan));
+        for (kind, protocol) in [
+            ("trojan", Protocol::Trojan),
+            ("vmess", Protocol::Vmess),
+            ("tuic", Protocol::Tuic),
+            ("anytls", Protocol::AnyTls),
+            ("hysteria2", Protocol::Hysteria2),
+            ("hysteria", Protocol::Hysteria),
+            ("shadowtls", Protocol::ShadowTls),
+            ("snell", Protocol::Snell),
+            ("http", Protocol::Http),
+            ("socks", Protocol::Socks),
+            ("naive", Protocol::Naive),
+        ] {
+            assert_eq!(grantable(&json!({ "type": kind })), Ok(protocol), "{kind}");
+        }
+
+        // Shadowsocks is a mode, not just a type: only a multi-user one, with
+        // the inbound's own key and a cipher that has per-user keys.
+        let ss = |method: &str, extra: Value| {
+            let mut inbound =
+                json!({"type": "shadowsocks", "method": method, "password": "c2VydmVy"});
+            for (key, value) in extra.as_object().unwrap() {
+                inbound[key] = value.clone();
+            }
+            inbound
+        };
         assert_eq!(
-            grantable(&json!({"type": "hysteria2"})),
-            Ok(Protocol::Hysteria2)
+            grantable(&ss("aes-256-gcm", json!({}))),
+            Ok(Protocol::Shadowsocks)
+        );
+        assert_eq!(
+            grantable(&ss("2022-blake3-aes-256-gcm", json!({}))),
+            Ok(Protocol::Shadowsocks)
+        );
+        assert_eq!(
+            grantable(&ss("2022-blake3-aes-128-gcm", json!({}))),
+            Ok(Protocol::Shadowsocks)
+        );
+        for (method, reason) in [
+            (
+                "2022-blake3-chacha20-poly1305",
+                "this cipher cannot have more than one user",
+            ),
+            (
+                "aes-256-gcm",
+                "multi-user Shadowsocks needs the inbound's own password",
+            ),
+        ] {
+            let mut inbound = ss(method, json!({}));
+            if reason.contains("own password") {
+                inbound.as_object_mut().unwrap().remove("password");
+            }
+            assert_eq!(grantable(&inbound), Err(reason), "{method}");
+        }
+        assert_eq!(
+            grantable(&ss(
+                "aes-256-gcm",
+                json!({"destinations": [{"name": "d", "server": "x.example.com", "server_port": 443, "password": "x"}]})
+            )),
+            Err("a relay inbound takes destinations, not users")
+        );
+        assert_eq!(
+            grantable(&ss("aes-256-gcm", json!({"managed": true}))),
+            Err("a managed Shadowsocks server sizes its own users")
         );
 
-        for kind in ["vmess", "mixed", "shadowtls", "naive", "tun"] {
-            assert!(grantable(&json!({ "type": kind })).is_err(), "{kind}");
+        for (kind, reason) in [
+            // The schema gives `mixed` a `users` field, so this refusal is a
+            // product decision rather than a capability gap, and it says so.
+            (
+                "mixed",
+                "a mixed listener is a local entry; users are not granted on it",
+            ),
+            ("shadowsocksr", "ShadowsocksR is removed from sing-box"),
+            ("direct", "this is not a proxy inbound users dial"),
+            ("tun", "this is not a proxy inbound users dial"),
+            ("nonsense", "this inbound has no users"),
+        ] {
+            assert_eq!(grantable(&json!({ "type": kind })), Err(reason), "{kind}");
+        }
+    }
+
+    /// The rule, over the schema's own inbound list rather than a hand-picked
+    /// few: granted when there is a `users` field, refused when there is not,
+    /// and `mixed` refused despite having one.
+    #[test]
+    fn what_can_be_granted_is_exactly_what_has_a_place_for_a_user() {
+        for (kind, has_users) in SCHEMA_INBOUNDS {
+            let inbound = json!({ "type": kind, "method": "aes-256-gcm", "password": "c2VydmVy" });
+            let granted = grantable(&inbound).is_ok();
+            let expected = *has_users && *kind != "mixed";
+
+            assert_eq!(granted, expected, "{kind} (users field: {has_users})");
+            if let Err(reason) = grantable(&inbound) {
+                assert!(
+                    !reason.contains("not yet") && !reason.contains("unsupported"),
+                    "{kind} is refused for a reason that does not name the cause: {reason}"
+                );
+            }
+        }
+
+        // A type the schema does not know — a misspelling, or a protocol a
+        // newer core added — is refused rather than granted by falling through.
+        for kind in ["nonsense", "wireguard", "ssh", "tor", "shadowsocksr", ""] {
+            assert!(
+                grantable(&json!({ "type": kind })).is_err(),
+                "{kind} must not be granted"
+            );
+        }
+    }
+
+    /// Each protocol gets the entry the core reads, with the field that
+    /// protocol keys a user by.
+    #[test]
+    fn a_user_carries_the_field_its_protocol_keys_by() {
+        let material = [9u8; 32];
+        let simple = |kind: &str| json!({ "type": kind, "listen_port": 1080 });
+
+        // A credential that only a UUID can be, and a second half only a
+        // password can be: two protocols needing one each never repeat.
+        let uuid_of = |entry: &Value| entry["uuid"].as_str().unwrap().to_owned();
+        let vmess = user(Protocol::Vmess, &simple("vmess"), "a", &material).unwrap();
+        assert_eq!(vmess["alterId"], json!(0));
+        assert_eq!(credential(Protocol::Vmess, &vmess), Some(&*uuid_of(&vmess)));
+        let vless = user(Protocol::Vless, &simple("vless"), "a", &material).unwrap();
+        assert_eq!(
+            uuid_of(&vless),
+            uuid_of(&vmess),
+            "one UUID per (user, inbound)"
+        );
+
+        let tuic = user(Protocol::Tuic, &simple("tuic"), "a", &material).unwrap();
+        assert_eq!(uuid_of(&tuic), uuid_of(&vless));
+        assert!(tuic["password"].is_string());
+        assert_eq!(credential(Protocol::Tuic, &tuic), Some(&*uuid_of(&tuic)));
+
+        for (protocol, kind) in [
+            (Protocol::Trojan, "trojan"),
+            (Protocol::AnyTls, "anytls"),
+            (Protocol::Hysteria2, "hysteria2"),
+            (Protocol::ShadowTls, "shadowtls"),
+        ] {
+            let entry = user(protocol, &simple(kind), "a", &material).unwrap();
+            assert!(entry["password"].is_string(), "{kind}");
+            assert!(entry.get("uuid").is_none(), "{kind}");
+            assert_eq!(credential(protocol, &entry), entry["password"].as_str());
+        }
+
+        // Snell names its per-user key after what it is beside the inbound's psk.
+        let snell = user(Protocol::Snell, &simple("snell"), "a", &material).unwrap();
+        assert!(snell["userkey"].is_string());
+        assert!(snell.get("password").is_none());
+        assert_eq!(
+            credential(Protocol::Snell, &snell),
+            snell["userkey"].as_str()
+        );
+
+        // Hysteria v1 names it after what it is: an auth beside the inbound's obfs.
+        let hysteria = user(Protocol::Hysteria, &simple("hysteria"), "a", &material).unwrap();
+        assert!(hysteria["auth_str"].is_string());
+        assert!(hysteria.get("password").is_none());
+        assert_eq!(
+            credential(Protocol::Hysteria, &hysteria),
+            hysteria["auth_str"].as_str()
+        );
+
+        // `auth.User` is `username` and `password` and no `name` at all.
+        for (protocol, kind) in [
+            (Protocol::Http, "http"),
+            (Protocol::Socks, "socks"),
+            (Protocol::Naive, "naive"),
+        ] {
+            let entry = user(protocol, &simple(kind), "a", &material).unwrap();
+            assert_eq!(entry["username"], json!("a"), "{kind}");
+            assert!(entry["password"].is_string(), "{kind}");
+            assert!(entry.get("name").is_none(), "{kind}");
+            assert_eq!(credential(protocol, &entry), Some("a"));
+        }
+    }
+
+    /// A Shadowsocks user key has to be the cipher's own length, and what a
+    /// client carries is the pair the core splits.
+    #[test]
+    fn a_shadowsocks_key_matches_its_cipher_and_a_client_pairs_it() {
+        let material = [4u8; 32];
+        let ss = |method: &str| json!({"type": "shadowsocks", "method": method, "listen_port": 1080, "password": "c2VydmVy"});
+
+        // Legacy AEAD takes any password, so the derived one is used as it is.
+        let legacy = ss("aes-256-gcm");
+        let key = user(Protocol::Shadowsocks, &legacy, "a", &material).unwrap();
+        let raw = key["password"].as_str().unwrap().to_owned();
+        let node = client(&legacy, &key, "users[0]", &host(), "ss").unwrap();
+        assert!(
+            matches!(node.protocol, Outbound::Shadowsocks(ref ss) if ss.password.as_str() == raw),
+            "a legacy client carries its own password"
+        );
+
+        // 2022 keys carry the cipher's length, and the client's is the pair.
+        for (method, raw_len, encoded_len) in [
+            ("2022-blake3-aes-128-gcm", 16, 24),
+            ("2022-blake3-aes-256-gcm", 32, 44),
+        ] {
+            let inbound = ss(method);
+            let user = user(Protocol::Shadowsocks, &inbound, "a", &material).unwrap();
+            let key = user["password"].as_str().unwrap();
+            assert_eq!(key.len(), encoded_len, "{method}");
+
+            let node = client(&inbound, &user, "users[0]", &host(), "ss").unwrap();
+            let Outbound::Shadowsocks(ref client) = node.protocol else {
+                panic!("{method} is a Shadowsocks outbound")
+            };
+            assert_eq!(client.password.as_str(), format!("c2VydmVy:{key}"));
+            assert_eq!(
+                client
+                    .password
+                    .as_str()
+                    .split(':')
+                    .next_back()
+                    .unwrap()
+                    .len(),
+                encoded_len,
+                "{method}"
+            );
+            let _ = raw_len;
         }
     }
 
@@ -443,7 +934,7 @@ mod tests {
     fn a_user_is_shaped_for_its_protocol() {
         let material = [7u8; 32];
 
-        let vless = user(Protocol::Vless, &reality(), "alice", &material);
+        let vless = user(Protocol::Vless, &reality(), "alice", &material).unwrap();
         let id = vless["uuid"].as_str().unwrap();
         assert_eq!(&id[14..15], "4", "a version 4 UUID: {id}");
         assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"), "{id}");
@@ -455,7 +946,8 @@ mod tests {
             &json!({"type": "trojan"}),
             "bob",
             &material,
-        );
+        )
+        .unwrap();
         assert_eq!(trojan["password"].as_str().unwrap().len(), 22);
         assert!(trojan.get("uuid").is_none());
         assert_eq!(
@@ -467,7 +959,7 @@ mod tests {
     #[test]
     fn a_reality_user_exports_with_the_derived_key_and_the_inbound_name() {
         let inbound = reality();
-        let user = user(Protocol::Vless, &inbound, "alice", &[1u8; 32]);
+        let user = user(Protocol::Vless, &inbound, "alice", &[1u8; 32]).unwrap();
 
         let node = client(&inbound, &user, "users[0]", &host(), "vless-in").unwrap();
         let link = write_link(&node).unwrap();
@@ -495,7 +987,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("server_name");
-        let user = user(Protocol::Vless, &inbound, "alice", &[1u8; 32]);
+        let user = user(Protocol::Vless, &inbound, "alice", &[1u8; 32]).unwrap();
 
         let refused = client(&inbound, &user, "users[0]", &host(), "x").unwrap_err();
 
@@ -510,7 +1002,7 @@ mod tests {
             "tls": { "enabled": true },
             "transport": { "type": "ws", "path": "/ws" }
         });
-        let user = user(Protocol::Trojan, &inbound, "bob", &[2u8; 32]);
+        let user = user(Protocol::Trojan, &inbound, "bob", &[2u8; 32]).unwrap();
 
         let node = client(&inbound, &user, "users[0]", &host(), "trojan-ws").unwrap();
 
@@ -540,7 +1032,7 @@ mod tests {
         ];
         for (inbound, path) in cases {
             let protocol = grantable(inbound).unwrap();
-            let user = user(protocol, inbound, "x", &[3u8; 32]);
+            let user = user(protocol, inbound, "x", &[3u8; 32]).unwrap();
             assert_eq!(
                 client(inbound, &user, "users[0]", &host(), "x")
                     .unwrap_err()
@@ -550,7 +1042,7 @@ mod tests {
         }
 
         gecko["obfs"]["type"] = json!("salamander");
-        let user = user(Protocol::Hysteria2, &gecko, "x", &[3u8; 32]);
+        let user = user(Protocol::Hysteria2, &gecko, "x", &[3u8; 32]).unwrap();
         let node = client(&gecko, &user, "users[0]", &host(), "hy2").unwrap();
         assert!(write_link(&node).unwrap().contains("obfs=salamander"));
     }

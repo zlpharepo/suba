@@ -68,7 +68,7 @@ fn plan(document: &Value, config: &str, access: &Access) -> Plan {
                 let material = access.material(&grant.user, &grant.entry)?;
                 Some(PlannedUser {
                     name: grant.user.clone(),
-                    entry: users::user(protocol, inbound, &grant.user, &material),
+                    entry: users::user(protocol, inbound, &grant.user, &material)?,
                 })
             })
             .collect();
@@ -551,7 +551,7 @@ mod tests {
                 "users": [{"name": "guest", "uuid": "c7d2e9f4-6a1b-4e3c-b5d8-0f2a4c6e8b03"}]
             },
             {"type": "trojan", "tag": "trojan-in", "listen_port": 8443, "tls": {"enabled": true}},
-            {"type": "mixed", "tag": "mixed-in", "listen_port": 2080}
+            {"type": "direct", "tag": "direct-in", "listen_port": 2080}
         ]})
     }
 
@@ -562,8 +562,8 @@ mod tests {
         }
     }
 
-    /// Alice uses both proxies and the mixed inbound that cannot take users;
-    /// bob uses another configuration's inbound.
+    /// Alice uses both proxies and the inbound that cannot take users; bob
+    /// uses another configuration's inbound.
     fn access() -> Access {
         Access {
             users: BTreeMap::from([
@@ -573,7 +573,7 @@ mod tests {
                         inbounds: vec![
                             entry("server", "vless-in"),
                             entry("server", "trojan-in"),
-                            entry("server", "mixed-in"),
+                            entry("server", "direct-in"),
                         ],
                         secret: "11".repeat(32),
                         ..User::default()
@@ -627,7 +627,7 @@ mod tests {
         );
         assert!(
             injected["inbounds"][2].get("users").is_none(),
-            "a mixed inbound cannot take users"
+            "an inbound users do not dial cannot take them"
         );
         assert_eq!(
             injected["inbounds"][0]["users"][1]["flow"],
@@ -708,7 +708,7 @@ mod tests {
             .ends_with("#vless-in"));
         assert_eq!(
             inbounds[2].refused,
-            Some(users::grantable(&json!({"type": "mixed"})).unwrap_err())
+            Some(users::grantable(&json!({"type": "direct"})).unwrap_err())
         );
 
         let unset = exports(
@@ -894,7 +894,7 @@ mod tests {
         assert_eq!(unknown.reason(), Some("no inbound has this tag"));
         assert!(matches!(unknown, Placement::Unknown));
 
-        let refused = super::placement(&document(), &entry("server", "mixed-in"));
+        let refused = super::placement(&document(), &entry("server", "direct-in"));
         assert!(refused.reason().is_some());
         assert!(matches!(refused, Placement::Refused(_)));
 

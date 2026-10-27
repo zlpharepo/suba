@@ -22,7 +22,7 @@ async fn server(public_host: Option<&str>) -> Server {
             {"type": "trojan", "tag": "trojan-in", "listen_port": 8443,
              "tls": {"enabled": true},
              "users": [{"name": "guest", "password": "example-hand-written"}]},
-            {"type": "mixed", "tag": "mixed-in", "listen_port": 2080}
+            {"type": "direct", "tag": "direct-in", "listen_port": 2080}
         ]}))
         .unwrap(),
     )
@@ -43,7 +43,7 @@ async fn server(public_host: Option<&str>) -> Server {
                 &format!("{USERS}/alice"),
                 json!({"inbounds": [
                     {"config": "server", "inbound": "trojan-in"},
-                    {"config": "server", "inbound": "mixed-in"},
+                    {"config": "server", "inbound": "direct-in"},
                     {"config": "server", "inbound": "gone"}
                 ]}),
             )
@@ -259,7 +259,7 @@ async fn endpoints_list_every_inbound_whether_or_not_one_is_stored() {
     assert!(entries[0].get("reason").is_none());
     assert!(
         entries[1]["reason"].is_string(),
-        "a mixed inbound cannot be granted"
+        "an inbound users do not dial cannot be granted"
     );
 
     // An address belongs to one inbound: the other one keeps its own, so an
@@ -272,7 +272,7 @@ async fn endpoints_list_every_inbound_whether_or_not_one_is_stored() {
         .await;
     server
         .put_json(
-            &format!("{ENDPOINTS}/server/mixed-in"),
+            &format!("{ENDPOINTS}/server/direct-in"),
             json!({"address": "other.example.net", "port": 1080}),
         )
         .await;
