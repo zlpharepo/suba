@@ -5,12 +5,12 @@
 //! capability this build does not have is answered — absent, not "unsupported".
 
 use axum::{
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
     Router,
 };
 
 use crate::{
-    handlers::{observation, singbox, users},
+    handlers::{observation, singbox},
     AppState,
 };
 
@@ -33,20 +33,6 @@ pub fn route() -> Router<AppState> {
                 .delete(singbox::delete_config),
         )
         .route("/configs/{name}/references", get(singbox::references))
-        .route("/configs/{name}/exports", get(users::exports))
-        .route("/users", get(users::index))
-        .route("/users/{name}", put(users::put).delete(users::delete))
-        .route("/users/{name}/credentials", delete(users::renew))
-        .route("/users/{name}/content", get(users::content))
-        .route(
-            "/users/{name}/tokens/{token}",
-            put(users::mint_token).delete(users::revoke_token),
-        )
-        .route("/endpoints", get(users::endpoints))
-        .route(
-            "/endpoints/{config}/{tag}",
-            put(users::put_endpoint).delete(users::delete_endpoint),
-        )
         .route(
             "/configs/{name}/sections/{section}",
             get(singbox::section)

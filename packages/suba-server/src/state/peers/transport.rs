@@ -220,7 +220,7 @@ pub(crate) fn resource_allowed(method: &str, path: &str) -> bool {
     ) {
         return method == "GET";
     }
-    ["/providers", "/collections", "/cores/sing-box"]
+    ["/providers", "/collections", "/cores/sing-box", "/inbounds"]
         .iter()
         .any(|prefix| {
             path == *prefix

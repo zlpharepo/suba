@@ -4,8 +4,8 @@ use serde_json::{json, Value};
 use super::{body, Server};
 use crate::config::AppConfig;
 
-const USERS: &str = "/api/cores/sing-box/users";
-const ENDPOINTS: &str = "/api/cores/sing-box/endpoints";
+const USERS: &str = "/api/inbounds/users";
+const ENDPOINTS: &str = "/api/inbounds/endpoints";
 
 async fn server(public_host: Option<&str>) -> Server {
     let server = Server::start_with(Some(AppConfig {
@@ -118,7 +118,7 @@ async fn a_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
     assert_eq!(delivered.status(), 200);
     assert_eq!(delivered.text().await.unwrap().trim(), link);
 
-    let editor = body(get(&server, "/api/cores/sing-box/configs/server/exports").await).await;
+    let editor = body(get(&server, "/api/inbounds/configs/server/exports").await).await;
     assert_eq!(editor["public_host"], "proxy.example.com");
     assert_eq!(editor["inbounds"][0]["managed"][0]["user"], "alice");
     assert_eq!(editor["inbounds"][0]["managed"][0]["link"], json!(link));
@@ -131,7 +131,7 @@ async fn a_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
     let secret = secret(&server);
     for answer in [
         get(&server, USERS).await.text().await.unwrap(),
-        get(&server, "/api/cores/sing-box/configs/server/exports")
+        get(&server, "/api/inbounds/configs/server/exports")
             .await
             .text()
             .await
@@ -205,7 +205,7 @@ async fn an_address_override_is_what_a_client_dials() {
 
     // The inbound keeps listening where it did; only what a client dials
     // changed, and the operator's document is untouched.
-    let editor = body(get(&server, "/api/cores/sing-box/configs/server/exports").await).await;
+    let editor = body(get(&server, "/api/inbounds/configs/server/exports").await).await;
     assert_eq!(editor["inbounds"][0]["index"], 0);
 
     // An omitted field keeps what is stored, an explicit null clears it.

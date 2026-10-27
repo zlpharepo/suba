@@ -1,5 +1,7 @@
 mod auth;
 mod collections;
+#[cfg(feature = "singbox-core")]
+mod inbounds;
 mod peers;
 mod providers;
 #[cfg(feature = "singbox-core")]
@@ -59,7 +61,9 @@ impl AppRouter {
             .nest("/providers", providers::route())
             .nest("/collections", collections::route());
         #[cfg(feature = "singbox-core")]
-        let router = router.nest("/cores/sing-box", singbox::route());
+        let router = router
+            .nest("/cores/sing-box", singbox::route())
+            .nest("/inbounds", inbounds::route());
         router
     }
 
@@ -595,6 +599,11 @@ mod tests {
             "/api/cores/sing-box/references",
             "/api/cores/sing-box/connections",
             "/api/cores/sing-box/metrics",
+            // Users and endpoints are about a configuration's inbounds, so a
+            // build that cannot read one has no answer for them either.
+            "/api/inbounds/users",
+            "/api/inbounds/endpoints",
+            "/api/inbounds/configs/default/exports",
         ] {
             let absent = server
                 .authed(reqwest::Method::GET, path)

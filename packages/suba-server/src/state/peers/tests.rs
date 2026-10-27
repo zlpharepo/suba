@@ -152,6 +152,12 @@ fn endpoints_require_tls_and_resource_scope_excludes_auth_trust_and_recursion() 
         "/providers/example",
         "/collections/example/content?format=links",
         "/cores/sing-box/configs/example",
+        // The manager writes a hosted user's entry here, so an agent that
+        // refused the prefix would silently drop every remote grant.
+        "/inbounds/users",
+        "/inbounds/users/alice",
+        "/inbounds/endpoints/server/trojan-in",
+        "/inbounds/configs/server/exports",
     ] {
         assert!(resource_allowed("GET", path));
     }
@@ -164,6 +170,7 @@ fn endpoints_require_tls_and_resource_scope_excludes_auth_trust_and_recursion() 
         "https://server.example.com/providers",
         "//server.example.com/providers",
         "/providers-other",
+        "/inbounds-other",
     ] {
         assert!(!resource_allowed("GET", path));
     }
