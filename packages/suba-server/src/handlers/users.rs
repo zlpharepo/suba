@@ -56,6 +56,9 @@ pub struct UserView {
 
 #[derive(Debug, Serialize)]
 pub struct GrantView {
+    /// Absent for an entry of this instance; the exporter is the reader.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<uuid::Uuid>,
     pub config: String,
     pub inbound: String,
     /// Absent when the entry reaches no inbound that can take users.
@@ -234,6 +237,7 @@ fn views(
 
 fn grant_view(inbounds: &[InboundUsers], entry: Entry, user: &str) -> GrantView {
     let refused = |reason: String| GrantView {
+        host: entry.host,
         config: entry.config.clone(),
         inbound: entry.inbound.clone(),
         state: None,
@@ -259,6 +263,7 @@ fn grant_view(inbounds: &[InboundUsers], entry: Entry, user: &str) -> GrantView 
     GrantView {
         state: Some(managed.state),
         export: managed.export.clone(),
+        host: entry.host,
         config: entry.config,
         inbound: entry.inbound,
     }
@@ -458,10 +463,7 @@ pub async fn endpoints(
                         // so it has no address to store either.
                         continue;
                     };
-                    let at = Entry {
-                        config: name.clone(),
-                        inbound: tag.to_owned(),
-                    };
+                    let at = Entry::local(&name, tag);
                     let stored = access.endpoint(&at);
                     entries.push(EndpointView {
                         reason: managed::placement(&document, &at).reason(),
@@ -490,10 +492,7 @@ pub async fn put_endpoint(
     Json(body): Json<EndpointBody>,
 ) -> ResponseResult<Json<EndpointView>> {
     let access = state.access().snapshot().await;
-    let at = Entry {
-        config: config.clone(),
-        inbound: inbound.clone(),
-    };
+    let at = Entry::local(&config, &inbound);
     // An address for an inbound that is not there would never be read, so it is
     // refused where an operator can still fix it rather than stored quietly.
     let placement = placement(&state, &at).await?;

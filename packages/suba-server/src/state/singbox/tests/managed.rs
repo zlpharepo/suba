@@ -19,10 +19,7 @@ fn contributions(user: &str) -> Contributions {
             users: BTreeMap::from([(
                 user.to_string(),
                 User {
-                    inbounds: vec![Entry {
-                        config: NAME.to_string(),
-                        inbound: "trojan-in".to_string(),
-                    }],
+                    inbounds: vec![Entry::local(NAME, "trojan-in")],
                     secret: "44".repeat(32),
                     ..User::default()
                 },

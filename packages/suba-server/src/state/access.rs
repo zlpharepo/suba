@@ -21,6 +21,7 @@ use std::path::Path;
 use hmac::{KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use suba_core::checksum::sha256_hex;
+use uuid::Uuid;
 
 use crate::{config::ConfigError, error::Error};
 
@@ -84,10 +85,28 @@ pub struct EndpointsConfig {
 }
 
 /// One inbound a user may use: its tag, in one named configuration.
+///
+/// `host` is the instance that runs that inbound. An absent one is this
+/// instance, which is what a file that never mentioned a host means and what a
+/// host's own copy of a mirrored entry holds.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Entry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<Uuid>,
     pub config: String,
     pub inbound: String,
+}
+
+impl Entry {
+    /// One of this instance's own inbounds, which is what an address lookup and
+    /// a plan over the local document are keyed by.
+    pub(crate) fn local(config: &str, inbound: &str) -> Self {
+        Self {
+            host: None,
+            config: config.to_owned(),
+            inbound: inbound.to_owned(),
+        }
+    }
 }
 
 /// Users and addresses as one consistent picture, taken before any lock that
@@ -449,10 +468,54 @@ mod tests {
     }
 
     fn entry(config: &str, inbound: &str) -> Entry {
-        Entry {
-            config: config.to_string(),
-            inbound: inbound.to_string(),
-        }
+        Entry::local(config, inbound)
+    }
+
+    /// The host an entry belongs to is stored and read back in both
+    /// configuration formats, and left out when it is this instance's own.
+    #[tokio::test]
+    async fn an_entry_says_which_host_runs_it_and_an_absent_one_is_this_instance() {
+        let dir = scratch();
+        let store = AccessStore::load(&dir).unwrap();
+        let elsewhere = Uuid::now_v7();
+
+        store
+            .put_user(
+                "alice",
+                vec![
+                    entry("server", "vless-in"),
+                    Entry {
+                        host: Some(elsewhere),
+                        config: "server".to_string(),
+                        inbound: "vless-in".to_string(),
+                    },
+                ],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let reloaded = AccessStore::load(&dir).unwrap().snapshot().await;
+        assert_eq!(
+            reloaded.users["alice"].inbounds,
+            vec![
+                Entry::local("server", "vless-in"),
+                Entry {
+                    host: Some(elsewhere),
+                    config: "server".to_string(),
+                    inbound: "vless-in".to_string(),
+                },
+            ]
+        );
+
+        let written = read_config::<UsersConfig>(&dir.to_string_lossy(), USERS_BASENAME).unwrap();
+        let encoded = serde_json::to_value(&written).unwrap();
+        assert!(
+            encoded["alice"]["inbounds"][0].get("host").is_none(),
+            "this instance's own entry carries no host"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

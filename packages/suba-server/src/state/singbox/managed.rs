@@ -57,12 +57,13 @@ fn plan(document: &Value, config: &str, access: &Access) -> Plan {
         let Ok(protocol) = users::grantable(inbound) else {
             continue;
         };
-        let at = Entry {
-            config: config.to_owned(),
-            inbound: tag.to_owned(),
-        };
+        let at = Entry::local(config, tag);
         let planned: Vec<PlannedUser> = grants
             .iter()
+            // Another instance's inbound is not an inbound of this document, so
+            // it injects nothing here however it was granted.
+            // `at` names a local inbound, and a hosted entry is never equal to
+            // it, so another instance's inbound injects nothing here.
             .filter(|grant| grant.entry == at)
             .filter_map(|grant| {
                 let material = access.material(&grant.user, &grant.entry)?;
@@ -287,10 +288,7 @@ pub(crate) fn nodes(
                 .get("tag")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let at = Entry {
-                config: config.to_owned(),
-                inbound: tag.to_owned(),
-            };
+            let at = Entry::local(config, tag);
             Some(match address(inbound, access.endpoint(&at), host) {
                 Err(reason) => Err(reason),
                 Ok(dialable) => users::client(
@@ -418,10 +416,7 @@ fn address_of<'a>(
     access: &Access,
     public: Result<&Host, &str>,
 ) -> Result<Dialable<'a>, String> {
-    let at = Entry {
-        config: config.to_owned(),
-        inbound: tag.unwrap_or_default().to_owned(),
-    };
+    let at = Entry::local(config, tag.unwrap_or_default());
     address(inbound, access.endpoint(&at), public)
 }
 
@@ -530,6 +525,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::*;
     use crate::state::access::{Endpoint, User};
@@ -556,10 +552,7 @@ mod tests {
     }
 
     fn entry(config: &str, inbound: &str) -> Entry {
-        Entry {
-            config: config.to_string(),
-            inbound: inbound.to_string(),
-        }
+        Entry::local(config, inbound)
     }
 
     /// Alice uses both proxies and the inbound that cannot take users; bob
@@ -638,6 +631,30 @@ mod tests {
         let elsewhere = inject(&document(), "other", &access()).unwrap();
         assert_eq!(names(&elsewhere, 0), ["guest"]);
         assert_eq!(names(&elsewhere, 1), ["bob"], "the same tags, as `other`");
+    }
+
+    /// Another instance's inbound shares this configuration's name and tag by
+    /// construction, so its entry has to be told apart by the host that runs it.
+    #[test]
+    fn an_entry_of_another_host_is_not_an_inbound_of_this_document() {
+        let mut access = access();
+        let elsewhere = Uuid::now_v7();
+        access.users.get_mut("alice").unwrap().inbounds = vec![
+            entry("server", "vless-in"),
+            Entry {
+                host: Some(elsewhere),
+                config: "server".to_string(),
+                inbound: "vless-in".to_string(),
+            },
+        ];
+
+        let injected = inject(&document(), "server", &access).unwrap();
+
+        assert_eq!(
+            names(&injected, 0),
+            ["guest", "alice"],
+            "the same tag on another host is not this document's inbound,              and the local entry still is"
+        );
     }
 
     #[test]
