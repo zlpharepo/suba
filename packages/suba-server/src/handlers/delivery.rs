@@ -568,6 +568,21 @@ mod tests {
         let (headers, _) = get_as(&state, &token, None, "curl/8.7.1").await.unwrap();
         assert_eq!(headers["x-suba-format"], "base64");
 
+        // A sing-box client asks with its own name, and the name comes back
+        // in the headers spelled the same way.
+        #[cfg(feature = "singbox")]
+        {
+            let (headers, body) = get_as(&state, &token, None, "SFA/1.11.0 (Android)")
+                .await
+                .unwrap();
+            assert_eq!(headers["x-suba-format"], "sing-box");
+            assert_eq!(
+                headers[header::CONTENT_TYPE],
+                "application/json; charset=utf-8"
+            );
+            assert!(body.contains("\"outbounds\""), "{body}");
+        }
+
         assert!(matches!(
             get_as(&state, &token, Some("xray"), "curl/8.7.1").await,
             Err(Error::UnknownFormat)

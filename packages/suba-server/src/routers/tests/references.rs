@@ -318,7 +318,10 @@ async fn reference_catalog_reports_conversion_skips_without_losing_usable_nodes(
     assert!(!catalog["skipped"].to_string().contains("private-"));
 
     let rendered = server
-        .authed(Method::GET, "/api/collections/first/content?format=singbox")
+        .authed(
+            Method::GET,
+            "/api/collections/first/content?format=sing-box",
+        )
         .send()
         .await
         .unwrap();

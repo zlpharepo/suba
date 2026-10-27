@@ -33,6 +33,11 @@ use crate::proto::{self, write_link, Kind};
 use crate::proto::{Client, Node};
 
 /// A document shape a collection can be served in.
+///
+/// The name it is spelled with is the product's own spelling, matched only
+/// where case does not matter: `sing-box`, not `singbox`. It is what a caller
+/// writes in `?format=` and what a `User-Agent` is recognised by, so the two
+/// cannot drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Format {
@@ -42,6 +47,7 @@ pub enum Format {
     Base64,
     /// A sing-box configuration, with one outbound per node.
     #[cfg(feature = "singbox")]
+    #[serde(rename = "sing-box")]
     Singbox,
     /// A clash configuration, with one proxy per node.
     #[cfg(feature = "clash")]
@@ -73,7 +79,7 @@ impl Format {
             Self::Links => "links",
             Self::Base64 => "base64",
             #[cfg(feature = "singbox")]
-            Self::Singbox => "singbox",
+            Self::Singbox => "sing-box",
             #[cfg(feature = "clash")]
             Self::Clash => "clash",
         }
@@ -115,6 +121,11 @@ impl Format {
     /// sing-box or clash client asked for a document it can load, and anything
     /// else gets the default. Matched without regard to
     /// case, because the clients spell themselves inconsistently.
+    ///
+    /// What it returns is a [`Format`], so the shape a client is served by its
+    /// `User-Agent` is the same one it would have been served by asking with
+    /// [`Format::as_str`] — including the name that goes back out in
+    /// `x-suba-format`.
     pub fn for_user_agent(agent: &str) -> Option<Self> {
         let agent = agent.to_ascii_lowercase();
 
@@ -692,6 +703,38 @@ mod tests {
         assert_eq!(Format::named("xray"), None);
     }
 
+    /// The name is the product's own spelling, so the squashed one a caller
+    /// might guess at is not a name this build answers to.
+    #[cfg(feature = "singbox")]
+    #[test]
+    fn a_squashed_product_name_is_not_a_format_name() {
+        assert_eq!(Format::named("sing-box"), Some(Format::Singbox));
+        assert_eq!(Format::named("singbox"), None);
+        assert_eq!(Format::Singbox.as_str(), "sing-box");
+    }
+
+    /// Whatever a client is recognised by, it is recognised as a format a
+    /// caller could also have named: the two ways of asking meet at one name.
+    #[test]
+    fn a_client_is_recognised_as_a_format_a_caller_could_name() {
+        for agent in ["SFA/1.11.0 (Android)", "clash-verge/v2.2.0", "curl/8.7.1"] {
+            if let Some(selected) = Format::for_user_agent(agent) {
+                assert_eq!(Format::named(selected.as_str()), Some(selected), "{agent}");
+            }
+        }
+
+        #[cfg(feature = "singbox")]
+        assert_eq!(
+            Format::for_user_agent("SFA/1.11.0 (Android)").map(Format::as_str),
+            Some("sing-box")
+        );
+        #[cfg(feature = "clash")]
+        assert_eq!(
+            Format::for_user_agent("mihomo/1.19.31").map(Format::as_str),
+            Some("clash")
+        );
+    }
+
     /// A client that can only read one shape is recognised; a browser, a curl
     /// and a v2ray client are left to the default.
     #[test]
@@ -810,9 +853,9 @@ mod tests {
         let names: Vec<&str> = Format::all().iter().map(|format| format.as_str()).collect();
 
         #[cfg(all(feature = "singbox", feature = "clash"))]
-        assert_eq!(names, ["links", "base64", "singbox", "clash"]);
+        assert_eq!(names, ["links", "base64", "sing-box", "clash"]);
         #[cfg(all(feature = "singbox", not(feature = "clash")))]
-        assert_eq!(names, ["links", "base64", "singbox"]);
+        assert_eq!(names, ["links", "base64", "sing-box"]);
         #[cfg(all(feature = "clash", not(feature = "singbox")))]
         assert_eq!(names, ["links", "base64", "clash"]);
         #[cfg(not(any(feature = "singbox", feature = "clash")))]
