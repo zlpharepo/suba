@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::core::{extract, sha256_hex, Dirs, Error, Metadata, Release, Version};
+use crate::spawn;
 
 /// The name the binary has inside a release archive, and the name it keeps.
 const BINARY: &str = "sing-box";
@@ -140,14 +141,11 @@ fn stage(dirs: &Dirs, version: &Version) -> PathBuf {
 
 /// Ask a binary to write its own schema, and measure what it wrote.
 fn generate_schema(binary: &Path, schema: &Path) -> Result<String, Error> {
-    let ran = Command::new(binary)
-        .arg("schema")
-        .arg("-o")
-        .arg(schema)
-        .output()
-        .map_err(|_| Error::Run {
-            reason: "the binary could not be started",
-        })?;
+    let mut command = Command::new(binary);
+    command.arg("schema").arg("-o").arg(schema);
+    let ran = spawn::output(command).map_err(|_| Error::Run {
+        reason: "the binary could not be started",
+    })?;
 
     if !ran.status.success() {
         return Err(Error::Run {
@@ -435,7 +433,7 @@ pub fn generate(
         }
     }
 
-    let ran = command.output().map_err(|_| Error::Generate {
+    let ran = spawn::output(command).map_err(|_| Error::Generate {
         command: kind.as_str(),
         reason: "the binary could not be started",
     })?;

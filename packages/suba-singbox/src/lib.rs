@@ -34,6 +34,9 @@ pub mod users;
 #[cfg(feature = "core")]
 pub mod schema;
 
+#[cfg(feature = "core")]
+mod spawn;
+
 #[cfg(feature = "render")]
 mod render;
 

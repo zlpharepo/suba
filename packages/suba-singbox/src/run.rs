@@ -28,6 +28,8 @@ use std::io::{BufRead as _, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
+
+use crate::spawn;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -75,14 +77,13 @@ fn core_command(binary: &Path, config: &Path, work: &Path, action: &str) -> Comm
 
 /// Bound native validation and discard output that can contain configuration secrets.
 pub fn check(mut command: Command, patience: Duration) -> Result<(), Error> {
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| Error::Run {
-            reason: "the native configuration check could not be started",
-        })?;
+        .stderr(Stdio::null());
+    let mut child = spawn::child(command).map_err(|_| Error::Run {
+        reason: "the native configuration check could not be started",
+    })?;
     let started = Instant::now();
     loop {
         match child.try_wait() {
@@ -192,7 +193,7 @@ impl Runner {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let child = command.spawn().map_err(|_| Error::Run {
+            let child = spawn::child(command).map_err(|_| Error::Run {
                 reason: "the process could not be started",
             })?;
 
