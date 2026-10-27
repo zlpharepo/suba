@@ -64,6 +64,11 @@ impl SubaServer {
         // The edge node connection is one task per process, not per request.
         let edging = tokio::spawn(crate::state::peers::edge::run(self.state.clone()));
 
+        // After the listeners and the observation loop are up, so a core that
+        // starts here is one the rest of the instance can already serve.
+        #[cfg(feature = "singbox-core")]
+        let starting = tokio::spawn(handlers::singbox::autostart(self.state.clone()));
+
         tracing::info!("SubA server running on http://{}", self.tcp.local_addr()?);
         let (notified, signal) = tokio::sync::oneshot::channel();
         let serving = async move {
@@ -98,6 +103,25 @@ impl SubaServer {
             let store = self.state.singbox();
             tokio::task::spawn_blocking(move || store.shutdown(std::time::Duration::from_secs(10)))
         };
+        #[cfg(feature = "singbox-core")]
+        let served = {
+            // A start still in flight is joined first: `shutdown` sets a flag
+            // that a start already past its check would otherwise ignore.
+            if let Err(error) = starting.await {
+                tracing::warn!("the core's autostart did not finish: {error}");
+            }
+            match finished {
+                Some(result) => result,
+                None => match tokio::time::timeout(drain_timeout, &mut serving).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!("HTTP shutdown grace period elapsed");
+                        Ok(())
+                    }
+                },
+            }
+        };
+        #[cfg(not(feature = "singbox-core"))]
         let served = match finished {
             Some(result) => result,
             None => match tokio::time::timeout(drain_timeout, &mut serving).await {

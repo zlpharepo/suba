@@ -104,6 +104,8 @@ mod tests {
     #[cfg(feature = "singbox-core")]
     mod references;
     #[cfg(feature = "singbox-core")]
+    mod settings;
+    #[cfg(feature = "singbox-core")]
     mod users;
 
     use http::header;

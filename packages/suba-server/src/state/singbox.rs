@@ -108,6 +108,51 @@ pub(crate) struct Settings {
     /// The collections whose nodes become outbounds, in this order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collections: Vec<String>,
+    /// Whether the core is started when this instance starts.
+    ///
+    /// Its own field on the same document. This file is written whole, so a
+    /// request that merely picks a version or a privilege would otherwise reset
+    /// a flag it never meant to speak about — see [`Settings::with_changes`],
+    /// which is what an API caller goes through.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub autostart: bool,
+}
+
+impl Settings {
+    /// These settings with only what a request named changed.
+    ///
+    /// `version` and `autostart` are `Option`al their own way: `None` means
+    /// "not spoken about", so a save keeps what is stored. Every other field is
+    /// always spoken about, which is what the module's form does.
+    pub(crate) fn with_changes(&self, change: Changes) -> Self {
+        Self {
+            version: match change.version {
+                Some(tag) => tag.as_deref().map(Version::from_tag),
+                None => self.version.clone(),
+            },
+            config: change.config.or_else(|| self.config.clone()),
+            privilege: change.privilege.unwrap_or(self.privilege),
+            collections: change
+                .collections
+                .unwrap_or_else(|| self.collections.clone()),
+            autostart: change.autostart.unwrap_or(self.autostart),
+        }
+    }
+}
+
+/// What one request said about the module, with `None` for what it did not.
+#[derive(Debug, Default)]
+pub(crate) struct Changes {
+    /// `Some(None)` clears the version, `None` keeps it.
+    pub version: Option<Option<String>>,
+    pub config: Option<String>,
+    pub privilege: Option<Privilege>,
+    pub collections: Option<Vec<String>>,
+    pub autostart: Option<bool>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// How a started core runs, which is not something that can be inferred from a
@@ -1544,6 +1589,7 @@ mod tests {
                 privilege: Default::default(),
                 config: Some(NAME.to_string()),
                 collections: Vec::new(),
+                ..Default::default()
             })
             .expect("a current version");
 
@@ -1998,6 +2044,7 @@ mod tests {
                 privilege: Default::default(),
                 config: Some(NAME.to_string()),
                 collections: Vec::new(),
+                ..Default::default()
             }),
             Err(Error::Singbox(
                 suba_singbox::core::Error::NotInstalled { .. }
@@ -2185,6 +2232,175 @@ mod tests {
         assert_eq!(status.exits.len(), 0);
 
         store.stop(Duration::from_secs(2)).expect("a stop");
+    }
+
+    /// A configuration that does not hold up at boot is said once and left
+    /// alone: the server keeps serving, so the operator has an API to fix it
+    /// from. Exiting here would take away the only way to repair it.
+    #[tokio::test]
+    async fn a_configuration_that_does_not_check_out_leaves_the_server_serving() {
+        let (scratch, fixture) = store();
+        // A document that cannot be read at all: assembly stops on it whatever
+        // the installed version's schema happens to accept.
+        let documents = fixture.config_dir.join(DOCUMENT_DIR);
+        std::fs::create_dir_all(&documents).unwrap();
+        std::fs::write(documents.join(document_file(NAME)), "{ not json").unwrap();
+        fixture
+            .set_settings(&Settings {
+                autostart: true,
+                ..fixture.settings().unwrap()
+            })
+            .unwrap();
+
+        let server = crate::SubaServer::new(crate::ServerConfig {
+            listen: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: scratch.0.join("config"),
+            data_dir: scratch.0.join("data"),
+            privileged: Default::default(),
+        })
+        .await
+        .unwrap();
+        let store = server.state.singbox();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(
+            async move {
+                receive.await.unwrap();
+            },
+            Duration::from_millis(100),
+        ));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let running = store.status().running;
+        let failed = matches!(store.runtime_phase(), Some(RuntimePhase::Failed { .. }));
+
+        send.send(()).unwrap();
+        let finished = tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("shutdown finishes");
+        store.stop(Duration::from_secs(2)).unwrap();
+
+        assert!(!running, "a configuration the core refuses does not run");
+        assert!(failed, "and the reason is kept for the operator to read");
+        assert!(
+            finished.is_ok(),
+            "the server still shut down cleanly rather than dying at boot"
+        );
+    }
+
+    /// A module that was set to autostart before it was ever given a version
+    /// does not come up: there is nothing to run, and the boot is quiet rather
+    /// than an error.
+    #[tokio::test]
+    async fn a_module_with_nothing_chosen_yet_does_not_start() {
+        let scratch = Scratch::new();
+        let store = SingboxStore::new(
+            &scratch.0.join("config"),
+            &scratch.0.join("data"),
+            reqwest::Client::new(),
+            identity(),
+        );
+        store
+            .set_settings(&Settings {
+                autostart: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(store.settings().unwrap().version, None, "nothing chosen");
+
+        let server = crate::SubaServer::new(crate::ServerConfig {
+            listen: "127.0.0.1".parse().unwrap(),
+            port: 0,
+            config_dir: scratch.0.join("config"),
+            data_dir: scratch.0.join("data"),
+            privileged: Default::default(),
+        })
+        .await
+        .unwrap();
+        let store = server.state.singbox();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(server.serve_until(
+            async move {
+                receive.await.unwrap();
+            },
+            Duration::from_millis(100),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let running = store.status().running;
+        // Not merely "not running": a refused attempt would leave a phase
+        // behind, and the point is that nothing was attempted at all.
+        let phase = store.runtime_phase();
+
+        send.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("shutdown finishes")
+            .unwrap()
+            .unwrap();
+        store.stop(Duration::from_secs(2)).unwrap();
+
+        assert!(!running, "a module with no version has nothing to start");
+        assert!(
+            !matches!(phase, Some(RuntimePhase::Failed { .. })),
+            "nothing was attempted, so nothing failed"
+        );
+        assert!(phase.is_none(), "the module was left alone");
+    }
+
+    /// What the module is set to decides whether the core comes up with the
+    /// server, and a module that is not set to says nothing about it.
+    #[tokio::test]
+    async fn the_core_starts_with_the_server_only_when_it_is_set_to() {
+        for (autostart, expected) in [(true, true), (false, false)] {
+            let (_scratch, fixture) = store();
+            fixture
+                .set_settings(&Settings {
+                    autostart,
+                    ..fixture.settings().unwrap()
+                })
+                .unwrap();
+
+            let server = crate::SubaServer::new(crate::ServerConfig {
+                listen: "127.0.0.1".parse().unwrap(),
+                port: 0,
+                config_dir: fixture.config_dir.clone(),
+                data_dir: fixture.dirs.root.parent().unwrap().to_path_buf(),
+                privileged: Default::default(),
+            })
+            .await
+            .unwrap();
+            let store = server.state.singbox();
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let serving = tokio::spawn(server.serve_until(
+                async move {
+                    receive.await.unwrap();
+                },
+                Duration::from_millis(100),
+            ));
+
+            // The boot task is off the serving path, so give it a moment to
+            // get there before asking what happened.
+            if expected {
+                for _ in 0..100 {
+                    if store.status().running {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let running = store.status().running;
+
+            send.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), serving)
+                .await
+                .expect("shutdown finishes")
+                .unwrap()
+                .unwrap();
+            store.stop(Duration::from_secs(2)).unwrap();
+
+            assert_eq!(running, expected, "autostart: {autostart}");
+        }
     }
 
     #[tokio::test]
@@ -2422,6 +2638,7 @@ mod tests {
                 privilege: Default::default(),
                 config: Some(NAME.to_string()),
                 collections: Vec::new(),
+                ..Default::default()
             })
             .expect("a current version");
 

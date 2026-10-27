@@ -26,8 +26,8 @@ use crate::{
     error::Error,
     handlers::collections::outbounds_of,
     state::singbox::{
-        Contributions, ConversionSkip, Document, InstallationTask, Privilege, RuntimePhase, Saved,
-        Settings, SingboxStore, Tag,
+        Changes, Contributions, ConversionSkip, Document, InstallationTask, Privilege,
+        RuntimePhase, Saved, SingboxStore, Tag,
     },
     AppState,
 };
@@ -47,6 +47,8 @@ pub struct Core {
     pub privilege: Privilege,
     /// The collections whose nodes become outbounds, in order.
     pub collections: Vec<String>,
+    /// Whether the core is started when this instance starts.
+    pub autostart: bool,
     /// Whether the chosen version's binary is where it should be.
     pub installed: bool,
     /// Whether an assembled configuration is on disk.
@@ -60,12 +62,14 @@ pub struct Core {
 
 /// What the operator chooses for the module.
 ///
-/// All three are the resource, so all three are named: a settings request that
-/// left one out would silently reset it, which is the kind of change nobody
-/// asks for.
+/// `version` and `autostart` are optional both ways: a request that does not
+/// speak about them keeps what is stored. The form always names them, but a
+/// caller whose concern is a privilege or a collection does not have to.
 #[derive(Debug, Deserialize)]
 pub struct Choose {
-    pub version: Option<String>,
+    /// `Some(tag)` picks a version, `Some(null)` clears it, omitted keeps it.
+    #[serde(default, deserialize_with = "spoken_or_kept")]
+    pub version: Option<Option<String>>,
     /// The configuration to run. A name whose document has not been written yet
     /// reads as an empty one, which is how a module starts.
     pub config: String,
@@ -75,6 +79,21 @@ pub struct Choose {
     pub privilege: Privilege,
     #[serde(default)]
     pub collections: Vec<String>,
+    /// Whether the core starts with this instance. Omitted keeps it.
+    #[serde(default, deserialize_with = "spoken_or_kept")]
+    pub autostart: Option<bool>,
+}
+
+/// Tell an omitted field from one that was spoken about.
+///
+/// `Option<T>` alone collapses the two: serde gives `None` for both, so a
+/// caller that never mentioned the field would be read as having cleared it.
+fn spoken_or_kept<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// One configuration this instance has.
@@ -101,6 +120,7 @@ fn core_view(store: &SingboxStore, note: Option<String>) -> Result<Core, Error> 
         config: store.config()?,
         privilege: settings.privilege,
         collections: settings.collections,
+        autostart: settings.autostart,
         installed: store.binary_in_place()?,
         assembled: store.assembled(),
         running: store.status().running,
@@ -153,15 +173,20 @@ pub async fn choose(
     Json(choose): Json<Choose>,
 ) -> ResponseResult<Json<Core>> {
     let store = state.singbox();
-    let settings = Settings {
-        version: choose.version.as_deref().map(Version::from_tag),
+    let changes = Changes {
+        version: choose.version,
         config: Some(choose.config),
-        privilege: choose.privilege,
-        collections: choose.collections,
+        privilege: Some(choose.privilege),
+        collections: Some(choose.collections),
+        autostart: choose.autostart,
     };
 
     Ok(Json(
         tokio::task::spawn_blocking(move || -> Result<Core, Error> {
+            // Read and write under the one lock, so a save cannot clobber a
+            // field another request changed in between.
+            let stored = store.settings()?;
+            let settings = stored.with_changes(changes);
             store.set_settings(&settings)?;
 
             let note = store.status().running.then(|| {
@@ -187,7 +212,7 @@ pub async fn index(State(state): State<AppState>, _auth: Operator) -> ResponseRe
 /// Resolve once without refreshing; unavailable collections remain save warnings
 /// so a draft can be repaired, but cannot become a runtime product or preview.
 /// The users are read here too, so one run sees one picture of them.
-async fn generated(state: &AppState) -> Result<Contributions, Error> {
+pub(crate) async fn generated(state: &AppState) -> Result<Contributions, Error> {
     let store = state.singbox();
     let selected = tokio::task::spawn_blocking(move || store.settings())
         .await??
@@ -204,6 +229,52 @@ async fn generated(state: &AppState) -> Result<Contributions, Error> {
         unavailable,
         access: state.access().snapshot().await,
     })
+}
+
+/// Start the core at boot, when the module is set to.
+///
+/// Nothing here is fatal to the server: a version that was never installed, a
+/// configuration that does not check out, or a collection that is gone leaves
+/// the operator with a working HTTP API to fix it from, which is the only way
+/// they could fix it if this refused to start. The failure is said once, in the
+/// log, and is not retried — a restart is the operator's to ask for.
+#[cfg(feature = "singbox-core")]
+pub(crate) async fn autostart(state: AppState) {
+    let store = state.singbox();
+    match tokio::task::spawn_blocking(move || {
+        store
+            .settings()
+            .map(|settings| (settings.autostart, settings.config.is_some()))
+    })
+    .await
+    {
+        Ok(Ok((true, true))) => {}
+        // Nothing asked for, or a module that has not been set up yet.
+        Ok(Ok((false, _))) | Ok(Ok((true, false))) => return,
+        Ok(Err(error)) => {
+            tracing::warn!("the module's settings could not be read: {error}");
+            return;
+        }
+        Err(error) => {
+            tracing::warn!("the module's settings could not be read: {error}");
+            return;
+        }
+    }
+
+    let generated = match generated(&state).await {
+        Ok(generated) => generated,
+        Err(error) => {
+            tracing::warn!("the core was not started: {error}");
+            return;
+        }
+    };
+
+    let store = state.singbox();
+    match tokio::task::spawn_blocking(move || store.start(&generated)).await {
+        Ok(Ok(pid)) => tracing::info!("the core started with this instance, as pid {pid}"),
+        Ok(Err(error)) => tracing::warn!("the core was not started: {error}"),
+        Err(error) => tracing::warn!("the core was not started: {error}"),
+    }
 }
 
 /// What the process is doing, and the end of what it said.
@@ -634,9 +705,97 @@ fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, 
 }
 
 #[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use crate::state::singbox::Settings;
+
+    fn stored() -> Settings {
+        Settings {
+            version: Some(Version::from_tag("1.14.3")),
+            config: Some("server".to_string()),
+            privilege: Privilege::Root,
+            collections: vec!["family".to_string()],
+            autostart: true,
+        }
+    }
+
+    /// What a request does not speak about is kept. This is the whole reason
+    /// `Choose` distinguishes absent from null: this file is written whole, so
+    /// a caller whose business is one field must not reset the rest.
+    #[test]
+    fn a_field_a_request_leaves_out_keeps_what_is_stored() {
+        let kept = stored().with_changes(Changes {
+            config: Some("other".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(kept.config.as_deref(), Some("other"), "what it did name");
+        assert_eq!(kept.version, stored().version, "what it did not");
+        assert_eq!(kept.privilege, Privilege::Root);
+        assert_eq!(kept.collections, ["family"]);
+        assert!(kept.autostart, "the flag survives an unrelated save");
+    }
+
+    /// A field that was spoken about is taken, including clearing it.
+    #[test]
+    fn a_field_a_request_names_is_taken_even_when_it_clears_it() {
+        let changed = stored().with_changes(Changes {
+            version: Some(None),
+            privilege: Some(Privilege::Operator),
+            collections: Some(Vec::new()),
+            autostart: Some(false),
+            ..Default::default()
+        });
+
+        assert_eq!(changed.version, None, "cleared, not kept");
+        assert_eq!(changed.privilege, Privilege::Operator);
+        assert!(changed.collections.is_empty());
+        assert!(!changed.autostart);
+        assert_eq!(changed.config.as_deref(), Some("server"), "untouched");
+    }
+
+    /// A request can turn the flag on alone, which is what the form does.
+    #[test]
+    fn the_flag_can_be_set_and_cleared_on_its_own() {
+        let off = Settings::default();
+        assert!(!off.autostart);
+
+        let on = off.with_changes(Changes {
+            autostart: Some(true),
+            ..Default::default()
+        });
+        assert!(on.autostart);
+
+        let back = on.with_changes(Changes {
+            autostart: Some(false),
+            ..Default::default()
+        });
+        assert!(!back.autostart);
+    }
+
+    /// It is written where an operator can see it, and left out when it is off.
+    #[test]
+    fn the_flag_is_its_own_key_on_the_document() {
+        let on = serde_json::to_value(stored()).unwrap();
+        assert_eq!(on["autostart"], true);
+
+        let off = serde_json::to_value(Settings {
+            autostart: false,
+            ..stored()
+        })
+        .unwrap();
+        assert!(
+            off.get("autostart").is_none(),
+            "a module that does not autostart says nothing about it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod version_view_tests {
     use super::*;
     use crate::identity::Identity;
+    use crate::state::singbox::Settings;
     use suba_singbox::core::{Dirs, Metadata};
 
     #[test]
@@ -785,6 +944,7 @@ mod version_view_tests {
                 privilege: Default::default(),
                 config: Some("default".to_string()),
                 collections: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
 
