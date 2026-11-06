@@ -215,7 +215,12 @@ async fn run_resource(
         })?;
     request.extensions_mut().insert(grant);
     // This router contains resources only, with no auth, trust, hosts, delivery or static-file routes.
-    let response = crate::routers::AppRouter::resources()
+    let router = if state.is_agent() {
+        crate::routers::AppRouter::agent_resources()
+    } else {
+        crate::routers::AppRouter::resources()
+    };
+    let response = router
         .with_state(state)
         .oneshot(request)
         .await
@@ -266,6 +271,12 @@ pub async fn forward(
     if !peers::resource_allowed(&method, &path) {
         return Err(Error::PeerNotFound);
     }
+    #[cfg(not(feature = "singbox-core"))]
+    if host.mode == peers::Mode::Edge && !path.starts_with("/system/") {
+        return Err(Error::PeerNotFound);
+    }
+    #[cfg(feature = "singbox-core")]
+    let headers = request.headers().clone();
     let if_match = request
         .headers()
         .get(header::IF_MATCH)
@@ -288,16 +299,31 @@ pub async fn forward(
             })?,
         )
     };
+    #[cfg(feature = "singbox-core")]
+    if host.mode == peers::Mode::Edge {
+        return crate::handlers::agents::forward(state, host, method, path, headers, body).await;
+    }
+    call(&state, &host, method, path, if_match, body).await
+}
+
+pub(crate) async fn call(
+    state: &AppState,
+    host: &Host,
+    method: String,
+    path: String,
+    if_match: Option<String>,
+    body: Option<String>,
+) -> ResponseResult<Response> {
     let signer = state.settings().peer_signer().await?;
     let reply = match host.mode {
         peers::Mode::Direct => {
             state
                 .peers()
-                .forward(&signer, &host, method, path, if_match, body)
+                .forward(&signer, host, method, path, if_match, body)
                 .await?
         }
         peers::Mode::Edge => {
-            edge_forward(&state, &signer, &host, method, path, if_match, body).await?
+            edge_forward(state, &signer, host, method, path, if_match, body).await?
         }
     };
     let status = StatusCode::from_u16(reply.status).map_err(|_| Error::PeerUnavailable)?;

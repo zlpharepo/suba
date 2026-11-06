@@ -259,6 +259,64 @@ async fn an_invitation_mac_cannot_be_transplanted_to_another_identity_or_challen
 }
 
 #[tokio::test]
+async fn an_edge_agent_is_trusted_for_sessions_but_not_manager_resources() {
+    let scratch = Scratch::new();
+    let store = scratch.store();
+    let manager = signer();
+    let node = signer();
+    let invitation = store
+        .invite(
+            &manager,
+            "Example Agent".into(),
+            "https://manager.example.invalid".into(),
+            Mode::Edge,
+        )
+        .await
+        .unwrap();
+    let proof = pair_proof(&store, &manager, &node, &invitation).await;
+    store.accept(&manager, proof).await.unwrap();
+    let challenge = store
+        .edge_challenge(&manager, node.identity.id)
+        .await
+        .unwrap();
+    let proof = node
+        .sign(
+            "edge-session",
+            EdgeSessionProof {
+                challenge: challenge.payload,
+            },
+        )
+        .unwrap();
+    assert!(store.authorize_edge_session(&manager, &proof).await.is_ok());
+    let resource = request_proof(&store, &manager, &node).await;
+    assert!(matches!(
+        store.authorize(&manager, &resource).await,
+        Err(Error::Unauthorized)
+    ));
+    store.remove_host(node.identity.id).await.unwrap();
+    assert!(store.require_trusted(&node.identity).await.is_err());
+    assert!(store
+        .edge_challenge(&manager, node.identity.id)
+        .await
+        .is_err());
+}
+
+#[test]
+fn agent_api_addresses_keep_reverse_proxy_prefixes_without_guessing_paths() {
+    assert_eq!(
+        manager_endpoint("https://manager.example.invalid/control/api/").unwrap(),
+        "https://manager.example.invalid/control"
+    );
+    for address in [
+        "https://manager.example.invalid",
+        "https://manager.example.invalid/api?token=fixture",
+        "http://manager.example.invalid/api",
+    ] {
+        assert!(manager_endpoint(address).is_err());
+    }
+}
+
+#[tokio::test]
 async fn expired_and_revoked_invitations_cannot_create_trust() {
     let scratch = Scratch::new();
     let store = scratch.store();

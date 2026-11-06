@@ -1,3 +1,5 @@
+#[cfg(feature = "singbox-core")]
+pub(crate) mod agents;
 pub mod auth;
 pub mod collections;
 pub mod delivery;

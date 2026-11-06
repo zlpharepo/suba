@@ -55,6 +55,13 @@ pub(crate) async fn web_file(state: &AppState, request: Request) -> Response {
 }
 
 impl AppRouter {
+    pub(crate) fn agent_resources() -> Router<AppState> {
+        let router = Router::new().nest("/system", system::route());
+        #[cfg(feature = "singbox-core")]
+        let router = router.nest("/cores/sing-box", singbox::agent_route());
+        router
+    }
+
     pub(crate) fn resources() -> Router<AppState> {
         let router = Router::new()
             .nest("/system", system::route())
@@ -99,6 +106,8 @@ impl AppRouter {
 /// headers added after a handler returns — is pinned rather than smoke-tested.
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "singbox-core")]
+    mod agents;
     #[cfg(all(feature = "singbox", feature = "singbox-core"))]
     mod collection_bindings;
     #[cfg(feature = "singbox-core")]
@@ -122,10 +131,12 @@ mod tests {
         client: reqwest::Client,
         token: String,
         root: std::path::PathBuf,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
     }
 
     impl Drop for Server {
         fn drop(&mut self) {
+            self.task.abort();
             let _ = std::fs::remove_dir_all(&self.root);
         }
     }
@@ -159,7 +170,7 @@ mod tests {
             let router = super::AppRouter::route(state.web_dir()).with_state(state);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            tokio::spawn(async move { axum::serve(listener, router).await });
+            let task = tokio::spawn(async move { axum::serve(listener, router).await });
 
             let client = reqwest::Client::new();
             let login = client
@@ -182,6 +193,7 @@ mod tests {
                 client,
                 token,
                 root,
+                task,
             }
         }
 

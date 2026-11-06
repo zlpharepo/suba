@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use suba_server::{tracing, Privileged, ServerConfig, SubaServer};
+use suba_server::{tracing, AgentOptions, Privileged, ServerConfig, SubaServer};
 
 #[derive(Parser)]
 #[command(author = "ZLPHA")]
@@ -43,6 +43,18 @@ struct Cli {
     /// The group those files belong to, when it is a different number
     #[arg(long)]
     group: Option<u32>,
+
+    /// Run as an Edge Agent controlled by one manager
+    #[arg(long, requires = "manager_api_url")]
+    edge_agent: bool,
+
+    /// Manager API base URL, including any reverse-proxy prefix and /api
+    #[arg(long, requires = "edge_agent")]
+    manager_api_url: Option<String>,
+
+    /// One-time invitation token for initial Agent pairing
+    #[arg(long, requires = "edge_agent")]
+    agent_token: Option<String>,
 }
 
 impl Cli {
@@ -63,7 +75,19 @@ impl Cli {
             },
         };
 
-        let server = SubaServer::new(config).await.unwrap_or_else(|error| {
+        let server = if self.edge_agent {
+            SubaServer::edge_agent(
+                config,
+                AgentOptions {
+                    manager_api_url: self.manager_api_url.clone().expect("required by clap"),
+                    token: self.agent_token.clone(),
+                },
+            )
+            .await
+        } else {
+            SubaServer::new(config).await
+        }
+        .unwrap_or_else(|error| {
             tracing::error!("Failed to initialize server: {}", error);
             std::process::exit(1);
         });
@@ -96,4 +120,32 @@ async fn main() {
     tracing::init();
 
     cli.serve().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_mode_is_explicit_and_requires_its_manager() {
+        let cli = Cli::try_parse_from(["suba"]).unwrap_or_else(|_| panic!("default CLI"));
+        assert!(!cli.edge_agent);
+        assert!(Cli::try_parse_from(["suba", "--edge-agent"]).is_err());
+        assert!(Cli::try_parse_from([
+            "suba",
+            "--manager-api-url",
+            "https://manager.example.invalid/api"
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "suba",
+            "--edge-agent",
+            "--manager-api-url",
+            "https://manager.example.invalid/api",
+        ])
+        .unwrap_or_else(|_| panic!("agent CLI"));
+        assert!(cli.edge_agent);
+        assert!(cli.agent_token.is_none());
+        assert!(Cli::try_parse_from(["suba", "--agent-token", "fixture"]).is_err());
+    }
 }

@@ -56,6 +56,8 @@ pub struct UserView {
 
 #[derive(Debug, Serialize)]
 pub struct GrantView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
     /// Absent for an entry of this instance; the exporter is the reader.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<uuid::Uuid>,
@@ -71,6 +73,10 @@ pub struct GrantView {
 /// One inbound of one configuration, with the address a client dials.
 #[derive(Debug, Serialize)]
 pub struct EndpointView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_name: Option<String>,
     pub config: String,
     pub inbound: String,
     /// The stored override, when the operator set one.
@@ -114,12 +120,17 @@ where
 #[derive(Debug, Serialize)]
 pub struct ConfigUsers {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub public_host: Option<String>,
     pub inbounds: Vec<InboundUsers>,
 }
 
 /// The public host, or the reason every export points nowhere.
 async fn public_host(state: &AppState) -> Result<Host, &'static str> {
+    if state.target_host().is_some() {
+        return Err("endpoint.address: an Agent requires an explicit public address");
+    }
     match state.settings().public_host().await {
         Ok(Some(host)) => Ok(host),
         Ok(None) => Err("not set in config.toml"),
@@ -141,9 +152,16 @@ pub async fn exports(
     _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<Json<ConfigUsers>> {
-    let access = state.access().snapshot().await;
+    let access = state.access_snapshot().await;
     let host = public_host(&state).await;
     let store = state.singbox();
+    let target = state.target_host();
+    let remote = if let Some(id) = state.target_host() {
+        let node = state.peers().host(id).await?;
+        Some(agent_runtime(&state, &state, &node).await)
+    } else {
+        None
+    };
 
     Ok(Json(
         tokio::task::spawn_blocking(move || -> Result<ConfigUsers, Error> {
@@ -151,15 +169,24 @@ pub async fn exports(
             let in_use = store.config()?;
             let product = store.product();
 
+            let mut inbounds = managed::exports(
+                &document,
+                &name,
+                &access,
+                host.as_ref().map_err(|reason| *reason),
+                &serving(&name, &in_use, product.as_ref()),
+            );
+            if let Some(runtime) = remote {
+                for inbound in &mut inbounds {
+                    for user in &mut inbound.managed {
+                        user.state = agent_grant_state(&in_use, &name, runtime);
+                    }
+                }
+            }
             Ok(ConfigUsers {
+                host: target,
                 public_host: host.as_ref().ok().map(ToString::to_string),
-                inbounds: managed::exports(
-                    &document,
-                    &name,
-                    &access,
-                    host.as_ref().map_err(|reason| *reason),
-                    &serving(&name, &in_use, product.as_ref()),
-                ),
+                inbounds,
             })
         })
         .await??,
@@ -171,16 +198,131 @@ pub async fn index(
     State(state): State<AppState>,
     _auth: Operator,
 ) -> ResponseResult<Json<Vec<UserView>>> {
-    let access = state.access().snapshot().await;
+    let access = state.access_snapshot().await;
     let host = public_host(&state).await;
     let prefix = state.settings().subscription_prefix().await?;
     let collections: BTreeSet<String> = state.collections().list().await.into_keys().collect();
+    let mut local = access.clone();
+    for user in local.users.values_mut() {
+        user.inbounds.retain(|entry| entry.host.is_none());
+    }
     let store = state.singbox();
+    let local_prefix = prefix.clone();
+    let local_collections = collections.clone();
+    let mut result = tokio::task::spawn_blocking(move || {
+        views(&store, &local, &host, &local_prefix, &local_collections)
+    })
+    .await??;
+    for view in &mut result {
+        view.inbounds = access.users[&view.name].inbounds.clone();
+    }
+    for node in state.peers().hosts().await {
+        if node.mode != crate::state::peers::Mode::Edge {
+            continue;
+        }
+        let scoped = state.for_agent(node.id).await?;
+        let projected = scoped.access_snapshot().await;
+        if projected.grants().is_empty() {
+            continue;
+        }
+        let runtime = agent_runtime(&state, &scoped, &node).await;
+        let store = scoped.singbox();
+        let host = public_host(&scoped).await;
+        let prefix = prefix.clone();
+        let collections = collections.clone();
+        let (remote, selected) = tokio::task::spawn_blocking(move || -> Result<_, Error> {
+            Ok((
+                views(&store, &projected, &host, &prefix, &collections)?,
+                store.config()?,
+            ))
+        })
+        .await??;
+        for view in remote {
+            if let Some(target) = result.iter_mut().find(|user| user.name == view.name) {
+                for mut grant in view.grants {
+                    grant.host = Some(node.id);
+                    grant.host_name = Some(node.name.clone());
+                    if grant.state.is_some() {
+                        grant.state = Some(agent_grant_state(&selected, &grant.config, runtime));
+                    }
+                    target.grants.push(grant);
+                }
+            }
+        }
+    }
+    for view in &mut result {
+        for entry in &view.inbounds {
+            if entry.host.is_some()
+                && !view.grants.iter().any(|grant| {
+                    grant.host == entry.host
+                        && grant.config == entry.config
+                        && grant.inbound == entry.inbound
+                })
+            {
+                view.grants.push(GrantView {
+                    host_name: None,
+                    host: entry.host,
+                    config: entry.config.clone(),
+                    inbound: entry.inbound.clone(),
+                    state: None,
+                    export: Export {
+                        reason: Some("host: the Agent is not configured".to_string()),
+                        ..Export::default()
+                    },
+                });
+            }
+        }
+    }
+    Ok(Json(result))
+}
 
-    Ok(Json(
-        tokio::task::spawn_blocking(move || views(&store, &access, &host, &prefix, &collections))
-            .await??,
+async fn agent_runtime(
+    state: &AppState,
+    scoped: &AppState,
+    host: &crate::state::peers::Host,
+) -> Option<(bool, bool)> {
+    let response = crate::handlers::peers::call(
+        state,
+        host,
+        "GET".into(),
+        "/cores/sing-box".into(),
+        None,
+        None,
+    )
+    .await
+    .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let bytes = axum::body::to_bytes(response.into_body(), crate::state::peers::REPLY_LIMIT)
+        .await
+        .ok()?;
+    let runtime: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let expected = crate::handlers::agents::deployment(scoped)
+        .await
+        .ok()
+        .and_then(|snapshot| snapshot.id().ok());
+    Some((
+        runtime["running"].as_bool()?,
+        expected
+            .as_deref()
+            .is_some_and(|expected| Some(expected) == runtime["applied"].as_str()),
     ))
+}
+
+fn agent_grant_state(selected: &str, config: &str, runtime: Option<(bool, bool)>) -> Applied {
+    let Some((running, applied)) = runtime else {
+        return Applied::Unknown;
+    };
+    if selected != config {
+        Applied::Unused
+    } else if !running {
+        Applied::Stopped
+    } else if applied {
+        Applied::Applied
+    } else {
+        Applied::Pending
+    }
 }
 
 fn views(
@@ -237,6 +379,7 @@ fn views(
 
 fn grant_view(inbounds: &[InboundUsers], entry: Entry, user: &str) -> GrantView {
     let refused = |reason: String| GrantView {
+        host_name: None,
         host: entry.host,
         config: entry.config.clone(),
         inbound: entry.inbound.clone(),
@@ -261,6 +404,7 @@ fn grant_view(inbounds: &[InboundUsers], entry: Entry, user: &str) -> GrantView 
     };
 
     GrantView {
+        host_name: None,
         state: Some(managed.state),
         export: managed.export.clone(),
         host: entry.host,
@@ -276,6 +420,21 @@ pub async fn put(
     Path(name): Path<String>,
     Json(body): Json<UserBody>,
 ) -> ResponseResult<impl IntoResponse> {
+    for entry in &body.inbounds {
+        if let Some(id) = entry.host {
+            let host = state.peers().host(id).await?;
+            if host.mode != crate::state::peers::Mode::Edge {
+                return Err(Error::Document(
+                    "inbounds.host: expected an Edge Agent".to_string(),
+                ));
+            }
+            let scoped = state.for_agent(id).await?;
+            let local = Entry::local(&entry.config, &entry.inbound);
+            if let Some(reason) = placement(&scoped, &local).await?.reason() {
+                return Err(Error::Document(format!("inbounds.inbound: {reason}")));
+            }
+        }
+    }
     state
         .access()
         .put_user(&name, body.inbounds, body.collections)
@@ -358,7 +517,7 @@ pub(crate) async fn user_artifact(
     name: &str,
     format: Format,
 ) -> Result<Artifact, Error> {
-    let access = state.access().snapshot().await;
+    let access = state.access_snapshot().await;
     let user = access
         .users
         .get(name)
@@ -396,6 +555,54 @@ pub(crate) async fn user_artifact(
                 node,
             }),
             Err(_) => unexported += 1,
+        }
+    }
+
+    let hosts = state.peers().hosts().await;
+    unexported += user
+        .inbounds
+        .iter()
+        .filter(|entry| {
+            entry.host.is_some_and(|id| {
+                !hosts
+                    .iter()
+                    .any(|host| host.id == id && host.mode == crate::state::peers::Mode::Edge)
+            })
+        })
+        .count();
+    for node in hosts {
+        if node.mode != crate::state::peers::Mode::Edge {
+            continue;
+        }
+        let scoped = state.for_agent(node.id).await?;
+        let projected = scoped.access_snapshot().await;
+        let store = scoped.singbox();
+        let owner = name.to_owned();
+        let exported = tokio::task::spawn_blocking(move || -> Result<_, Error> {
+            let selected = store.config()?;
+            let document = store.config_document(&selected)?.value;
+            Ok(managed::nodes(
+                &document,
+                &selected,
+                &projected,
+                &owner,
+                Err("endpoint.address: an Agent requires an explicit public address"),
+            ))
+        })
+        .await??;
+        for (position, exported) in exported.into_iter().enumerate() {
+            match exported {
+                Ok(node_value) => entries.push(IndexEntry {
+                    id: node_value.id(),
+                    source: Source {
+                        provider: node.name.clone(),
+                        name: node_value.name.to_string(),
+                        position,
+                    },
+                    node: node_value,
+                }),
+                Err(_) => unexported += 1,
+            }
         }
     }
 
@@ -444,44 +651,63 @@ pub async fn endpoints(
     State(state): State<AppState>,
     _auth: Operator,
 ) -> ResponseResult<Json<EndpointsView>> {
-    let access = state.access().snapshot().await;
-    let public_host = public_host(&state).await.ok().map(|host| host.to_string());
+    let mut view = endpoint_view(&state).await?;
+    if state.target_host().is_none() {
+        for host in state.peers().hosts().await {
+            if host.mode != crate::state::peers::Mode::Edge {
+                continue;
+            }
+            let scoped = state.for_agent(host.id).await?;
+            let mut remote = endpoint_view(&scoped).await?;
+            for entry in &mut remote.entries {
+                entry.host = Some(host.id);
+                entry.host_name = Some(host.name.clone());
+            }
+            view.entries.extend(remote.entries);
+        }
+    }
+    Ok(Json(view))
+}
+
+async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
+    let access = state.access_snapshot().await;
+    let public_host = public_host(state).await.ok().map(|host| host.to_string());
     let store = state.singbox();
 
-    Ok(Json(
-        tokio::task::spawn_blocking(move || -> Result<EndpointsView, Error> {
-            let mut entries = Vec::new();
-            for name in store.configs()? {
-                let document = store.config_document(&name)?.value;
-                for inbound in document
-                    .get("inbounds")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(&[][..], Vec::as_slice)
-                {
-                    let Some(tag) = inbound.get("tag").and_then(serde_json::Value::as_str) else {
-                        // An inbound without a tag cannot be addressed at all,
-                        // so it has no address to store either.
-                        continue;
-                    };
-                    let at = Entry::local(&name, tag);
-                    let stored = access.endpoint(&at);
-                    entries.push(EndpointView {
-                        reason: managed::placement(&document, &at).reason(),
-                        config: name.clone(),
-                        inbound: tag.to_owned(),
-                        address: stored.and_then(|endpoint| endpoint.address.clone()),
-                        port: stored.and_then(|endpoint| endpoint.port),
-                    });
-                }
+    tokio::task::spawn_blocking(move || -> Result<EndpointsView, Error> {
+        let mut entries = Vec::new();
+        for name in store.configs()? {
+            let document = store.config_document(&name)?.value;
+            for inbound in document
+                .get("inbounds")
+                .and_then(serde_json::Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+            {
+                let Some(tag) = inbound.get("tag").and_then(serde_json::Value::as_str) else {
+                    // An inbound without a tag cannot be addressed at all,
+                    // so it has no address to store either.
+                    continue;
+                };
+                let at = Entry::local(&name, tag);
+                let stored = access.endpoint(&at);
+                entries.push(EndpointView {
+                    host: None,
+                    host_name: None,
+                    reason: managed::placement(&document, &at).reason(),
+                    config: name.clone(),
+                    inbound: tag.to_owned(),
+                    address: stored.and_then(|endpoint| endpoint.address.clone()),
+                    port: stored.and_then(|endpoint| endpoint.port),
+                });
             }
+        }
 
-            Ok(EndpointsView {
-                public_host,
-                entries,
-            })
+        Ok(EndpointsView {
+            public_host,
+            entries,
         })
-        .await??,
-    ))
+    })
+    .await?
 }
 
 /// Store or clear one inbound's address override.
@@ -491,7 +717,7 @@ pub async fn put_endpoint(
     Path((config, inbound)): Path<(String, String)>,
     Json(body): Json<EndpointBody>,
 ) -> ResponseResult<Json<EndpointView>> {
-    let access = state.access().snapshot().await;
+    let access = state.access_snapshot().await;
     let at = Entry::local(&config, &inbound);
     // An address for an inbound that is not there would never be read, so it is
     // refused where an operator can still fix it rather than stored quietly.
@@ -508,12 +734,13 @@ pub async fn put_endpoint(
         },
     };
     state
-        .access()
         .put_endpoint(&config, &inbound, endpoint.clone())
         .await?;
     tracing::debug!("Stored an address for {} :: {inbound}", config);
 
     Ok(Json(EndpointView {
+        host: state.target_host(),
+        host_name: None,
         config,
         inbound,
         address: endpoint.address,
@@ -527,7 +754,7 @@ pub async fn delete_endpoint(
     _auth: Operator,
     Path((config, inbound)): Path<(String, String)>,
 ) -> ResponseResult<impl IntoResponse> {
-    state.access().remove_endpoint(&config, &inbound).await?;
+    state.remove_endpoint(&config, &inbound).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }

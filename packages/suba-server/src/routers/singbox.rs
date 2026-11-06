@@ -15,13 +15,8 @@ use crate::{
 };
 
 pub fn route() -> Router<AppState> {
-    Router::new()
-        .route("/", get(singbox::index))
+    agent_route()
         .route("/", put(singbox::choose))
-        .route("/status", get(singbox::status))
-        .route("/status", put(singbox::act))
-        .route("/connections", get(observation::connections))
-        .route("/metrics", get(observation::metrics))
         .route(
             "/configs",
             get(singbox::configs).post(singbox::create_config),
@@ -45,6 +40,14 @@ pub fn route() -> Router<AppState> {
                 .put(singbox::write_entry)
                 .delete(singbox::delete_entry),
         )
+}
+
+pub fn agent_route() -> Router<AppState> {
+    Router::new()
+        .route("/", get(singbox::index))
+        .route("/status", get(singbox::status).put(singbox::act))
+        .route("/connections", get(observation::connections))
+        .route("/metrics", get(observation::metrics))
         .route("/versions", get(singbox::versions))
         .route(
             "/versions/{version}",

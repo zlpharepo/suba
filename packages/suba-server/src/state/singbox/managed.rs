@@ -144,6 +144,8 @@ pub(crate) enum Serving<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum State {
+    /// The node's runtime could not be verified.
+    Unknown,
     /// The running core has it.
     Applied,
     /// The running core has something else; a restart applies it.

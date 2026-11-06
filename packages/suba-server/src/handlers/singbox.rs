@@ -39,6 +39,8 @@ const PATIENCE: Duration = Duration::from_secs(10);
 /// The module: what the operator chose, and what state the core is in.
 #[derive(Debug, Serialize)]
 pub struct Core {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<String>,
     /// The version in use, when one is chosen.
     pub version: Option<String>,
     /// The configuration in use.
@@ -116,6 +118,7 @@ fn core_view(store: &SingboxStore, note: Option<String>) -> Result<Core, Error> 
     let settings = store.settings()?;
 
     Ok(Core {
+        applied: store.applied(),
         version: settings.version.map(|version| version.as_str().to_string()),
         config: store.config()?,
         privilege: settings.privilege,
@@ -147,10 +150,12 @@ pub struct Tail {
 }
 
 /// What to do with the process.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Action {
     pub action: Command,
+    #[serde(default)]
+    pub(crate) deployment: Option<crate::state::singbox::Deployment>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -172,6 +177,11 @@ pub async fn choose(
     _auth: Operator,
     Json(choose): Json<Choose>,
 ) -> ResponseResult<Json<Core>> {
+    if (state.is_agent() || state.target_host().is_some()) && !choose.collections.is_empty() {
+        return Err(Error::Document(
+            "collections: an Agent has no collection bindings".to_string(),
+        ));
+    }
     let store = state.singbox();
     let changes = Changes {
         version: choose.version,
@@ -213,6 +223,9 @@ pub async fn index(State(state): State<AppState>, _auth: Operator) -> ResponseRe
 /// so a draft can be repaired, but cannot become a runtime product or preview.
 /// The users are read here too, so one run sees one picture of them.
 pub(crate) async fn generated(state: &AppState) -> Result<Contributions, Error> {
+    if state.is_agent() {
+        return Ok(Contributions::default());
+    }
     let store = state.singbox();
     let selected = tokio::task::spawn_blocking(move || store.settings())
         .await??
@@ -227,7 +240,7 @@ pub(crate) async fn generated(state: &AppState) -> Result<Contributions, Error> 
         outbounds,
         skipped,
         unavailable,
-        access: state.access().snapshot().await,
+        access: state.access_snapshot().await,
     })
 }
 
@@ -313,25 +326,37 @@ pub async fn act(
     Query(query): Query<Tail>,
     Json(action): Json<Action>,
 ) -> ResponseResult<Json<Running>> {
+    if action.deployment.is_some() && (!state.is_agent() || action.action == Command::Stop) {
+        return Err(Error::Document(
+            "deployment: only an Agent start or restart accepts a runtime snapshot".to_string(),
+        ));
+    }
     let store = state.singbox();
     let tail = query.tail.unwrap_or(run::LOG_LINES).min(run::LOG_LINES);
     let generated = match action.action {
+        _ if action.deployment.is_some() => Contributions::default(),
         Command::Stop => Contributions::default(),
         Command::Start | Command::Restart => generated(&state).await?,
     };
 
     Ok(Json(
         tokio::task::spawn_blocking(move || -> Result<Running, Error> {
-            match action.action {
-                Command::Start => {
-                    store.start(&generated)?;
-                }
-                Command::Stop => store.stop(PATIENCE)?,
-                Command::Restart => {
-                    store.restart(&generated, PATIENCE)?;
+            if let Some(deployment) = action.deployment {
+                store.apply_deployment(
+                    deployment,
+                    (action.action == Command::Restart).then_some(PATIENCE),
+                )?;
+            } else {
+                match action.action {
+                    Command::Start => {
+                        store.start(&generated)?;
+                    }
+                    Command::Stop => store.stop(PATIENCE)?,
+                    Command::Restart => {
+                        store.restart(&generated, PATIENCE)?;
+                    }
                 }
             }
-
             let status: Status = store.status();
 
             Ok(Running {
@@ -1210,14 +1235,23 @@ mod releases_tests {
     }
 }
 
-/// The schema of the version in use: the whole document, as it was written by
-/// that version's own binary.
+#[derive(Default, Deserialize)]
+pub struct VersionChoice {
+    pub version: Option<String>,
+}
+
+/// Querying an installed version lets the manager validate a selection before applying it.
 pub async fn schema(
     State(state): State<AppState>,
     _auth: Operator,
+    Query(choice): Query<VersionChoice>,
 ) -> ResponseResult<impl IntoResponse> {
     let store = state.singbox();
-    let file = tokio::task::spawn_blocking(move || store.schema_bytes()).await??;
+    let file = tokio::task::spawn_blocking(move || match choice.version {
+        Some(version) => store.schema_for(&Version::from_tag(&version)),
+        None => store.schema_bytes(),
+    })
+    .await??;
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1262,6 +1296,7 @@ pub struct Generated {
 pub async fn generate(
     State(state): State<AppState>,
     _auth: Operator,
+    Query(choice): Query<VersionChoice>,
     Json(asked): Json<Generation>,
 ) -> ResponseResult<Json<Generated>> {
     let store = state.singbox();
@@ -1297,8 +1332,13 @@ pub async fn generate(
     };
 
     let command = asked.command;
-    let output =
-        tokio::task::spawn_blocking(move || store.generate(command, argument.as_deref())).await??;
+    let output = tokio::task::spawn_blocking(move || match choice.version {
+        Some(version) => {
+            store.generate_for(&Version::from_tag(&version), command, argument.as_deref())
+        }
+        None => store.generate(command, argument.as_deref()),
+    })
+    .await??;
 
     Ok(Json(Generated {
         command: command.as_str().to_string(),

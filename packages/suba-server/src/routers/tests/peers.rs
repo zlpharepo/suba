@@ -402,3 +402,150 @@ async fn remote_config_writes_preserve_etags_and_do_not_touch_local_documents() 
         signer(&local).identity.id
     );
 }
+
+#[cfg(feature = "singbox-core")]
+#[tokio::test]
+async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_and_survives_restart(
+) {
+    let manager = Server::start().await;
+    let root = manager.root.join("agent");
+    let config_dir = root.join("config");
+    crate::fs::ensure_dir(&config_dir).unwrap();
+    for name in ["providers", "collections", "users", "endpoints"] {
+        std::fs::write(
+            config_dir.join(crate::config::config_name(name)),
+            "invalid document",
+        )
+        .unwrap();
+    }
+    let make_config = || crate::ServerConfig {
+        listen: "127.0.0.1".parse().unwrap(),
+        port: url::Url::parse(&manager.base).unwrap().port().unwrap(),
+        config_dir: config_dir.clone(),
+        data_dir: root.join("data"),
+        privileged: Default::default(),
+    };
+    let missing = crate::SubaServer::edge_agent(
+        make_config(),
+        crate::AgentOptions {
+            manager_api_url: format!("{}/api", manager.base),
+            token: None,
+        },
+    )
+    .await;
+    assert!(matches!(missing, Err(crate::Error::PeerRequest { .. })));
+    let invitation = body(
+        post(
+            &manager,
+            "/api/peers/invitations",
+            json!({
+                "name": "Example Agent", "endpoint": manager.base, "mode": "edge",
+            }),
+        )
+        .await,
+    )
+    .await;
+    let token = format!(
+        "{}.{}",
+        invitation["id"].as_str().unwrap(),
+        invitation["secret"].as_str().unwrap()
+    );
+    let agent = crate::SubaServer::edge_agent(
+        make_config(),
+        crate::AgentOptions {
+            manager_api_url: format!("{}/api", manager.base),
+            token: Some(token.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(agent.tcp.is_none());
+    let identity = agent
+        .state
+        .settings()
+        .existing_peer_signer()
+        .await
+        .unwrap()
+        .identity;
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(agent.serve_until(
+        async {
+            let _ = stopped.await;
+        },
+        std::time::Duration::from_secs(2),
+    ));
+    let prefix = format!("/api/hosts/{}", identity.id);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let response = manager
+                .authed(Method::GET, &format!("{prefix}/system/info"))
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 200 {
+                let info = body(response).await;
+                assert_eq!(info["administrator_configured"], false);
+                assert_eq!(info["formats"], json!([]));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for path in ["providers", "collections", "inbounds/users"] {
+        assert_eq!(
+            manager
+                .authed(Method::GET, &format!("{prefix}/{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        get(&manager, &format!("{prefix}/cores/sing-box/metrics")).await["state"],
+        "stopped"
+    );
+    stop.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let restarted = crate::SubaServer::edge_agent(
+        make_config(),
+        crate::AgentOptions {
+            manager_api_url: format!("{}/api", manager.base),
+            token: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(restarted.tcp.is_none());
+    assert_eq!(
+        restarted
+            .state
+            .settings()
+            .existing_peer_signer()
+            .await
+            .unwrap()
+            .identity,
+        identity
+    );
+    let saved =
+        std::fs::read_to_string(config_dir.join(crate::config::config_name("peers"))).unwrap();
+    assert!(!saved.contains(&token));
+    assert!(!saved.contains(invitation["secret"].as_str().unwrap()));
+    let changed = crate::SubaServer::edge_agent(
+        make_config(),
+        crate::AgentOptions {
+            manager_api_url: "http://127.0.0.1:1/api".into(),
+            token: None,
+        },
+    )
+    .await;
+    assert!(matches!(changed, Err(crate::Error::PeerConflict { .. })));
+}

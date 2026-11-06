@@ -217,6 +217,7 @@ struct ReleasesCache {
 }
 
 /// A schema, as it was read: which version's, which bytes, and their hash.
+#[derive(Clone)]
 pub(crate) struct SchemaBytes {
     pub version: Version,
     pub sha256: String,
@@ -272,8 +273,31 @@ fn runtime_failure(error: &Error) -> &'static str {
     }
 }
 
-/// The sing-box module.
+/// One complete native runtime snapshot, containing only final inbound credentials.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Deployment {
+    pub settings: Settings,
+    pub document: Value,
+}
+
+impl Deployment {
+    pub(crate) fn id(&self) -> Result<String, Error> {
+        Ok(core::sha256_hex(&serde_json::to_vec(self)?))
+    }
+}
+
+struct Prepared {
+    settings: Settings,
+    version: Version,
+    config: Value,
+    binary: PathBuf,
+    work: PathBuf,
+    drop_to: Option<(u32, u32)>,
+}
+
 pub(crate) struct SingboxStore {
+    remote: bool,
+    remote_schema: Mutex<Option<SchemaBytes>>,
     /// The config directory, which the settings live in.
     config_dir: PathBuf,
     /// `<config>/sing-box`, which the operator's configuration lives in.
@@ -293,10 +317,11 @@ pub(crate) struct SingboxStore {
     started: Mutex<Option<Version>>,
     /// Observation follows the launched product even after selection or authored edits change.
     observed_run: Mutex<Option<ObservedRun>>,
+    applied: Mutex<Option<String>>,
     /// The last schema read, with the hash it was read at.
     ///
     /// A schema is addressed by its bytes (I3), so holding one costs nothing but
-    /// memory and saves parsing 445 KB on every form save and every start.
+    /// memory and saves parsing 445 KB on every form save.
     schemas: Mutex<Option<(String, Arc<Schema>)>>,
     installs: Mutex<HashMap<Version, InstallationTask>>,
     lifecycle: Mutex<()>,
@@ -317,6 +342,8 @@ impl SingboxStore {
         identity: Identity,
     ) -> Self {
         Self {
+            remote: false,
+            remote_schema: Mutex::new(None),
             config_dir: config_dir.to_path_buf(),
             document_dir: config_dir.join(DOCUMENT_DIR),
             dirs: Dirs::new(data_dir),
@@ -326,6 +353,7 @@ impl SingboxStore {
             runner: Arc::new(Runner::new()),
             started: Mutex::new(None),
             observed_run: Mutex::new(None),
+            applied: Mutex::new(None),
             schemas: Mutex::new(None),
             installs: Mutex::new(HashMap::new()),
             lifecycle: Mutex::new(()),
@@ -335,6 +363,127 @@ impl SingboxStore {
             phase: Mutex::new(None),
             failed_version: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn remote(
+        config_dir: &Path,
+        data_dir: &Path,
+        http: reqwest::Client,
+        identity: Identity,
+    ) -> Self {
+        let mut store = Self::new(config_dir, data_dir, http, identity);
+        store.remote = true;
+        store
+    }
+
+    pub(crate) fn has_remote_schema(&self, version: &Version) -> bool {
+        self.remote_schema
+            .lock()
+            .expect("agent schema")
+            .as_ref()
+            .is_some_and(|schema| &schema.version == version)
+    }
+
+    /// A fresh manager adopts the node's installed version without undoing an explicit clear.
+    pub(crate) fn bootstrap_version(&self, version: &Version) -> Result<Settings, Error> {
+        let _selection = self.selection.lock().expect("current selection");
+        if !crate::config::config_path(&self.config_dir, SETTINGS_BASENAME).is_file() {
+            let settings = Settings {
+                version: Some(version.clone()),
+                ..self.settings()?
+            };
+            self.write_settings(&settings)?;
+        }
+        self.settings()
+    }
+
+    pub(crate) fn accept_schema(&self, version: Version, body: Vec<u8>) -> Result<(), Error> {
+        Schema::read(&body).map_err(|error| Error::Schema(error.to_string()))?;
+        *self.remote_schema.lock().expect("agent schema") = Some(SchemaBytes {
+            version,
+            sha256: core::sha256_hex(&body),
+            body,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn deployment(&self) -> Result<Option<Deployment>, Error> {
+        fs::read_to_string(&self.config_dir, "deployment.json")?
+            .map(|body| serde_json::from_str(&body).map_err(Error::from))
+            .transpose()
+    }
+
+    pub(crate) fn applied(&self) -> Option<String> {
+        self.applied.lock().expect("applied deployment").clone()
+    }
+
+    pub(crate) fn restore_deployment(&self) -> Result<(), Error> {
+        if let Some(deployment) = self.deployment()? {
+            self.write_settings(&deployment.settings)?;
+            let name = deployment
+                .settings
+                .config
+                .as_deref()
+                .unwrap_or(DEFAULT_CONFIG);
+            config_name(name)?;
+            fs::ensure_dir(&self.document_dir)?;
+            fs::write_atomic(
+                &self.document_dir,
+                &document_file(name),
+                serde_json::to_vec_pretty(&deployment.document)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_deployment(
+        &self,
+        deployment: Deployment,
+        restart: Option<Duration>,
+    ) -> Result<u32, Error> {
+        let _lifecycle = self.lifecycle.lock().expect("core lifecycle");
+        let _selection = self.selection.lock().expect("current selection");
+        let _writing = self.writing.lock().expect("the configuration");
+        let attempted = deployment.settings.version.clone();
+        *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Starting);
+        let result = (|| -> Result<u32, Error> {
+            self.ensure_not_shutting_down()?;
+            if self.remote || !deployment.settings.collections.is_empty() {
+                return Err(Error::Document(
+                    "deployment: expected a native Agent configuration".to_string(),
+                ));
+            }
+            let name = deployment
+                .settings
+                .config
+                .as_deref()
+                .unwrap_or(DEFAULT_CONFIG);
+            config_name(name)?;
+            let native = suba_singbox::assemble::assemble(&deployment.document, &[])
+                .map_err(|error| Error::Document(error.to_string()))?;
+            let prepared = self.prepare(deployment.settings.clone(), native.config)?;
+            let pid = self.launch_prepared(prepared, restart)?;
+            fs::ensure_dir(&self.config_dir)?;
+            fs::write_atomic(
+                &self.config_dir,
+                "deployment.json",
+                serde_json::to_vec(&deployment)?,
+            )?;
+            self.write_settings(&deployment.settings)?;
+            fs::ensure_dir(&self.document_dir)?;
+            fs::write_atomic(
+                &self.document_dir,
+                &document_file(name),
+                serde_json::to_vec_pretty(&deployment.document)?,
+            )?;
+            Ok(pid)
+        })();
+        *self.phase.lock().expect("runtime phase") =
+            result.as_ref().err().map(|error| RuntimePhase::Failed {
+                error: runtime_failure(error),
+            });
+        *self.failed_version.lock().expect("failed version") = result.as_ref().err().and(attempted);
+        result
     }
 
     pub(crate) fn installation_task(&self, version: &Version) -> Option<InstallationTask> {
@@ -748,7 +897,7 @@ impl SingboxStore {
         let _selection = self.selection.lock().expect("current selection");
 
         if let Some(version) = &settings.version {
-            if !self.dirs.metadata(version).exists() {
+            if !self.remote && !self.dirs.metadata(version).exists() {
                 return Err(Error::Singbox(suba_singbox::core::Error::NotInstalled {
                     version: version.clone(),
                 }));
@@ -927,17 +1076,39 @@ impl SingboxStore {
     /// Ask the version in use for something it generates.
     pub(crate) fn generate(&self, kind: Generate, argument: Option<&str>) -> Result<String, Error> {
         let version = self.current()?.ok_or(Error::NoVersion)?;
+        self.generate_for(&version, kind, argument)
+    }
 
-        Ok(install::generate(&self.dirs, &version, kind, argument)?)
+    pub(crate) fn generate_for(
+        &self,
+        version: &Version,
+        kind: Generate,
+        argument: Option<&str>,
+    ) -> Result<String, Error> {
+        Ok(install::generate(&self.dirs, version, kind, argument)?)
     }
 
     /// The schema of the version in use, as it is on disk.
     pub(crate) fn schema_bytes(&self) -> Result<SchemaBytes, Error> {
         let version = self.current()?.ok_or(Error::NoVersion)?;
-        let body = std::fs::read(self.dirs.schema(&version))?;
+        if self.remote {
+            return self
+                .remote_schema
+                .lock()
+                .expect("agent schema")
+                .as_ref()
+                .filter(|schema| schema.version == version)
+                .cloned()
+                .ok_or(Error::PeerUnavailable);
+        }
+        self.schema_for(&version)
+    }
+
+    pub(crate) fn schema_for(&self, version: &Version) -> Result<SchemaBytes, Error> {
+        let body = std::fs::read(self.dirs.schema(version))?;
         let sha256 = core::sha256_hex(&body);
 
-        let record = self.record(&version)?;
+        let record = self.record(version)?;
         if record.schema_sha256 != sha256 {
             return Err(Error::Singbox(suba_singbox::core::Error::Hash {
                 expected: record.schema_sha256,
@@ -946,7 +1117,7 @@ impl SingboxStore {
         }
 
         Ok(SchemaBytes {
-            version,
+            version: version.clone(),
             sha256,
             body,
         })
@@ -991,6 +1162,21 @@ impl SingboxStore {
     /// collections contributed.
     pub(crate) fn assemble(&self, generated: &Contributions) -> Result<Assembled, Error> {
         assemble_document(&self.current_document()?.value, &self.config()?, generated)
+    }
+
+    pub(crate) fn runtime_snapshot(&self, generated: &Contributions) -> Result<Deployment, Error> {
+        let _selection = self.selection.lock().expect("current selection");
+        let _writing = self.writing.lock().expect("the configuration");
+        let settings = self.settings()?;
+        if !settings.collections.is_empty() {
+            return Err(Error::Document(
+                "collections: an Agent has no collection bindings".to_string(),
+            ));
+        }
+        let name = settings.config.as_deref().unwrap_or(DEFAULT_CONFIG);
+        let document =
+            assemble_document(&self.config_document(name)?.value, name, generated)?.config;
+        Ok(Deployment { settings, document })
     }
 
     /// What the core last started with, while it runs.
@@ -1076,6 +1262,11 @@ impl SingboxStore {
         generated: &Contributions,
         restart: Option<Duration>,
     ) -> Result<u32, Error> {
+        if self.remote {
+            return Err(Error::Document(
+                "agent: a managed configuration cannot run on the manager".to_string(),
+            ));
+        }
         let settings = self.settings()?;
         if settings.collections != generated.selected {
             return Err(Error::Document(
@@ -1083,23 +1274,43 @@ impl SingboxStore {
                     .to_string(),
             ));
         }
-        // Asked before the version is: how a core is run is a property of this
-        // instance, and an operator who set that has to be told about it rather
-        // than about something the module has not got to yet. Nothing is
-        // written either way, so a refused start leaves the document alone.
-        let drop_to = self.startable()?;
-        let version = settings.version.ok_or(Error::NoVersion)?;
-
+        self.startable()?;
         let assembled = self.assemble(generated)?;
-        let (schema, _) = self.parsed_schema()?;
-        if let Verdict::Failed(fault) = schema.validate(&assembled.config) {
+        let prepared = self.prepare(settings, assembled.config)?;
+        self.launch_prepared(prepared, restart)
+    }
+
+    fn prepare(&self, settings: Settings, config: Value) -> Result<Prepared, Error> {
+        let drop_to = self.run_as(settings.privilege)?;
+        let version = settings.version.clone().ok_or(Error::NoVersion)?;
+        let file = self.schema_for(&version)?;
+        let schema = Schema::read(&file.body).map_err(|error| Error::Schema(error.to_string()))?;
+        if let Verdict::Failed(fault) = schema.validate(&config) {
             return Err(Error::Document(format!("{}: {}", fault.path, fault.reason)));
         }
-
         let binary = std::fs::canonicalize(self.dirs.binary(&version))?;
         fs::ensure_dir(self.dirs.work())?;
         let work = std::fs::canonicalize(self.dirs.work())?;
-        self.check_native(&binary, &assembled.config, &work, drop_to)?;
+        self.check_native(&binary, &config, &work, drop_to)?;
+        Ok(Prepared {
+            settings,
+            version,
+            config,
+            binary,
+            work,
+            drop_to,
+        })
+    }
+
+    fn launch_prepared(&self, prepared: Prepared, restart: Option<Duration>) -> Result<u32, Error> {
+        let Prepared {
+            settings,
+            version,
+            config,
+            binary,
+            work,
+            drop_to,
+        } = prepared;
         self.ensure_not_shutting_down()?;
         if let Some(patience) = restart {
             self.stop_locked(patience)?;
@@ -1107,30 +1318,31 @@ impl SingboxStore {
         } else if let Some(pid) = self.runner.status().pid {
             return Err(core::Error::Running { pid }.into());
         }
-        // Preflight and launch share this exact expansion, even on restart.
-        self.write_product(&assembled.config)?;
-        let config = std::fs::canonicalize(self.dirs.config().join(CONFIG))?;
-
-        let mut command = run::command(&binary, &config, &work);
+        self.write_product(&config)?;
+        let path = std::fs::canonicalize(self.dirs.config().join(CONFIG))?;
+        let mut command = run::command(&binary, &path, &work);
         match drop_to {
             Some((uid, gid)) => tracing::info!("starting {version} as {uid}:{gid}"),
-            // Said out loud because it is the one thing an operator cannot see
-            // from the page: a core that never became root cannot create an
-            // interface, and its own log is the only place that shows up.
             None => tracing::info!("starting {version} with this instance's privileges"),
         }
         apply_identity(&mut command, drop_to);
-
         self.observed_run.lock().expect("observed run").take();
         let pid = self.runner.spawn(command)?;
         *self.started.lock().expect("the started version") = Some(version);
         self.runner.confirm_start(pid, STARTUP_GRACE)?;
+        *self.applied.lock().expect("applied deployment") = Some(
+            Deployment {
+                settings: settings.clone(),
+                document: config.clone(),
+            }
+            .id()?,
+        );
         *self.observed_run.lock().expect("observed run") = Some(ObservedRun::new(
             pid,
             settings
                 .config
                 .unwrap_or_else(|| DEFAULT_CONFIG.to_string()),
-            &assembled.config,
+            &config,
         ));
         Ok(pid)
     }
@@ -2451,7 +2663,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let address = server.tcp.local_addr().unwrap();
+        let address = server.tcp.as_ref().unwrap().local_addr().unwrap();
         let store = server.state.singbox();
         store.start(&Contributions::default()).unwrap();
         wait_for(&store, "started");

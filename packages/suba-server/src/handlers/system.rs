@@ -61,7 +61,8 @@ pub async fn ping() -> &'static str {
 pub async fn status(State(state): State<AppState>) -> Json<SystemStatus> {
     Json(SystemStatus {
         version: VERSION.to_string(),
-        administrator_configured: state.settings().administrator().await.is_some(),
+        administrator_configured: !state.is_agent()
+            && state.settings().administrator().await.is_some(),
     })
 }
 
@@ -80,8 +81,13 @@ pub async fn metrics(
 pub async fn info(_auth: Operator, State(state): State<AppState>) -> Json<SystemInfo> {
     Json(SystemInfo {
         version: VERSION.to_string(),
-        administrator_configured: state.settings().administrator().await.is_some(),
-        formats: formats(),
+        administrator_configured: !state.is_agent()
+            && state.settings().administrator().await.is_some(),
+        formats: if state.is_agent() {
+            Vec::new()
+        } else {
+            formats()
+        },
     })
 }
 

@@ -1,8 +1,9 @@
-//! Direct peer trust is separate from administrator sessions and remote data.
+//! Machine trust is separate from administrator sessions and resource ownership.
 //!
 //! Only public identities and connection addresses persist. Invitations and
 //! replay challenges expire in memory; restarting invalidates them. A peer
 //! proof authorizes a bounded resource router, never login or further delegation.
+//! Edge identities can establish sessions but cannot operate manager resources.
 
 pub(crate) mod edge;
 mod identity;
@@ -201,6 +202,57 @@ pub(crate) struct Peers {
 }
 
 impl Peers {
+    pub(crate) async fn pair_agent(
+        &self,
+        signer: &IdentitySigner,
+        endpoint: &str,
+        token: &str,
+    ) -> Result<EdgeUpstream, Error> {
+        let (id, secret) = token.split_once('.').ok_or(Error::PeerRequest {
+            reason: "agent-token: expected an invitation identifier and secret",
+        })?;
+        let id = Uuid::parse_str(id).map_err(|_| Error::PeerRequest {
+            reason: "agent-token: invalid invitation identifier",
+        })?;
+        if secret.len() != 64 || !secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Error::PeerRequest {
+                reason: "agent-token: invalid invitation secret",
+            });
+        }
+        // HTTPS authenticates the bootstrap endpoint; the signed challenge
+        // supplies the identity pinned by the existing invitation protocol.
+        let challenge: Signed<Challenge> = self
+            .post(
+                endpoint,
+                "challenges",
+                &ChallengeRequest {
+                    actor: signer.identity.clone(),
+                    invitation: Some(id),
+                },
+            )
+            .await?;
+        challenge.verify("challenge", &challenge.payload.target)?;
+        if challenge.payload.actor != signer.identity
+            || challenge.payload.purpose != Purpose::EdgePair
+        {
+            return Err(Error::Unauthorized);
+        }
+        self.join_edge(
+            signer,
+            Invitation {
+                version: 1,
+                id,
+                endpoint: endpoint.to_string(),
+                identity: challenge.payload.target,
+                secret: secret.to_string(),
+                expires_at: challenge.payload.expires_at,
+                mode: Mode::Edge,
+            },
+            None,
+        )
+        .await
+    }
+
     pub(crate) fn load(config: &Path) -> Result<Self, Error> {
         Ok(Self {
             file: Persisted::load(config, "peers")?,
@@ -288,7 +340,10 @@ impl Peers {
     pub(crate) async fn remove_host(&self, id: Uuid) -> Result<(), Error> {
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
-        file.hosts.remove(&id).ok_or(Error::PeerNotFound)?;
+        let host = file.hosts.remove(&id).ok_or(Error::PeerNotFound)?;
+        if host.mode == Mode::Edge {
+            file.trusted.remove(&id);
+        }
         locked.commit(file).await?;
         self.edge.disconnect(id);
         Ok(())
@@ -415,6 +470,15 @@ impl Peers {
         };
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
+        if file
+            .hosts
+            .get(&actor.id)
+            .is_some_and(|host| host.mode != mode)
+        {
+            return Err(Error::PeerConflict {
+                reason: "host.mode: this identity is paired in another mode",
+            });
+        }
         file.trusted.insert(actor.id, trusted);
         if mode == Mode::Edge {
             // The manager keeps the node it invited so it can dial it back over
@@ -452,14 +516,30 @@ impl Peers {
             &signer.identity,
             Purpose::Request,
         )?;
-        self.require_trusted(&proof.payload.challenge.actor).await?;
+        self.require_resource_operator(&proof.payload.challenge.actor)
+            .await?;
         Ok(PeerGrant {
             actor: proof.payload.challenge.actor.clone(),
         })
     }
 
     pub(crate) async fn allows(&self, grant: &PeerGrant) -> Result<(), Error> {
-        self.require_trusted(&grant.actor).await
+        self.require_resource_operator(&grant.actor).await
+    }
+
+    async fn require_resource_operator(&self, actor: &Identity) -> Result<(), Error> {
+        if self
+            .file
+            .read(|file| {
+                file.hosts
+                    .get(&actor.id)
+                    .is_some_and(|host| host.mode == Mode::Edge)
+            })
+            .await
+        {
+            return Err(Error::Unauthorized);
+        }
+        self.require_trusted(actor).await
     }
 
     /// A manager's own inbound side: prove an agent is the one this instance invited,
@@ -740,6 +820,14 @@ fn proxy_url(value: &str) -> Result<Option<String>, Error> {
         return Err(invalid());
     }
     Ok(Some(url.as_str().trim_end_matches('/').to_string()))
+}
+
+pub(crate) fn manager_endpoint(value: &str) -> Result<String, Error> {
+    let value = value.trim_end_matches('/');
+    let base = value.strip_suffix("/api").ok_or(Error::PeerRequest {
+        reason: "manager-api-url: expected an API base URL ending in /api",
+    })?;
+    endpoint(base)
 }
 
 pub(crate) fn endpoint(value: &str) -> Result<String, Error> {

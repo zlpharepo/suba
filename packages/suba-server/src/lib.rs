@@ -1,3 +1,4 @@
+mod agent;
 mod config;
 mod dto;
 mod error;
@@ -11,6 +12,7 @@ mod state;
 mod store;
 pub mod tracing;
 
+pub use agent::AgentOptions;
 pub(crate) use config::Claims;
 pub use config::{ConfigError, ListenAddr, ServerConfig};
 pub use error::{Error, HttpError};
@@ -19,7 +21,7 @@ pub use state::AppState;
 
 pub struct SubaServer {
     state: AppState,
-    tcp: tokio::net::TcpListener,
+    tcp: Option<tokio::net::TcpListener>,
 }
 
 impl SubaServer {
@@ -27,7 +29,21 @@ impl SubaServer {
         let tcp = tokio::net::TcpListener::bind(config.listen_addr()).await?;
         let state = AppState::build(&config).await?;
 
-        Ok(Self { state, tcp })
+        Ok(Self {
+            state,
+            tcp: Some(tcp),
+        })
+    }
+
+    pub async fn edge_agent(config: ServerConfig, options: AgentOptions) -> Result<Self, Error> {
+        let state = AppState::build_agent(&config).await?;
+        agent::pair(&state, options).await?;
+        #[cfg(feature = "singbox-core")]
+        {
+            let store = state.singbox();
+            tokio::task::spawn_blocking(move || store.restore_deployment()).await??;
+        }
+        Ok(Self { state, tcp: None })
     }
 
     pub async fn serve(self) -> Result<(), Error> {
@@ -52,6 +68,10 @@ impl SubaServer {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
         drain_timeout: std::time::Duration,
     ) -> Result<(), Error> {
+        if self.state.is_agent() {
+            return self.serve_agent_until(shutdown).await;
+        }
+        let tcp = self.tcp.expect("manager listener");
         let router = routers::AppRouter::route(self.state.web_dir()).with_state(self.state.clone());
 
         // Providers start refreshing as soon as the server does, so a
@@ -61,18 +81,16 @@ impl SubaServer {
         let stopping = self.state.singbox();
         #[cfg(feature = "singbox-core")]
         let observing = tokio::spawn(self.state.observation().run(self.state.singbox()));
-        // The edge node connection is one task per process, not per request.
-        let edging = tokio::spawn(crate::state::peers::edge::run(self.state.clone()));
 
         // After the listeners and the observation loop are up, so a core that
         // starts here is one the rest of the instance can already serve.
         #[cfg(feature = "singbox-core")]
         let starting = tokio::spawn(handlers::singbox::autostart(self.state.clone()));
 
-        tracing::info!("SubA server running on http://{}", self.tcp.local_addr()?);
+        tracing::info!("SubA server running on http://{}", tcp.local_addr()?);
         let (notified, signal) = tokio::sync::oneshot::channel();
         let serving = async move {
-            axum::serve(self.tcp, router.into_make_service())
+            axum::serve(tcp, router.into_make_service())
                 .with_graceful_shutdown(async move {
                     shutdown.await;
                     #[cfg(feature = "singbox-core")]
@@ -89,8 +107,6 @@ impl SubaServer {
         refresher.abort();
         let _ = refresher.await;
         self.state.peers().edge.shutdown();
-        edging.abort();
-        let _ = edging.await;
         #[cfg(feature = "singbox-core")]
         {
             observing.abort();
@@ -135,5 +151,31 @@ impl SubaServer {
         #[cfg(feature = "singbox-core")]
         stopped.await??;
         Ok(served?)
+    }
+
+    async fn serve_agent_until(
+        self,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), Error> {
+        let edging = tokio::spawn(state::peers::edge::run(self.state.clone()));
+        #[cfg(feature = "singbox-core")]
+        let observing = tokio::spawn(self.state.observation().run(self.state.singbox()));
+        #[cfg(feature = "singbox-core")]
+        let starting = tokio::spawn(handlers::singbox::autostart(self.state.clone()));
+        shutdown.await;
+        self.state.peers().edge.shutdown();
+        edging.abort();
+        let _ = edging.await;
+        #[cfg(feature = "singbox-core")]
+        {
+            self.state.singbox().begin_shutdown();
+            observing.abort();
+            let _ = observing.await;
+            let _ = starting.await;
+            let store = self.state.singbox();
+            tokio::task::spawn_blocking(move || store.shutdown(std::time::Duration::from_secs(10)))
+                .await??;
+        }
+        Ok(())
     }
 }

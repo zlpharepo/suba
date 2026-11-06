@@ -10,6 +10,8 @@
 //! so exposing one inbound's credential does not reveal another's. Changes
 //! to grants persist their relationships without storing derived credentials.
 //! A new secret replaces all of a user's credentials at once.
+//! Agent projections bind a host-specific key first, preserving local credentials
+//! while separating otherwise identical configuration names and inbound tags.
 //!
 //! **Addresses live beside the identity, not in the core's document.** sing-box
 //! refuses a field it does not know, so the address a client dials is kept here
@@ -125,6 +127,28 @@ pub(crate) struct Grant {
 }
 
 impl Access {
+    pub(crate) fn for_host(mut self, host: Uuid) -> Self {
+        for user in self.users.values_mut() {
+            user.inbounds.retain(|entry| entry.host == Some(host));
+            for entry in &mut user.inbounds {
+                entry.host = None;
+            }
+            if let Some(secret) = decode_hex(&user.secret) {
+                if let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(&secret) {
+                    mac.update(b"suba-agent-user-v1\0");
+                    mac.update(host.as_bytes());
+                    user.secret = mac
+                        .finalize()
+                        .into_bytes()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect();
+                }
+            }
+        }
+        self
+    }
+
     /// Every grant, user by user, each inbound once and in its listed order.
     pub(crate) fn grants(&self) -> Vec<Grant> {
         self.users
@@ -176,21 +200,21 @@ impl Access {
 /// The users and addresses of the instance.
 pub(crate) struct AccessStore {
     users: Persisted<UsersConfig>,
-    endpoints: Persisted<EndpointsConfig>,
+    endpoints: EndpointStore,
 }
 
 impl AccessStore {
     pub(crate) fn load(config_dir: &Path) -> Result<Self, ConfigError> {
         Ok(Self {
             users: Persisted::load(config_dir, USERS_BASENAME)?,
-            endpoints: Persisted::load(config_dir, ENDPOINTS_BASENAME)?,
+            endpoints: EndpointStore::load(config_dir)?,
         })
     }
 
     pub(crate) async fn snapshot(&self) -> Access {
         Access {
             users: self.users.read(|config| config.users.clone()).await,
-            endpoints: self.endpoints.read(|config| config.configs.clone()).await,
+            endpoints: self.endpoints.snapshot().await,
         }
     }
 
@@ -314,6 +338,31 @@ impl AccessStore {
             .await
     }
 
+    pub(crate) async fn put_endpoint(
+        &self,
+        config: &str,
+        inbound: &str,
+        endpoint: Endpoint,
+    ) -> Result<(), Error> {
+        self.endpoints.put_endpoint(config, inbound, endpoint).await
+    }
+
+    pub(crate) async fn remove_endpoint(&self, config: &str, inbound: &str) -> Result<(), Error> {
+        self.endpoints.remove_endpoint(config, inbound).await
+    }
+}
+
+pub(crate) struct EndpointStore(Persisted<EndpointsConfig>);
+
+impl EndpointStore {
+    pub(crate) fn load(config_dir: &Path) -> Result<Self, ConfigError> {
+        Ok(Self(Persisted::load(config_dir, ENDPOINTS_BASENAME)?))
+    }
+
+    pub(crate) async fn snapshot(&self) -> BTreeMap<String, BTreeMap<String, Endpoint>> {
+        self.0.read(|config| config.configs.clone()).await
+    }
+
     /// Store, replace or clear the address override of one inbound.
     ///
     /// Clearing both halves removes the entry rather than keeping an empty one,
@@ -335,7 +384,7 @@ impl AccessStore {
             endpoint_host(address)?;
         }
 
-        let locked = self.endpoints.lock().await;
+        let locked = self.0.lock().await;
         let mut config_file = locked.get().clone();
         let inbounds = config_file.configs.entry(config.to_owned()).or_default();
         if endpoint.is_empty() {
@@ -352,7 +401,7 @@ impl AccessStore {
     }
 
     pub(crate) async fn remove_endpoint(&self, config: &str, inbound: &str) -> Result<(), Error> {
-        let locked = self.endpoints.lock().await;
+        let locked = self.0.lock().await;
         let mut config_file = locked.get().clone();
         let mut changed = false;
         if let Some(inbounds) = config_file.configs.get_mut(config) {
@@ -469,6 +518,44 @@ mod tests {
 
     fn entry(config: &str, inbound: &str) -> Entry {
         Entry::local(config, inbound)
+    }
+
+    #[test]
+    fn agent_projection_separates_host_credentials_and_preserves_local_material() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+        let local = entry("default", "shared");
+        let mut access = Access::default();
+        access.users.insert(
+            "example".into(),
+            User {
+                secret: "11".repeat(32),
+                inbounds: vec![
+                    local.clone(),
+                    Entry {
+                        host: Some(first),
+                        ..local.clone()
+                    },
+                    Entry {
+                        host: Some(second),
+                        ..local.clone()
+                    },
+                ],
+                ..User::default()
+            },
+        );
+        let original = access.material("example", &local).unwrap();
+        let first_view = access.clone().for_host(first);
+        let second_view = access.clone().for_host(second);
+        assert_eq!(first_view.users["example"].inbounds, vec![local.clone()]);
+        let first_material = first_view.material("example", &local).unwrap();
+        assert_ne!(first_material, original);
+        assert_ne!(
+            first_material,
+            second_view.material("example", &local).unwrap()
+        );
+        assert_eq!(access.material("example", &local).unwrap(), original);
+        assert_eq!(access.users["example"].secret, "11".repeat(32));
     }
 
     /// The host an entry belongs to is stored and read back in both
