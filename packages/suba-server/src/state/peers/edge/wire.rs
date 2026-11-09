@@ -90,7 +90,7 @@ impl Failure {
 }
 
 pub(super) fn address(endpoint: &str, host: Uuid) -> Result<url::Url, Error> {
-    let base = crate::state::peers::endpoint(endpoint)?;
+    let base = crate::state::peers::endpoint(endpoint, crate::state::peers::Mode::Edge)?;
     let mut url = url::Url::parse(&format!("{base}/api/peers/edge/connect"))
         .map_err(|_| Error::PeerUnavailable)?;
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };

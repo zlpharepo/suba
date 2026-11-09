@@ -131,11 +131,11 @@ fn identity_requires_matching_keys_and_signatures_are_bound_to_their_purpose() {
 #[test]
 fn endpoints_require_tls_and_resource_scope_excludes_auth_trust_and_recursion() {
     assert_eq!(
-        endpoint("https://server.example.com/base/").unwrap(),
+        endpoint("https://server.example.com/base/", Mode::Direct).unwrap(),
         "https://server.example.com/base"
     );
-    assert!(endpoint("http://127.0.0.1:4321").is_ok());
-    assert!(endpoint("http://[::1]:4321").is_ok());
+    assert!(endpoint("http://127.0.0.1:4321", Mode::Direct).is_ok());
+    assert!(endpoint("http://[::1]:4321", Mode::Direct).is_ok());
     for url in [
         "http://server.example.com",
         "http://localhost",
@@ -145,7 +145,7 @@ fn endpoints_require_tls_and_resource_scope_excludes_auth_trust_and_recursion() 
         "https://server.example.com?token=example",
         "https://server.example.com#fragment",
     ] {
-        assert!(endpoint(url).is_err());
+        assert!(endpoint(url, Mode::Direct).is_err());
     }
     for path in [
         "/system/metrics",
@@ -303,14 +303,23 @@ async fn an_edge_agent_is_trusted_for_sessions_but_not_manager_resources() {
 
 #[test]
 fn agent_api_addresses_keep_reverse_proxy_prefixes_without_guessing_paths() {
-    assert_eq!(
-        manager_endpoint("https://manager.example.invalid/control/api/").unwrap(),
-        "https://manager.example.invalid/control"
-    );
     for address in [
-        "https://manager.example.invalid",
+        "https://manager.example.invalid/control/api/",
+        "http://manager.example.invalid/control/api/",
+        "http://192.0.2.1:8080/control/api/",
+        "http://[2001:db8::1]:8080/control/api/",
+        "http://localhost:8080/control/api/",
+    ] {
+        assert_eq!(
+            manager_endpoint(address).unwrap(),
+            address.trim_end_matches('/').trim_end_matches("/api")
+        );
+    }
+    for address in [
+        "http://manager.example.invalid",
         "https://manager.example.invalid/api?token=fixture",
-        "http://manager.example.invalid/api",
+        "http://user:fixture@manager.example.invalid/api",
+        "ftp://manager.example.invalid/api",
     ] {
         assert!(manager_endpoint(address).is_err());
     }

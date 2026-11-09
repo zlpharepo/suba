@@ -219,11 +219,11 @@ impl Peers {
                 reason: "agent-token: invalid invitation secret",
             });
         }
-        // HTTPS authenticates the bootstrap endpoint; the signed challenge
-        // supplies the identity pinned by the existing invitation protocol.
+        // The signed challenge supplies the identity pinned during pairing.
         let challenge: Signed<Challenge> = self
             .post(
                 endpoint,
+                Mode::Edge,
                 "challenges",
                 &ChallengeRequest {
                     actor: signer.identity.clone(),
@@ -321,10 +321,13 @@ impl Peers {
         url: Option<String>,
     ) -> Result<Host, Error> {
         valid_name(&name)?;
-        let endpoint = url.as_deref().map(endpoint).transpose()?;
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
         let host = file.hosts.get_mut(&id).ok_or(Error::PeerNotFound)?;
+        let endpoint = url
+            .as_deref()
+            .map(|url| endpoint(url, host.mode))
+            .transpose()?;
         if host.mode == Mode::Direct && endpoint.is_none() {
             return Err(Error::PeerRequest {
                 reason: "endpoint: a Direct host requires an address",
@@ -364,7 +367,7 @@ impl Peers {
         mode: Mode,
     ) -> Result<Invitation, Error> {
         valid_name(&name)?;
-        let endpoint = endpoint(&url)?;
+        let endpoint = endpoint(&url, mode)?;
         let mut pending = self.pending.lock().await;
         pending.prune();
         if pending.invitations.len() >= PENDING_LIMIT {
@@ -593,7 +596,7 @@ impl Peers {
                 reason: "invitation.mode: this invitation is for a Direct connection",
             });
         }
-        let endpoint = endpoint(&invitation.endpoint)?;
+        let endpoint = endpoint(&invitation.endpoint, Mode::Edge)?;
         invitation.identity.key()?;
         if invitation.version != 1
             || invitation.identity.id == signer.identity.id
@@ -626,6 +629,7 @@ impl Peers {
         let receipt: Signed<PairReceipt> = self
             .post(
                 &endpoint,
+                Mode::Edge,
                 "pairings",
                 &signer.sign(
                     "pair",
@@ -699,7 +703,7 @@ impl Peers {
         let mut file = locked.get().clone();
         let link = file.edge.as_mut().ok_or(Error::PeerNotFound)?;
         if let Some(url) = endpoint {
-            link.endpoint = super::peers::endpoint(&url)?;
+            link.endpoint = super::peers::endpoint(&url, Mode::Edge)?;
         }
         if let Some(proxy) = proxy {
             link.proxy = proxy.map(|url| proxy_url(&url)).transpose()?.flatten();
@@ -827,12 +831,15 @@ pub(crate) fn manager_endpoint(value: &str) -> Result<String, Error> {
     let base = value.strip_suffix("/api").ok_or(Error::PeerRequest {
         reason: "manager-api-url: expected an API base URL ending in /api",
     })?;
-    endpoint(base)
+    endpoint(base, Mode::Edge)
 }
 
-pub(crate) fn endpoint(value: &str) -> Result<String, Error> {
+pub(crate) fn endpoint(value: &str, mode: Mode) -> Result<String, Error> {
     let invalid = || {
-        Error::PeerRequest { reason: "endpoint: use HTTPS, without credentials, query or fragment; HTTP is only allowed for a loopback IP" }
+        Error::PeerRequest { reason: match mode {
+            Mode::Edge => "endpoint: use HTTP or HTTPS, without credentials, query or fragment",
+            Mode::Direct => "endpoint: use HTTPS, without credentials, query or fragment; HTTP is only allowed for a loopback IP",
+        } }
     };
     let url = url::Url::parse(value).map_err(|_| invalid())?;
     let loopback = match url.host() {
@@ -840,7 +847,7 @@ pub(crate) fn endpoint(value: &str) -> Result<String, Error> {
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         _ => false,
     };
-    if !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+    if !(url.scheme() == "https" || url.scheme() == "http" && (mode == Mode::Edge || loopback))
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()

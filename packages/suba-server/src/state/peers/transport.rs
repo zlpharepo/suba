@@ -12,7 +12,7 @@ impl Peers {
         invitation: Invitation,
     ) -> Result<Host, Error> {
         valid_name(&name)?;
-        let endpoint = endpoint(&invitation.endpoint)?;
+        let endpoint = endpoint(&invitation.endpoint, Mode::Direct)?;
         invitation.identity.key()?;
         if invitation.version != 1
             || invitation.identity.id == signer.identity.id
@@ -48,6 +48,7 @@ impl Peers {
         let receipt: Signed<PairReceipt> = self
             .post(
                 &endpoint,
+                Mode::Direct,
                 "pairings",
                 &signer.sign(
                     "pair",
@@ -125,7 +126,7 @@ impl Peers {
             }
         };
         let reply: Signed<ResourceReply> = self
-            .post(address, "requests", &proof)
+            .post(address, Mode::Direct, "requests", &proof)
             .await
             .map_err(|_| outcome())?;
         reply
@@ -148,9 +149,15 @@ impl Peers {
         invitation: Option<Uuid>,
         purpose: Purpose,
     ) -> Result<Challenge, Error> {
+        let mode = if purpose == Purpose::EdgePair {
+            Mode::Edge
+        } else {
+            Mode::Direct
+        };
         let challenge: Signed<Challenge> = self
             .post(
                 endpoint,
+                mode,
                 "challenges",
                 &ChallengeRequest {
                     actor: signer.identity.clone(),
@@ -173,10 +180,11 @@ impl Peers {
     pub(super) async fn post<T: Serialize, R: DeserializeOwned>(
         &self,
         endpoint: &str,
+        mode: Mode,
         path: &str,
         body: &T,
     ) -> Result<R, Error> {
-        let endpoint = super::endpoint(endpoint)?;
+        let endpoint = super::endpoint(endpoint, mode)?;
         let mut response = self
             .http
             .post(format!("{endpoint}/api/peers/{path}"))

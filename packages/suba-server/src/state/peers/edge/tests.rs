@@ -28,7 +28,7 @@ fn challenge(agent: &IdentitySigner, manager: &IdentitySigner) -> Challenge {
 }
 
 #[test]
-fn websocket_addresses_preserve_prefix_and_allow_only_tls_or_literal_loopback() {
+fn websocket_addresses_preserve_prefix_for_http_and_https() {
     let id = Uuid::now_v7();
     assert_eq!(
         wire::address("https://manager.example.com/prefix/", id)
@@ -47,6 +47,15 @@ fn websocket_addresses_preserve_prefix_and_allow_only_tls_or_literal_loopback() 
     for endpoint in [
         "http://localhost",
         "http://manager.example.com",
+        "http://192.0.2.1:8080",
+        "http://[2001:db8::1]:8080",
+    ] {
+        let address = wire::address(&format!("{endpoint}/prefix/"), id).unwrap();
+        assert_eq!(address.scheme(), "ws");
+        assert_eq!(address.path(), "/prefix/api/peers/edge/connect");
+        assert_eq!(address.query(), Some(format!("host={id}").as_str()));
+    }
+    for endpoint in [
         "ws://127.0.0.1",
         "https://manager.example.com?token=example",
         "https://user:example@manager.example.com",

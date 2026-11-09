@@ -408,6 +408,7 @@ async fn remote_config_writes_preserve_etags_and_do_not_touch_local_documents() 
 async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_and_survives_restart(
 ) {
     let manager = Server::start().await;
+    let manager_endpoint = manager.base.replacen("127.0.0.1", "localhost", 1);
     let root = manager.root.join("agent");
     let config_dir = root.join("config");
     crate::fs::ensure_dir(&config_dir).unwrap();
@@ -428,7 +429,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
     let missing = crate::SubaServer::edge_agent(
         make_config(),
         crate::AgentOptions {
-            manager_api_url: format!("{}/api", manager.base),
+            manager_api_url: format!("{manager_endpoint}/api"),
             token: None,
         },
     )
@@ -439,7 +440,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
             &manager,
             "/api/peers/invitations",
             json!({
-                "name": "Example Agent", "endpoint": manager.base, "mode": "edge",
+                "name": "Example Agent", "endpoint": manager_endpoint, "mode": "edge",
             }),
         )
         .await,
@@ -453,7 +454,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
     let agent = crate::SubaServer::edge_agent(
         make_config(),
         crate::AgentOptions {
-            manager_api_url: format!("{}/api", manager.base),
+            manager_api_url: format!("{manager_endpoint}/api"),
             token: Some(token.clone()),
         },
     )
@@ -518,7 +519,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
     let restarted = crate::SubaServer::edge_agent(
         make_config(),
         crate::AgentOptions {
-            manager_api_url: format!("{}/api", manager.base),
+            manager_api_url: format!("{manager_endpoint}/api"),
             token: None,
         },
     )
