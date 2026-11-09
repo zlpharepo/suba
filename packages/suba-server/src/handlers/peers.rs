@@ -31,7 +31,7 @@ pub struct PendingInvite {
 }
 
 #[derive(Deserialize)]
-pub struct AddHost {
+pub struct AddEnvironment {
     name: String,
     invitation: Invitation,
 }
@@ -101,7 +101,7 @@ pub async fn accept(
     Ok(Json(state.peers().accept(&signer, proof).await?))
 }
 
-pub async fn hosts(
+pub async fn environments(
     State(state): State<AppState>,
     _auth: Authenticated,
 ) -> Json<Vec<peers::HostView>> {
@@ -116,10 +116,10 @@ pub async fn hosts(
     )
 }
 
-pub async fn add_host(
+pub async fn add_environment(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Json(body): Json<AddHost>,
+    Json(body): Json<AddEnvironment>,
 ) -> ResponseResult<impl IntoResponse> {
     let signer = state.settings().peer_signer().await?;
     let host = state
@@ -129,11 +129,11 @@ pub async fn add_host(
     Ok((StatusCode::CREATED, Json(state.peers().host_view(host))))
 }
 
-pub async fn update_host(
+pub async fn update_environment(
     State(state): State<AppState>,
     _auth: Authenticated,
     Path(id): Path<Uuid>,
-    Json(body): Json<EditHost>,
+    Json(body): Json<EditEnvironment>,
 ) -> ResponseResult<Json<peers::HostView>> {
     let host = state
         .peers()
@@ -143,13 +143,13 @@ pub async fn update_host(
 }
 
 #[derive(Deserialize)]
-pub struct EditHost {
+pub struct EditEnvironment {
     name: String,
     #[serde(default)]
     endpoint: Option<String>,
 }
 
-pub async fn remove_host(
+pub async fn remove_environment(
     State(state): State<AppState>,
     _auth: Authenticated,
     Path(id): Path<Uuid>,
@@ -214,7 +214,7 @@ async fn run_resource(
             reason: "peer.request: invalid request metadata",
         })?;
     request.extensions_mut().insert(grant);
-    // This router contains resources only, with no auth, trust, hosts, delivery or static-file routes.
+    // This router contains resources only, with no auth, trust, environments, delivery or static-file routes.
     let router = if state.is_agent() {
         crate::routers::AppRouter::agent_resources()
     } else {

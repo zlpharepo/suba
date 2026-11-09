@@ -14,13 +14,16 @@ use crate::{
 
 pub fn route() -> Router<AppState> {
     Router::new()
-        .route("/hosts", get(peers::hosts).post(peers::add_host))
         .route(
-            "/hosts/{id}",
-            delete(peers::remove_host).put(peers::update_host),
+            "/environments",
+            get(peers::environments).post(peers::add_environment),
         )
         .route(
-            "/hosts/{id}/{*path}",
+            "/environments/{id}",
+            delete(peers::remove_environment).put(peers::update_environment),
+        )
+        .route(
+            "/environments/{id}/{*path}",
             get(peers::forward)
                 .post(peers::forward)
                 .put(peers::forward)

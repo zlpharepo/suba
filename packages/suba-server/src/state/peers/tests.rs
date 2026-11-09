@@ -164,8 +164,8 @@ fn endpoints_require_tls_and_resource_scope_excludes_auth_trust_and_recursion() 
     for path in [
         "/auth/password",
         "/peers",
-        "/hosts",
-        "/hosts/example/system/metrics",
+        "/environments",
+        "/environments/example/system/metrics",
         "/s/example",
         "https://server.example.com/providers",
         "//server.example.com/providers",

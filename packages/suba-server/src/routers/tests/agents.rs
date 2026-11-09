@@ -227,7 +227,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         "/inbounds/users",
         "/inbounds/endpoints",
         "/cores/sing-box/configs",
-        "/hosts",
+        "/environments",
         "/auth/password",
     ] {
         let mut request = http::Request::builder()
@@ -243,7 +243,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         assert_eq!(response.status(), 404, "{path}");
     }
     let agent = RunningAgent::start(node);
-    let prefix = format!("/api/hosts/{id}");
+    let prefix = format!("/api/environments/{id}");
     tokio::time::timeout(Duration::from_secs(5), async {
         while manager
             .authed(Method::GET, &format!("{prefix}/system/info"))

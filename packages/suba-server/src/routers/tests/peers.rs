@@ -29,7 +29,7 @@ async fn pair(local: &Server, remote: &Server) -> String {
     assert_eq!(invitation.headers()[header::CACHE_CONTROL], "no-store");
     let added = post(
         local,
-        "/api/hosts",
+        "/api/environments",
         json!({"name":"Example server", "invitation":body(invitation).await}),
     )
     .await;
@@ -127,11 +127,11 @@ async fn machine_handshakes_do_not_initialize_an_unpaired_instance() {
 async fn direct_management_preserves_remote_ownership_and_local_authentication() {
     let local = Server::start().await;
     let remote = Server::start().await;
-    for path in ["/api/hosts", "/api/peers", "/api/peers/identity"] {
+    for path in ["/api/environments", "/api/peers", "/api/peers/identity"] {
         assert_eq!(local.get(path).send().await.unwrap().status(), 401);
     }
     let host = pair(&local, &remote).await;
-    let base = format!("/api/hosts/{host}");
+    let base = format!("/api/environments/{host}");
     assert_eq!(
         get(&local, &(base.clone() + "/system/info")).await["version"],
         env!("CARGO_PKG_VERSION")
@@ -235,8 +235,8 @@ async fn peer_requests_are_single_use_and_cannot_delegate_or_become_admin_sessio
     for path in [
         "/auth/password",
         "/peers",
-        "/hosts",
-        "/hosts/example/system/info",
+        "/environments",
+        "/environments/example/system/info",
         "/s/example",
     ] {
         assert_eq!(
@@ -247,7 +247,7 @@ async fn peer_requests_are_single_use_and_cannot_delegate_or_become_admin_sessio
         );
         assert_eq!(
             local
-                .authed(Method::GET, &format!("/api/hosts/{host}{path}"))
+                .authed(Method::GET, &format!("/api/environments/{host}{path}"))
                 .send()
                 .await
                 .unwrap()
@@ -279,7 +279,7 @@ async fn peer_requests_are_single_use_and_cannot_delegate_or_become_admin_sessio
         401
     );
     let removed = local
-        .authed(Method::DELETE, &format!("/api/hosts/{host}"))
+        .authed(Method::DELETE, &format!("/api/environments/{host}"))
         .send()
         .await
         .unwrap();
@@ -301,7 +301,7 @@ async fn changed_endpoints_cannot_change_the_pinned_remote_identity() {
     assert_eq!(
         local
             .put_json(
-                &format!("/api/hosts/{host}"),
+                &format!("/api/environments/{host}"),
                 json!({"name":"Example", "endpoint":other.base})
             )
             .await
@@ -311,7 +311,7 @@ async fn changed_endpoints_cannot_change_the_pinned_remote_identity() {
     assert_eq!(
         local
             .put_json(
-                &format!("/api/hosts/{host}/collections/wrong-target"),
+                &format!("/api/environments/{host}/collections/wrong-target"),
                 json!({"providers":[]})
             )
             .await
@@ -326,7 +326,7 @@ async fn changed_endpoints_cannot_change_the_pinned_remote_identity() {
     assert_eq!(
         local
             .put_json(
-                &format!("/api/hosts/{host}"),
+                &format!("/api/environments/{host}"),
                 json!({"name":"Example", "endpoint":remote.base})
             )
             .await
@@ -335,7 +335,10 @@ async fn changed_endpoints_cannot_change_the_pinned_remote_identity() {
     );
     assert_eq!(
         local
-            .authed(Method::GET, &format!("/api/hosts/{host}/system/info"))
+            .authed(
+                Method::GET,
+                &format!("/api/environments/{host}/system/info")
+            )
             .send()
             .await
             .unwrap()
@@ -371,7 +374,7 @@ async fn remote_config_writes_preserve_etags_and_do_not_touch_local_documents() 
     .unwrap();
     assert_eq!(remote.put_json("/api/cores/sing-box",json!({"version":"1.14.3","config":"default","privilege":"operator","collections":[]})).await.status(),200);
     let host = pair(&local, &remote).await;
-    let path = format!("/api/hosts/{host}/cores/sing-box/configs/default");
+    let path = format!("/api/environments/{host}/cores/sing-box/configs/default");
     let response = local.authed(Method::GET, &path).send().await.unwrap();
     assert_eq!(response.status(), 200);
     let etag = response.headers()[header::ETAG]
@@ -475,7 +478,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         },
         std::time::Duration::from_secs(2),
     ));
-    let prefix = format!("/api/hosts/{}", identity.id);
+    let prefix = format!("/api/environments/{}", identity.id);
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let response = manager
