@@ -41,9 +41,8 @@ use suba_proto::{
 ///   `password` and **no** `name` — see [`user`], where these get a `username`
 ///   from the user's name because the core refuses a `name` field.
 ///
-/// Shadowsocks is the one with a shape of its own: multi-user needs the
-/// inbound's own `password` as well, and the 2022 ciphers need every key the
-/// same length as the cipher's, which is why [`user`] can refuse.
+/// Shadowsocks is the one with a shape of its own: 2022 multi-user needs the
+/// inbound's own `password` as well, and each user key must match the cipher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Vless,
@@ -92,7 +91,10 @@ pub fn grantable(inbound: &Value) -> Result<Protocol, &'static str> {
         Some("anytls") => Ok(Protocol::AnyTls),
         Some("hysteria2") => Ok(Protocol::Hysteria2),
         Some("hysteria") => Ok(Protocol::Hysteria),
-        Some("shadowtls") => Ok(Protocol::ShadowTls),
+        Some("shadowtls") if inbound.get("version").and_then(Value::as_u64) == Some(3) => {
+            Ok(Protocol::ShadowTls)
+        }
+        Some("shadowtls") => Err("ShadowTLS users require version 3"),
         Some("snell") => Ok(Protocol::Snell),
         Some("http") => Ok(Protocol::Http),
         Some("socks") => Ok(Protocol::Socks),
@@ -119,8 +121,7 @@ pub fn grantable(inbound: &Value) -> Result<Protocol, &'static str> {
 ///
 /// Multi-user is a mode of its own: the core refuses `users` beside
 /// `destinations` and beside `managed`, and it needs the inbound's own
-/// `password` to derive per-user keys. It is never a matter of scaling the
-/// single-user case up.
+/// `password` for 2022 ciphers. Legacy AEAD multi-user ignores that field.
 fn shadowsocks(inbound: &Value) -> Result<Protocol, &'static str> {
     let method = inbound
         .get("method")
@@ -136,14 +137,6 @@ fn shadowsocks(inbound: &Value) -> Result<Protocol, &'static str> {
     if inbound.get("managed").and_then(Value::as_bool) == Some(true) {
         return Err("a managed Shadowsocks server sizes its own users");
     }
-    if inbound
-        .get("password")
-        .and_then(Value::as_str)
-        .filter(|key| !key.is_empty())
-        .is_none()
-    {
-        return Err("multi-user Shadowsocks needs the inbound's own password");
-    }
     // Measured: every 2022 cipher refuses a user key that is not its own length,
     // and the chacha20-poly1305 one refuses multi-user outright.
     if method == "2022-blake3-chacha20-poly1305" {
@@ -151,6 +144,15 @@ fn shadowsocks(inbound: &Value) -> Result<Protocol, &'static str> {
     }
     if method.starts_with("2022-blake3-") && shadowsocks_key_len(method).is_none() {
         return Err("only the 2022 key lengths can be derived");
+    }
+    if shadowsocks_key_len(method).is_some()
+        && inbound
+            .get("password")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .is_none()
+    {
+        return Err("multi-user Shadowsocks needs the inbound's own password");
     }
 
     Ok(Protocol::Shadowsocks)
@@ -646,10 +648,8 @@ mod tests {
     /// `users` field. Frozen here because the schema is a runtime artefact:
     /// `data/sing-box/versions/<v>/schema.json`, `$defs.Inbound`, 1.14.3.
     ///
-    /// The rule the owner set is exactly this list minus `mixed`: an inbound
-    /// that has nowhere to put a user cannot be granted one, and `mixed` is the
-    /// one that has a place and still must not, because it is the plaintext
-    /// local entry.
+    /// The schema's users field is a necessary condition. `mixed` is excluded
+    /// by product choice, and protocol-specific modes are checked separately.
     const SCHEMA_INBOUNDS: &[(&str, bool)] = &[
         ("anytls", true),
         ("cloudflared", false),
@@ -684,7 +684,6 @@ mod tests {
             ("anytls", Protocol::AnyTls),
             ("hysteria2", Protocol::Hysteria2),
             ("hysteria", Protocol::Hysteria),
-            ("shadowtls", Protocol::ShadowTls),
             ("snell", Protocol::Snell),
             ("http", Protocol::Http),
             ("socks", Protocol::Socks),
@@ -692,9 +691,17 @@ mod tests {
         ] {
             assert_eq!(grantable(&json!({ "type": kind })), Ok(protocol), "{kind}");
         }
+        assert_eq!(
+            grantable(&json!({"type": "shadowtls", "version": 3})),
+            Ok(Protocol::ShadowTls),
+        );
+        assert_eq!(
+            grantable(&json!({"type": "shadowtls", "version": 2})),
+            Err("ShadowTLS users require version 3"),
+        );
 
-        // Shadowsocks is a mode, not just a type: only a multi-user one, with
-        // the inbound's own key and a cipher that has per-user keys.
+        // Shadowsocks is a mode, not just a type: 2022 multi-user needs the
+        // inbound's own key, while legacy AEAD uses each user's password.
         let ss = |method: &str, extra: Value| {
             let mut inbound =
                 json!({"type": "shadowsocks", "method": method, "password": "c2VydmVy"});
@@ -706,6 +713,10 @@ mod tests {
         assert_eq!(
             grantable(&ss("aes-256-gcm", json!({}))),
             Ok(Protocol::Shadowsocks)
+        );
+        assert_eq!(
+            grantable(&json!({"type": "shadowsocks", "method": "aes-256-gcm"})),
+            Ok(Protocol::Shadowsocks),
         );
         assert_eq!(
             grantable(&ss("2022-blake3-aes-256-gcm", json!({}))),
@@ -721,7 +732,7 @@ mod tests {
                 "this cipher cannot have more than one user",
             ),
             (
-                "aes-256-gcm",
+                "2022-blake3-aes-256-gcm",
                 "multi-user Shadowsocks needs the inbound's own password",
             ),
         ] {
@@ -759,13 +770,12 @@ mod tests {
         }
     }
 
-    /// The rule, over the schema's own inbound list rather than a hand-picked
-    /// few: granted when there is a `users` field, refused when there is not,
-    /// and `mixed` refused despite having one.
+    /// A valid multi-user mode for every supported inbound, across the
+    /// schema's own list rather than a hand-picked subset.
     #[test]
     fn what_can_be_granted_is_exactly_what_has_a_place_for_a_user() {
         for (kind, has_users) in SCHEMA_INBOUNDS {
-            let inbound = json!({ "type": kind, "method": "aes-256-gcm", "password": "c2VydmVy" });
+            let inbound = json!({ "type": kind, "version": 3, "method": "aes-256-gcm", "password": "c2VydmVy" });
             let granted = grantable(&inbound).is_ok();
             let expected = *has_users && *kind != "mixed";
 
