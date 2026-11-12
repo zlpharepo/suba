@@ -13,15 +13,15 @@ use axum::{
 };
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
-use suba_core::format::{Format, RenderIntent};
 use suba_core::proto::Host;
+use suba_core::target::{RenderIntent, Target};
 use suba_core::{IndexEntry, NodeIndex, Source};
 
 use crate::{
     dto::{Operator, ResponseResult},
     error::Error,
     handlers::collections::{
-        artifact_headers, provider_filters, token_view, update_hours, Choice, TokenView,
+        artifact_headers, provider_filters, token_view, update_hours, TargetChoice, TokenView,
     },
     state::access::{Access, Endpoint, Entry},
     state::render::Artifact,
@@ -495,7 +495,7 @@ pub async fn content(
     State(state): State<AppState>,
     _auth: Operator,
     Path(name): Path<String>,
-    Query(choice): Query<Choice>,
+    Query(choice): Query<TargetChoice>,
     request: HeaderMap,
 ) -> ResponseResult<impl IntoResponse> {
     let artifact = user_artifact(&state, &name, choice.resolve(&request)?).await?;
@@ -515,7 +515,7 @@ pub async fn content(
 pub(crate) async fn user_artifact(
     state: &AppState,
     name: &str,
-    format: Format,
+    target: Target,
 ) -> Result<Artifact, Error> {
     let access = state.access_snapshot().await;
     let user = access
@@ -631,11 +631,11 @@ pub(crate) async fn user_artifact(
     // Own servers and provider nodes share one list, so a name both use is
     // told apart the way two providers' are.
     suba_core::name_conflicts(&mut entries);
-    let rendered = format.render(&entries.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
+    let rendered = target.render(&entries.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
 
     Ok(Artifact {
         body: rendered.body.into(),
-        format,
+        target,
         nodes: entries.len().saturating_sub(rendered.skipped.len()),
         skipped: rendered.skipped.len() + unexported,
         update_hours: hours,

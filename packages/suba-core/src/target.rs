@@ -1,6 +1,6 @@
-//! The formats a collection can be served in, and what each of them can say.
+//! Subscription conversion targets and the capabilities each supports.
 //!
-//! A format is a **document shape**, not a step in a pipeline. Rendering is a
+//! A target is a **document shape**, not a step in a pipeline. Rendering is a
 //! pure function of the nodes and the direction the caller asked for, so the
 //! same node set can be handed out as links, as a clash document, as a sing-box
 //! configuration — and the caller is the one who knows which of those the
@@ -11,16 +11,16 @@
 //! * **The direction is asked for, never assumed.** A node can be written as
 //!   something a client dials or as something a server runs, and the two are not
 //!   the same document; a default would silently hand out the wrong one. A
-//!   format that cannot write the direction asked for refuses, rather than
+//!   target that cannot write the direction asked for refuses, rather than
 //!   producing its other one.
-//! * **What cannot be written is reported, not dropped.** A node a format has no
+//! * **What cannot be written is reported, not dropped.** A node a target has no
 //!   representation for is left out *with a reason*, per node, and a caller can
-//!   learn what a format will refuse **before** rendering, from its
-//!   [`FormatDescriptor`]. A subscription that quietly serves fewer nodes than
+//!   learn what a target will refuse **before** rendering, from its
+//!   [`TargetDescriptor`]. A subscription that quietly serves fewer nodes than
 //!   it should is worse than one that says which ones it could not serve.
 //!
-//! A format whose dialect is not compiled into this build is not a
-//! [`Format`] at all: [`Format::all`] is the truth about what this build serves,
+//! A target whose dialect is not compiled into this build is not a
+//! [`Target`] at all: [`Target::all`] is the truth about what this build serves,
 //! and a request naming anything else cannot be parsed into one.
 
 use std::fmt;
@@ -36,11 +36,11 @@ use crate::proto::{Client, Node};
 ///
 /// The name it is spelled with is the product's own spelling, matched only
 /// where case does not matter: `sing-box`, not `singbox`. It is what a caller
-/// writes in `?format=` and what a `User-Agent` is recognised by, so the two
+/// writes in `?target=` and what a `User-Agent` is recognised by, so the two
 /// cannot drift apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Format {
+pub enum Target {
     /// The share links themselves, one per line.
     Links,
     /// The same link list, wrapped in base64: what a subscription URL serves.
@@ -54,23 +54,23 @@ pub enum Format {
     Clash,
 }
 
-impl Format {
-    /// Every format this build can serve.
+impl Target {
+    /// Every target this build can serve.
     ///
-    /// Compiled, not configured: a format whose dialect is behind a feature that
+    /// Compiled, not configured: a target whose dialect is behind a feature that
     /// is off is absent here, which is what makes "this build does not serve
     /// that" a fact rather than a runtime check somebody can forget to perform.
     pub fn all() -> &'static [Self] {
         #[cfg(all(feature = "singbox", feature = "clash"))]
-        let formats: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox, Self::Clash];
+        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox, Self::Clash];
         #[cfg(all(feature = "singbox", not(feature = "clash")))]
-        let formats: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox];
+        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox];
         #[cfg(all(feature = "clash", not(feature = "singbox")))]
-        let formats: &'static [Self] = &[Self::Links, Self::Base64, Self::Clash];
+        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Clash];
         #[cfg(not(any(feature = "singbox", feature = "clash")))]
-        let formats: &'static [Self] = &[Self::Links, Self::Base64];
+        let targets: &'static [Self] = &[Self::Links, Self::Base64];
 
-        formats
+        targets
     }
 
     /// The name it is spelled with, in documents and in URLs.
@@ -85,7 +85,7 @@ impl Format {
         }
     }
 
-    /// The media type a response in this format is served as.
+    /// The media type used by this conversion target.
     pub const fn media_type(self) -> &'static str {
         match self {
             Self::Links | Self::Base64 => "text/plain; charset=utf-8",
@@ -96,7 +96,7 @@ impl Format {
         }
     }
 
-    /// The file extension a client saves this format under.
+    /// The file extension used for this target's output.
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Links | Self::Base64 => "txt",
@@ -107,25 +107,25 @@ impl Format {
         }
     }
 
-    /// The format a name spells, when this build serves it.
+    /// The supported target identified by this name.
     pub fn named(name: &str) -> Option<Self> {
         Self::all()
             .iter()
             .copied()
-            .find(|format| format.as_str() == name)
+            .find(|target| target.as_str() == name)
     }
 
-    /// The format a client's `User-Agent` says it reads, when it says one.
+    /// The target a client's `User-Agent` says it reads, when it says one.
     ///
     /// Only the shapes a client cannot read otherwise are recognised: a
     /// sing-box or clash client asked for a document it can load, and anything
     /// else gets the default. Matched without regard to
     /// case, because the clients spell themselves inconsistently.
     ///
-    /// What it returns is a [`Format`], so the shape a client is served by its
+    /// What it returns is a [`Target`], so the shape a client is served by its
     /// `User-Agent` is the same one it would have been served by asking with
-    /// [`Format::as_str`] — including the name that goes back out in
-    /// `x-suba-format`.
+    /// [`Target::as_str`] — including the name that goes back out in
+    /// `x-suba-target`.
     pub fn for_user_agent(agent: &str) -> Option<Self> {
         let agent = agent.to_ascii_lowercase();
 
@@ -150,10 +150,10 @@ impl Format {
     }
 
     /// What it can express, before anything is rendered.
-    pub const fn descriptor(self) -> FormatDescriptor {
+    pub const fn descriptor(self) -> TargetDescriptor {
         match self {
-            Self::Links | Self::Base64 => FormatDescriptor {
-                format: self,
+            Self::Links | Self::Base64 => TargetDescriptor {
+                target: self,
                 intents: &[RenderIntent::Client],
                 // A link is what the model is parsed *from*: whatever a provider
                 // served, the model holds enough to write it back. A protocol
@@ -164,24 +164,24 @@ impl Format {
             // The dialect's own table, so that what it says it can write and
             // what it writes cannot drift apart.
             #[cfg(feature = "singbox")]
-            Self::Singbox => FormatDescriptor {
-                format: self,
+            Self::Singbox => TargetDescriptor {
+                target: self,
                 intents: &[RenderIntent::Client],
                 protocols: ProtocolSupport::Only(suba_singbox::PROTOCOLS),
             },
             #[cfg(feature = "clash")]
-            Self::Clash => FormatDescriptor {
-                format: self,
+            Self::Clash => TargetDescriptor {
+                target: self,
                 intents: &[RenderIntent::Client],
                 protocols: ProtocolSupport::Only(suba_clash::PROTOCOLS),
             },
         }
     }
 
-    /// Write `nodes` as this format.
+    /// Write `nodes` as this target.
     ///
     /// The nodes are the resolved ones, in the order they are to appear;
-    /// anything this format cannot write is left out and reported in
+    /// anything this target cannot write is left out and reported in
     /// [`Rendered::skipped`], with one reason per node.
     pub fn render(
         self,
@@ -190,7 +190,7 @@ impl Format {
     ) -> Result<Rendered, RenderError> {
         if !self.descriptor().intents.contains(&intent) {
             return Err(RenderError::Intent {
-                format: self,
+                target: self,
                 intent,
             });
         }
@@ -331,7 +331,7 @@ fn refusals(
         });
     }
 }
-impl fmt::Display for Format {
+impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -366,22 +366,22 @@ impl fmt::Display for RenderIntent {
     }
 }
 
-/// What a format can express, before anything is rendered.
+/// What a target can express, before anything is rendered.
 ///
 /// The point of asking first: a caller can tell an operator which nodes will be
 /// left out *before* a document is produced, instead of comparing what was asked
 /// for against what came back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FormatDescriptor {
-    pub format: Format,
-    /// The directions this format can write.
+pub struct TargetDescriptor {
+    pub target: Target,
+    /// The directions this target can write.
     pub intents: &'static [RenderIntent],
     /// The protocols it can express.
     pub protocols: ProtocolSupport,
 }
 
-impl FormatDescriptor {
-    /// Why this format cannot write a node of this kind, if it cannot.
+impl TargetDescriptor {
+    /// Why this target cannot write a node of this kind, if it cannot.
     pub fn refuses(&self, kind: Kind) -> Option<SkipReason> {
         match self.protocols.expresses(kind) {
             true => None,
@@ -390,7 +390,7 @@ impl FormatDescriptor {
     }
 }
 
-/// Which protocols a format has a representation for.
+/// Which protocols a target has a representation for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolSupport {
     /// Every protocol the model knows — including one it does not model, which
@@ -432,9 +432,9 @@ pub struct Skipped {
 /// Why a node is not in a document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The format has no representation for this protocol.
+    /// The target has no representation for this protocol.
     Protocol(Kind),
-    /// The format has no representation for how the node is carried.
+    /// The target has no representation for how the node is carried.
     Transport(String),
     /// A known field cannot be preserved, without including its supplied value.
     Field {
@@ -449,13 +449,13 @@ pub enum SkipReason {
     },
 }
 
-/// A document this format does not write.
+/// A document this target does not write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RenderError {
-    /// The direction asked for is not one this format can produce.
-    #[error("`{format}` does not write a {intent} document")]
+    /// The direction asked for is not one this target can produce.
+    #[error("`{target}` does not write a {intent} document")]
     Intent {
-        format: Format,
+        target: Target,
         intent: RenderIntent,
     },
 }
@@ -526,7 +526,7 @@ mod tests {
         );
 
         // One walk, two callers: the document is these values under one key.
-        let rendered = Format::Singbox
+        let rendered = Target::Singbox
             .render(&nodes, RenderIntent::Client)
             .expect("a client document");
         let document: serde_json::Value = serde_json::from_str(&rendered.body).expect("valid JSON");
@@ -563,7 +563,7 @@ mod tests {
             assert!(!reason.contains("private-authority"));
             assert!(!reason.contains("fixture-secret"));
         }
-        let rendered = Format::Singbox
+        let rendered = Target::Singbox
             .render(&nodes, RenderIntent::Client)
             .unwrap();
         assert_eq!(rendered.skipped, skipped);
@@ -606,7 +606,7 @@ mod tests {
         let index = index(&fixtures);
         let nodes = entries(&index);
 
-        let rendered = Format::Links
+        let rendered = Target::Links
             .render(&nodes, RenderIntent::Client)
             .expect("a client document");
 
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn the_document_is_one_link_per_line() {
         let index = index(&links()[..2]);
-        let rendered = Format::Links
+        let rendered = Target::Links
             .render(&entries(&index), RenderIntent::Client)
             .unwrap();
 
@@ -680,10 +680,10 @@ mod tests {
     #[test]
     fn base64_is_the_link_list_wrapped() {
         let index = index(&links()[..2]);
-        let links = Format::Links
+        let links = Target::Links
             .render(&entries(&index), RenderIntent::Client)
             .unwrap();
-        let wrapped = Format::Base64
+        let wrapped = Target::Base64
             .render(&entries(&index), RenderIntent::Client)
             .unwrap();
 
@@ -696,41 +696,41 @@ mod tests {
     }
 
     #[test]
-    fn a_format_is_found_by_the_name_it_is_spelled_with() {
-        for format in Format::all() {
-            assert_eq!(Format::named(format.as_str()), Some(*format));
+    fn a_target_is_found_by_the_name_it_is_spelled_with() {
+        for target in Target::all() {
+            assert_eq!(Target::named(target.as_str()), Some(*target));
         }
-        assert_eq!(Format::named("xray"), None);
+        assert_eq!(Target::named("xray"), None);
     }
 
     /// The name is the product's own spelling, so the squashed one a caller
     /// might guess at is not a name this build answers to.
     #[cfg(feature = "singbox")]
     #[test]
-    fn a_squashed_product_name_is_not_a_format_name() {
-        assert_eq!(Format::named("sing-box"), Some(Format::Singbox));
-        assert_eq!(Format::named("singbox"), None);
-        assert_eq!(Format::Singbox.as_str(), "sing-box");
+    fn a_squashed_product_name_is_not_a_target_name() {
+        assert_eq!(Target::named("sing-box"), Some(Target::Singbox));
+        assert_eq!(Target::named("singbox"), None);
+        assert_eq!(Target::Singbox.as_str(), "sing-box");
     }
 
-    /// Whatever a client is recognised by, it is recognised as a format a
+    /// Whatever a client is recognised by, it is recognised as a target a
     /// caller could also have named: the two ways of asking meet at one name.
     #[test]
-    fn a_client_is_recognised_as_a_format_a_caller_could_name() {
+    fn a_client_is_recognised_as_a_target_a_caller_could_name() {
         for agent in ["SFA/1.11.0 (Android)", "clash-verge/v2.2.0", "curl/8.7.1"] {
-            if let Some(selected) = Format::for_user_agent(agent) {
-                assert_eq!(Format::named(selected.as_str()), Some(selected), "{agent}");
+            if let Some(selected) = Target::for_user_agent(agent) {
+                assert_eq!(Target::named(selected.as_str()), Some(selected), "{agent}");
             }
         }
 
         #[cfg(feature = "singbox")]
         assert_eq!(
-            Format::for_user_agent("SFA/1.11.0 (Android)").map(Format::as_str),
+            Target::for_user_agent("SFA/1.11.0 (Android)").map(Target::as_str),
             Some("sing-box")
         );
         #[cfg(feature = "clash")]
         assert_eq!(
-            Format::for_user_agent("mihomo/1.19.31").map(Format::as_str),
+            Target::for_user_agent("mihomo/1.19.31").map(Target::as_str),
             Some("clash")
         );
     }
@@ -742,8 +742,8 @@ mod tests {
         #[cfg(feature = "singbox")]
         for agent in ["SFA/1.11.0 (Android)", "sing-box 1.14.2", "SFI/1.10 (iOS)"] {
             assert_eq!(
-                Format::for_user_agent(agent),
-                Some(Format::Singbox),
+                Target::for_user_agent(agent),
+                Some(Target::Singbox),
                 "{agent}"
             );
         }
@@ -755,63 +755,63 @@ mod tests {
             "Stash/2.4",
         ] {
             assert_eq!(
-                Format::for_user_agent(agent),
-                Some(Format::Clash),
+                Target::for_user_agent(agent),
+                Some(Target::Clash),
                 "{agent}"
             );
         }
         for agent in ["curl/8.7.1", "Mozilla/5.0", "v2rayNG/1.9.0", ""] {
-            assert_eq!(Format::for_user_agent(agent), None, "{agent}");
+            assert_eq!(Target::for_user_agent(agent), None, "{agent}");
         }
     }
 
     /// Links describe a client. A server document is a different shape, and one
-    /// this format does not have.
+    /// this target does not have.
     #[test]
     fn the_direction_that_was_asked_for_is_the_one_written() {
         let index = index(&links()[..1]);
 
         assert!(matches!(
-            Format::Links.render(&entries(&index), RenderIntent::Server),
+            Target::Links.render(&entries(&index), RenderIntent::Server),
             Err(RenderError::Intent {
-                format: Format::Links,
+                target: Target::Links,
                 intent: RenderIntent::Server
             })
         ));
-        assert!(Format::Links
+        assert!(Target::Links
             .render(&entries(&index), RenderIntent::Client)
             .is_ok());
     }
 
     #[test]
-    fn every_format_this_build_serves_answers_for_itself() {
-        assert!(!Format::all().is_empty());
+    fn every_target_this_build_serves_answers_for_itself() {
+        assert!(!Target::all().is_empty());
 
-        for format in Format::all() {
-            let descriptor = format.descriptor();
-            assert_eq!(descriptor.format, *format);
+        for target in Target::all() {
+            let descriptor = target.descriptor();
+            assert_eq!(descriptor.target, *target);
             assert!(
                 !descriptor.intents.is_empty(),
-                "{format} writes no direction"
+                "{target} writes no direction"
             );
 
             // The name it is spelled with and the name it serializes as are one
             // name: a client that reads the capability list and asks for what it
             // saw must be asking for this.
-            let spelled = serde_json::to_value(format).unwrap();
+            let spelled = serde_json::to_value(target).unwrap();
             assert_eq!(
                 spelled,
-                serde_json::Value::String(format.as_str().to_string())
+                serde_json::Value::String(target.as_str().to_string())
             );
 
-            let parsed: Format = serde_json::from_value(spelled).unwrap();
-            assert_eq!(parsed, *format);
+            let parsed: Target = serde_json::from_value(spelled).unwrap();
+            assert_eq!(parsed, *target);
         }
     }
 
     #[test]
-    fn a_format_that_cannot_write_a_protocol_says_which_one() {
-        let everything = Format::Links.descriptor();
+    fn a_target_that_cannot_write_a_protocol_says_which_one() {
+        let everything = Target::Links.descriptor();
         for link in links() {
             let node = proto::parse_link(&link).expect("the fixture parses");
             assert_eq!(
@@ -821,8 +821,8 @@ mod tests {
             );
         }
 
-        let picky = FormatDescriptor {
-            format: Format::Links,
+        let picky = TargetDescriptor {
+            target: Target::Links,
             intents: &[RenderIntent::Client],
             protocols: ProtocolSupport::Only(&[Kind::Trojan]),
         };
@@ -837,7 +837,7 @@ mod tests {
     #[test]
     fn an_empty_collection_renders_an_empty_document() {
         let index = index(&Vec::new());
-        let rendered = Format::Links
+        let rendered = Target::Links
             .render(&entries(&index), RenderIntent::Client)
             .unwrap();
 
@@ -845,12 +845,12 @@ mod tests {
         assert!(rendered.skipped.is_empty());
     }
 
-    /// The feature decides the capability list: a format whose dialect is not
-    /// compiled in is not a format at all, and a client that reads the list
+    /// The feature decides the capability list: a target whose dialect is not
+    /// compiled in is not a target at all, and a client that reads the list
     /// never asks for one this build cannot answer.
     #[test]
-    fn the_formats_this_build_has_are_the_compiled_ones() {
-        let names: Vec<&str> = Format::all().iter().map(|format| format.as_str()).collect();
+    fn the_targets_this_build_has_are_the_compiled_ones() {
+        let names: Vec<&str> = Target::all().iter().map(|target| target.as_str()).collect();
 
         #[cfg(all(feature = "singbox", feature = "clash"))]
         assert_eq!(names, ["links", "base64", "sing-box", "clash"]);
@@ -873,7 +873,7 @@ mod tests {
                 .to_string(),
         ];
         let index = index(&fixtures);
-        let rendered = Format::Singbox
+        let rendered = Target::Singbox
             .render(&entries(&index), RenderIntent::Client)
             .expect("a client document");
 
@@ -899,9 +899,9 @@ mod tests {
         let index = index(&links()[..1]);
 
         assert!(matches!(
-            Format::Singbox.render(&entries(&index), RenderIntent::Server),
+            Target::Singbox.render(&entries(&index), RenderIntent::Server),
             Err(RenderError::Intent {
-                format: Format::Singbox,
+                target: Target::Singbox,
                 intent: RenderIntent::Server
             })
         ));
@@ -917,7 +917,7 @@ mod tests {
             "snell://1.2.3.4:443?psk=PSK&version=4#Snell".to_string(),
         ];
         let index = index(&fixtures);
-        let rendered = Format::Clash
+        let rendered = Target::Clash
             .render(&entries(&index), RenderIntent::Client)
             .expect("a client document");
 
@@ -947,9 +947,9 @@ mod tests {
         let index = index(&links()[..1]);
 
         assert!(matches!(
-            Format::Clash.render(&entries(&index), RenderIntent::Server),
+            Target::Clash.render(&entries(&index), RenderIntent::Server),
             Err(RenderError::Intent {
-                format: Format::Clash,
+                target: Target::Clash,
                 intent: RenderIntent::Server
             })
         ));
@@ -967,7 +967,7 @@ mod tests {
         assert!(!node.name.as_str().is_empty(), "the fixture is named");
 
         let index = index(&[fixture]);
-        let rendered = Format::Links
+        let rendered = Target::Links
             .render(&entries(&index), RenderIntent::Client)
             .unwrap();
 
@@ -976,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_names_are_written_by_every_compiled_format() {
+    fn resolved_names_are_written_by_every_compiled_target() {
         let held = observation(&["trojan://PASSWORD@example.com:443#Node".to_string()]);
         let index = NodeIndex::from_observations([("alpha", &held), ("beta", &held)]);
         let mut named = index.entries().to_vec();
@@ -984,12 +984,12 @@ mod tests {
         let entries: Vec<_> = named.iter().collect();
         let expected = ["[alpha] Node", "[beta] Node"];
 
-        for format in Format::all() {
-            let rendered = format.render(&entries, RenderIntent::Client).unwrap();
+        for target in Target::all() {
+            let rendered = target.render(&entries, RenderIntent::Client).unwrap();
             assert!(rendered.skipped.is_empty());
-            match format {
-                Format::Links | Format::Base64 => {
-                    let body = if *format == Format::Base64 {
+            match target {
+                Target::Links | Target::Base64 => {
+                    let body = if *target == Target::Base64 {
                         proto::base64::decode_to_string(rendered.body.as_bytes()).unwrap()
                     } else {
                         rendered.body
@@ -1001,7 +1001,7 @@ mod tests {
                     assert_eq!(names, expected);
                 }
                 #[cfg(feature = "singbox")]
-                Format::Singbox => {
+                Target::Singbox => {
                     let document: serde_json::Value = serde_json::from_str(&rendered.body).unwrap();
                     let names: Vec<_> = document["outbounds"]
                         .as_array()
@@ -1012,7 +1012,7 @@ mod tests {
                     assert_eq!(names, expected);
                 }
                 #[cfg(feature = "clash")]
-                Format::Clash => {
+                Target::Clash => {
                     for name in expected {
                         assert!(rendered.body.contains(name));
                     }
@@ -1028,7 +1028,7 @@ mod tests {
         let parsed = subscription::parse(payload(&fixtures).as_bytes(), "airport");
 
         let index = index(&fixtures);
-        let rendered = Format::Links
+        let rendered = Target::Links
             .render(&entries(&index), RenderIntent::Client)
             .unwrap();
 

@@ -82,7 +82,7 @@ pub enum Error {
 
     /// A document this instance cannot write.
     ///
-    /// Its own problem, not the caller's: the format and the direction are both
+    /// Its own problem, not the caller's: the target and the direction are both
     /// this instance's choice, made where the collection is written.
     #[error(transparent)]
     Render(#[from] suba_core::RenderError),
@@ -107,9 +107,9 @@ pub enum Error {
     #[error("token name: {reason}")]
     TokenName { reason: &'static str },
 
-    /// A format this build does not serve was asked for by name.
-    #[error("format: not a format this build serves")]
-    UnknownFormat,
+    /// A target this build does not serve was asked for by name.
+    #[error("target: not a target this build serves")]
+    UnknownTarget,
 
     /// A delivery token was used more often than it may be.
     #[error("too many requests")]
@@ -392,9 +392,9 @@ impl IntoHttpError for Error {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
                 message: format!("token name: {reason}"),
             },
-            Error::UnknownFormat => HttpError {
+            Error::UnknownTarget => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
-                message: "format: not a format this build serves".to_string(),
+                message: "target: not a target this build serves".to_string(),
             },
             Error::TooManyRequests { .. } => HttpError {
                 status_code: StatusCode::TOO_MANY_REQUESTS,

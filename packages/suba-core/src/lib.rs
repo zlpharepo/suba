@@ -19,33 +19,33 @@
 //! * [`subscription`] — the container formats a provider serves.
 //! * [`index`] — every provider's nodes, merged into one view.
 //! * [`collection`] — a subscription assembled out of providers.
-//! * [`format`] — the documents a collection can be served as.
+//! * [`target`] — the documents a collection can be served as.
 //! * [`provider`] — what a fetch means for what is kept.
 //! * [`filter`] — which nodes survive.
 
 pub mod checksum;
 pub mod collection;
 pub mod filter;
-pub mod format;
 pub mod index;
 pub mod node;
 pub mod observation;
 pub mod provider;
 pub mod subscription;
+pub mod target;
 
 /// The protocol model, under the name this crate refers to it by.
 pub use suba_proto as proto;
 
 pub use collection::{Collection, Resolved};
 pub use filter::{FilterError, NodeFilter, Pattern, PatternReason};
-#[cfg(feature = "singbox")]
-pub use format::outbounds;
-pub use format::{
-    Format, FormatDescriptor, ProtocolSupport, RenderError, RenderIntent, Rendered, SkipReason,
-    Skipped,
-};
 pub use index::{name_conflicts, IndexEntry, NodeIndex, Source};
 pub use node::{NodeRecord, Provenance};
 pub use observation::Observation;
 pub use provider::{decide, record_failure, Fetched, PayloadReport, RefreshPlan, RefreshStatus};
 pub use subscription::{SourceFormat, Subscription};
+#[cfg(feature = "singbox")]
+pub use target::outbounds;
+pub use target::{
+    ProtocolSupport, RenderError, RenderIntent, Rendered, SkipReason, Skipped, Target,
+    TargetDescriptor,
+};

@@ -314,7 +314,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
     let exported = manager
         .authed(
             Method::GET,
-            "/api/inbounds/users/example/content?format=links",
+            "/api/inbounds/users/example/content?target=links",
         )
         .send()
         .await

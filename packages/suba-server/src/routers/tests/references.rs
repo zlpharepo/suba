@@ -320,7 +320,7 @@ async fn reference_catalog_reports_conversion_skips_without_losing_usable_nodes(
     let rendered = server
         .authed(
             Method::GET,
-            "/api/collections/first/content?format=sing-box",
+            "/api/collections/first/content?target=sing-box",
         )
         .send()
         .await

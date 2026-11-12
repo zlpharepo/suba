@@ -1,6 +1,6 @@
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
-use suba_core::{Format, ProtocolSupport};
+use suba_core::{ProtocolSupport, Target};
 
 use crate::{
     dto::{Operator, ResponseResult},
@@ -21,30 +21,30 @@ pub struct SystemStatus {
 pub struct SystemInfo {
     pub version: String,
     pub administrator_configured: bool,
-    /// The document formats this build writes.
+    /// The conversion targets supported by this build.
     ///
-    /// Compiled, not configured: a format whose dialect is behind a feature that
+    /// Compiled, not configured: a target whose dialect is behind a feature that
     /// is off is absent here, so a client that reads this list never asks for
     /// something this instance cannot answer.
-    pub formats: Vec<FormatView>,
+    pub targets: Vec<TargetView>,
 }
 
-/// One format, as the API describes it.
+/// One target, as the API describes it.
 ///
 /// Written, never read: the names are the ones the model spells, so this is a
 /// response and not a request body.
 #[derive(Debug, Serialize)]
-pub struct FormatView {
+pub struct TargetView {
     /// The name it is asked for by.
     pub name: &'static str,
     /// The directions it can write.
     pub intents: Vec<&'static str>,
-    /// The protocols it can write, so that a caller can tell what a format will
+    /// The protocols it can write, so that a caller can tell what a target will
     /// leave out **before** asking for a document.
     pub protocols: ProtocolsView,
 }
 
-/// Which protocols a format has a representation for.
+/// Which protocols a target has a representation for.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case", tag = "support")]
 pub enum ProtocolsView {
@@ -83,23 +83,23 @@ pub async fn info(_auth: Operator, State(state): State<AppState>) -> Json<System
         version: VERSION.to_string(),
         administrator_configured: !state.is_agent()
             && state.settings().administrator().await.is_some(),
-        formats: if state.is_agent() {
+        targets: if state.is_agent() {
             Vec::new()
         } else {
-            formats()
+            targets()
         },
     })
 }
 
-/// What this build can write, in the order the formats are listed in.
-fn formats() -> Vec<FormatView> {
-    Format::all()
+/// What this build can write, in the order the targets are listed in.
+fn targets() -> Vec<TargetView> {
+    Target::all()
         .iter()
-        .map(|format| {
-            let descriptor = format.descriptor();
+        .map(|target| {
+            let descriptor = target.descriptor();
 
-            FormatView {
-                name: format.as_str(),
+            TargetView {
+                name: target.as_str(),
                 intents: descriptor
                     .intents
                     .iter()
@@ -121,33 +121,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_capability_list_says_what_each_format_writes() {
-        let formats = formats();
-        assert!(!formats.is_empty(), "a build that serves nothing is a bug");
+    fn the_capability_list_says_what_each_target_writes() {
+        let targets = targets();
+        assert!(!targets.is_empty(), "a build that serves nothing is a bug");
 
-        for format in &formats {
-            assert!(!format.intents.is_empty(), "{format:?} writes no direction");
+        for target in &targets {
+            assert!(!target.intents.is_empty(), "{target:?} writes no direction");
             assert!(
-                Format::all()
+                Target::all()
                     .iter()
-                    .any(|known| known.as_str() == format.name),
-                "{:?} is not a format this build has",
-                format.name
+                    .any(|known| known.as_str() == target.name),
+                "{:?} is not a target this build has",
+                target.name
             );
         }
     }
 
     /// The name in the capability list is the name a request is made with: the
-    /// one the format serializes as.
+    /// one the target serializes as.
     #[test]
     fn the_listed_name_is_the_name_that_is_asked_for() {
-        let spelled = serde_json::to_value(Format::all()).expect("the formats serialize");
+        let spelled = serde_json::to_value(Target::all()).expect("the targets serialize");
         let spelled = spelled.as_array().expect("a list");
 
         assert_eq!(
-            formats()
+            targets()
                 .iter()
-                .map(|format| format.name)
+                .map(|target| target.name)
                 .collect::<Vec<_>>(),
             spelled
                 .iter()
@@ -156,13 +156,13 @@ mod tests {
         );
     }
 
-    /// A format that leaves no protocol out says so rather than listing every
+    /// A target that leaves no protocol out says so rather than listing every
     /// protocol it knows.
     #[test]
-    fn a_format_that_leaves_nothing_out_says_so() {
-        for format in formats() {
-            if let ProtocolsView::Only { kinds } = &format.protocols {
-                assert!(!kinds.is_empty(), "{format:?} can write nothing");
+    fn a_target_that_leaves_nothing_out_says_so() {
+        for target in targets() {
+            if let ProtocolsView::Only { kinds } = &target.protocols {
+                assert!(!kinds.is_empty(), "{target:?} can write nothing");
             }
         }
     }

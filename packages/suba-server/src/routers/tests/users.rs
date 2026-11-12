@@ -111,11 +111,12 @@ async fn a_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
     assert_eq!(grants[2]["reason"], "inbound: no inbound has this tag");
 
     let delivered = server
-        .get(&format!("/s/{token}?format=links"))
+        .get(&format!("/s/{token}?target=links"))
         .send()
         .await
         .unwrap();
     assert_eq!(delivered.status(), 200);
+    assert_eq!(delivered.headers()["x-suba-target"], "links");
     assert_eq!(delivered.text().await.unwrap().trim(), link);
 
     let editor = body(get(&server, "/api/inbounds/configs/server/exports").await).await;
@@ -171,8 +172,9 @@ async fn without_a_public_host_a_node_says_why_and_the_subscription_leaves_it_ou
     assert_eq!(grant["reason"], "public-host: not set in config.toml");
     assert!(grant.get("link").is_none());
 
-    let preview = get(&server, &format!("{USERS}/alice/content?format=links")).await;
+    let preview = get(&server, &format!("{USERS}/alice/content?target=links")).await;
     assert_eq!(preview.status(), 200);
+    assert_eq!(preview.headers()["x-suba-target"], "links");
     assert_eq!(preview.headers()["x-suba-nodes"], "0");
     assert_eq!(preview.headers()["x-suba-skipped"], "1");
 }

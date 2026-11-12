@@ -9,7 +9,7 @@ use axum::{
 };
 use http::{header, HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
-use suba_core::format::{Format, RenderIntent};
+use suba_core::target::{RenderIntent, Target};
 use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source};
 
 #[cfg(feature = "singbox-core")]
@@ -193,25 +193,25 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Which format a caller asks an artifact in.
+/// The conversion target requested for an artifact.
 #[derive(Debug, Default, Deserialize)]
-pub struct Choice {
-    pub format: Option<String>,
+pub struct TargetChoice {
+    pub target: Option<String>,
 }
 
-impl Choice {
-    /// The format asked for by name, then by the client's `User-Agent`, then
+impl TargetChoice {
+    /// The target asked for by name, then by the client's `User-Agent`, then
     /// base64: a link list in base64 is the shape every client reads.
-    pub(crate) fn resolve(&self, headers: &HeaderMap) -> Result<Format, Error> {
-        if let Some(name) = self.format.as_deref() {
-            return Format::named(name).ok_or(Error::UnknownFormat);
+    pub(crate) fn resolve(&self, headers: &HeaderMap) -> Result<Target, Error> {
+        if let Some(name) = self.target.as_deref() {
+            return Target::named(name).ok_or(Error::UnknownTarget);
         }
 
         Ok(headers
             .get(header::USER_AGENT)
             .and_then(|agent| agent.to_str().ok())
-            .and_then(Format::for_user_agent)
-            .unwrap_or(Format::Base64))
+            .and_then(Target::for_user_agent)
+            .unwrap_or(Target::Base64))
     }
 }
 
@@ -290,7 +290,7 @@ pub async fn revoke_token(
 pub(crate) async fn artifact_of(
     state: &AppState,
     name: &str,
-    format: Format,
+    target: Target,
 ) -> Result<(std::sync::Arc<Artifact>, bool), Error> {
     let mut collection = state
         .collections()
@@ -303,7 +303,7 @@ pub(crate) async fn artifact_of(
 
     let observations = state.providers().observations().await?;
 
-    let key = address(state, &collection, &observations, format).await?;
+    let key = address(state, &collection, &observations, target).await?;
 
     if let Some(artifact) = state.rendered().get(&key) {
         return Ok((artifact, true));
@@ -325,13 +325,13 @@ pub(crate) async fn artifact_of(
 
     let nodes = resolved.nodes;
 
-    // The direction is asked for explicitly, and today every compiled format
-    // writes the client one; a format that grew a server direction would have to
+    // The direction is asked for explicitly, and today every compiled target
+    // writes the client one; a target that grew a server direction would have to
     // say so in its descriptor first.
-    let rendered = format.render(&nodes.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
+    let rendered = target.render(&nodes.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
     let artifact = std::sync::Arc::new(Artifact {
         body: rendered.body.into(),
-        format,
+        target,
         nodes: nodes.len().saturating_sub(rendered.skipped.len()),
         skipped: rendered.skipped.len(),
         update_hours: update_hours(state, &collection).await,
@@ -345,18 +345,18 @@ pub(crate) async fn artifact_of(
 /// Everything that can change an artifact's bytes, as one address.
 ///
 /// The collection's own bytes, each definition it names, the hash each payload
-/// was fetched at, and the format. A key built by hand out of the fields that
+/// was fetched at, and the target. A key built by hand out of the fields that
 /// «should» matter is the kind that goes stale without anyone noticing; these
 /// are the bytes the answer is a function of.
 async fn address(
     state: &AppState,
     collection: &Collection,
     observations: &BTreeMap<String, Observation>,
-    format: Format,
+    target: Target,
 ) -> Result<String, Error> {
     let mut key = String::new();
 
-    key.push_str(format.as_str());
+    key.push_str(target.as_str());
     key.push('\n');
     key.push_str(&encode(collection)?);
 
@@ -410,7 +410,7 @@ pub async fn content(
     _auth: Operator,
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Query(choice): Query<Choice>,
+    Query(choice): Query<TargetChoice>,
     request: HeaderMap,
 ) -> ResponseResult<impl IntoResponse> {
     let (artifact, _) = artifact_of(&state, &name, choice.resolve(&request)?).await?;
@@ -428,11 +428,11 @@ pub(crate) fn artifact_headers(artifact: &Artifact) -> HeaderMap {
 
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static(artifact.format.media_type()),
+        HeaderValue::from_static(artifact.target.media_type()),
     );
     headers.insert(
-        "x-suba-format",
-        HeaderValue::from_static(artifact.format.as_str()),
+        "x-suba-target",
+        HeaderValue::from_static(artifact.target.as_str()),
     );
 
     if let Some(hours) = artifact.update_hours {
@@ -456,7 +456,7 @@ pub(crate) fn attachment(artifact: &Artifact, name: &str) -> Option<HeaderValue>
 
     HeaderValue::from_str(&format!(
         "attachment; filename=\"subscription.{extension}\"; filename*=UTF-8''{encoded}.{extension}",
-        extension = artifact.format.extension(),
+        extension = artifact.target.extension(),
     ))
     .ok()
 }
@@ -478,7 +478,7 @@ pub async fn nodes(
 #[cfg(test)]
 mod artifact_tests {
     use super::*;
-    use suba_core::Format;
+    use suba_core::Target;
 
     use crate::{
         config::ServerConfig,
@@ -534,7 +534,7 @@ mod artifact_tests {
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"]).await;
 
-        let artifact = artifact_of(&state, "main", Format::Links).await.unwrap().0;
+        let artifact = artifact_of(&state, "main", Target::Links).await.unwrap().0;
 
         assert_eq!(artifact.nodes, 1);
         assert_eq!(artifact.skipped, 0);
@@ -558,7 +558,7 @@ mod artifact_tests {
         inline(&state, "beta", &shared).await;
         collection(&state, "main", &["beta", "alpha"]).await;
 
-        let artifact = artifact_of(&state, "main", Format::Links).await.unwrap().0;
+        let artifact = artifact_of(&state, "main", Target::Links).await.unwrap().0;
         let names: Vec<_> = artifact
             .body
             .lines()
@@ -578,13 +578,13 @@ mod artifact_tests {
     /// collection are two artifacts.
     #[cfg(feature = "clash")]
     #[tokio::test]
-    async fn the_artifact_is_written_in_the_format_asked_for() {
+    async fn the_artifact_uses_the_requested_target() {
         let state = state().await;
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"]).await;
 
-        let clash = artifact_of(&state, "main", Format::Clash).await.unwrap().0;
-        let links = artifact_of(&state, "main", Format::Links).await.unwrap().0;
+        let clash = artifact_of(&state, "main", Target::Clash).await.unwrap().0;
+        let links = artifact_of(&state, "main", Target::Links).await.unwrap().0;
 
         assert!(
             clash.body.contains("proxies:"),
@@ -603,8 +603,8 @@ mod artifact_tests {
         inline(&state, "alpha", &link("alpha.example.com", "US-01")).await;
         collection(&state, "main", &["alpha"]).await;
 
-        let once = artifact_of(&state, "main", Format::Links).await.unwrap().0;
-        let twice = artifact_of(&state, "main", Format::Links).await.unwrap().0;
+        let once = artifact_of(&state, "main", Target::Links).await.unwrap().0;
+        let twice = artifact_of(&state, "main", Target::Links).await.unwrap().0;
 
         assert_eq!(once.body, twice.body);
         assert!(std::sync::Arc::ptr_eq(&once, &twice), "the same artifact");
@@ -624,8 +624,8 @@ mod artifact_tests {
         collection(&state, "main", &["alpha"]).await;
 
         let before = std::fs::read_dir(state.data_dir()).map(Iterator::count);
-        artifact_of(&state, "main", Format::Links).await.unwrap();
-        artifact_of(&state, "main", Format::Links).await.unwrap();
+        artifact_of(&state, "main", Target::Links).await.unwrap();
+        artifact_of(&state, "main", Target::Links).await.unwrap();
         let after = std::fs::read_dir(state.data_dir()).map(Iterator::count);
 
         assert_eq!(before.unwrap(), after.unwrap(), "two renders add no files");
@@ -878,15 +878,15 @@ pub(crate) async fn outbounds_of(
         .filter_map(|(index, entry)| {
             let reason = refused.get(&entry.id)?;
             let (field, reason) = match reason {
-                suba_core::format::SkipReason::Field { field, reason } => (*field, *reason),
-                suba_core::format::SkipReason::Protocol(_) => {
+                suba_core::target::SkipReason::Field { field, reason } => (*field, *reason),
+                suba_core::target::SkipReason::Protocol(_) => {
                     ("protocol", "the protocol cannot be represented by sing-box")
                 }
-                suba_core::format::SkipReason::Transport(_) => (
+                suba_core::target::SkipReason::Transport(_) => (
                     "transport",
                     "the transport cannot be represented by sing-box",
                 ),
-                suba_core::format::SkipReason::Refused { .. } => {
+                suba_core::target::SkipReason::Refused { .. } => {
                     ("node", "the node cannot be represented by sing-box")
                 }
             };

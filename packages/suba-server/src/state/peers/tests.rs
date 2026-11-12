@@ -150,7 +150,7 @@ fn endpoints_require_tls_and_resource_scope_excludes_auth_trust_and_recursion() 
     for path in [
         "/system/metrics",
         "/providers/example",
-        "/collections/example/content?format=links",
+        "/collections/example/content?target=links",
         "/cores/sing-box/configs/example",
         // The manager writes a hosted user's entry here, so an agent that
         // refused the prefix would silently drop every remote grant.

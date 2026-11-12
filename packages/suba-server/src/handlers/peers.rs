@@ -356,7 +356,7 @@ fn reply_header(name: &str) -> bool {
             | "etag"
             | "retry-after"
             | "subscription-update-interval"
-            | "x-suba-format"
+            | "x-suba-target"
             | "x-suba-nodes"
             | "x-suba-skipped"
     )

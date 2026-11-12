@@ -2,11 +2,11 @@
 //!
 //! A render is a pure function of things that are already in memory, so what
 //! remembering one buys is not correctness but the second subscriber: the same
-//! collection, over the same payloads, in the same format produces the same
+//! collection, over the same payloads, in the same target produces the same
 //! bytes, and producing them again would walk every node of every payload again.
 //! The key is a content address — the collection's bytes, each contributing
-//! definition's bytes, the hash each payload was fetched at, and the format — so
-//! an edit, a refresh or a format change misses, and a request that changes
+//! definition's bytes, the hash each payload was fetched at, and the target — so
+//! an edit, a refresh or a target change misses, and a request that changes
 //! nothing hits.
 //!
 //! Nothing here is written down (I3). What is remembered is derived from the
@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use suba_core::Format;
+use suba_core::Target;
 
 /// How many artifacts are kept.
 ///
@@ -43,11 +43,11 @@ struct Entries {
 #[derive(Debug)]
 pub(crate) struct Artifact {
     pub(crate) body: Arc<str>,
-    /// The format the body is written in, as the request chose it.
-    pub(crate) format: Format,
+    /// The conversion target selected by the request.
+    pub(crate) target: Target,
     /// How many nodes the body holds.
     pub(crate) nodes: usize,
-    /// How many nodes the format could not write.
+    /// How many nodes the target could not write.
     pub(crate) skipped: usize,
     /// How often a client should ask again, in hours: the shortest refresh
     /// interval among the providers, or `None` when none refreshes by itself.
@@ -101,7 +101,7 @@ mod tests {
     fn artifact(body: &str) -> Arc<Artifact> {
         Arc::new(Artifact {
             body: Arc::from(body),
-            format: Format::Links,
+            target: Target::Links,
             nodes: 1,
             skipped: 0,
             update_hours: None,

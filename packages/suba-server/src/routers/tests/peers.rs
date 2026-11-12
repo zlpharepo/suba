@@ -173,12 +173,13 @@ async fn direct_management_preserves_remote_ownership_and_local_authentication()
     let preview = local
         .authed(
             Method::GET,
-            &(base.clone() + "/collections/example/content?format=links"),
+            &(base.clone() + "/collections/example/content?target=links"),
         )
         .send()
         .await
         .unwrap();
     assert_eq!(preview.status(), 200);
+    assert_eq!(preview.headers()["x-suba-target"], "links");
     assert_eq!(preview.headers()["x-suba-nodes"], "1");
     assert_eq!(preview.headers()[header::CACHE_CONTROL], "no-store");
     assert!(preview.text().await.unwrap().starts_with("trojan://"));
@@ -489,7 +490,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
             if response.status() == 200 {
                 let info = body(response).await;
                 assert_eq!(info["administrator_configured"], false);
-                assert_eq!(info["formats"], json!([]));
+                assert_eq!(info["targets"], json!([]));
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;

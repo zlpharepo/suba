@@ -21,7 +21,7 @@ use http::{header, HeaderMap, HeaderValue, StatusCode};
 
 use crate::{
     error::Error,
-    handlers::collections::{artifact_headers, artifact_of, attachment, Choice},
+    handlers::collections::{artifact_headers, artifact_of, attachment, TargetChoice},
     routers, tracing, AppState,
 };
 
@@ -32,7 +32,7 @@ use crate::{
 pub async fn serve(
     State(state): State<AppState>,
     Path((prefix, token)): Path<(String, String)>,
-    Query(choice): Query<Choice>,
+    Query(choice): Query<TargetChoice>,
     request: Request,
 ) -> Response {
     if !addresses_deliveries(&state, &prefix).await {
@@ -46,7 +46,7 @@ pub async fn serve(
 pub async fn download(
     State(state): State<AppState>,
     Path((prefix, token)): Path<(String, String)>,
-    Query(choice): Query<Choice>,
+    Query(choice): Query<TargetChoice>,
     request: Request,
 ) -> Response {
     if !addresses_deliveries(&state, &prefix).await {
@@ -87,7 +87,7 @@ async fn deliver(
     state: &AppState,
     prefix: &str,
     token: &str,
-    choice: &Choice,
+    choice: &TargetChoice,
     request: &HeaderMap,
     download: bool,
 ) -> Result<(HeaderMap, String), Error> {
@@ -128,13 +128,13 @@ async fn deliver(
         return Err(Error::TooManyRequests { retry_after });
     }
 
-    let format = choice.resolve(request)?;
+    let target = choice.resolve(request)?;
 
     // The holder can go away between the lookup and the render; that is the
     // delivery's 404 too, never a message naming it.
     let (artifact, cached) = match holder {
-        Holder::Collection => artifact_of(state, &name, format).await,
-        Holder::User => user_artifact(state, &name, format)
+        Holder::Collection => artifact_of(state, &name, target).await,
+        Holder::User => user_artifact(state, &name, target)
             .await
             .map(|artifact| (std::sync::Arc::new(artifact), false)),
     }
@@ -149,7 +149,7 @@ async fn deliver(
         "Delivered {}'{name}' via token '{label}': {} nodes as {}, {} bytes, {}",
         holder.prefix(),
         artifact.nodes,
-        artifact.format,
+        artifact.target,
         artifact.body.len(),
         match cached {
             true => "cached",
@@ -196,16 +196,16 @@ async fn user_token(_: &AppState, _: &str) -> Option<(String, String)> {
 async fn user_artifact(
     state: &AppState,
     name: &str,
-    format: suba_core::format::Format,
+    target: suba_core::target::Target,
 ) -> Result<crate::state::render::Artifact, Error> {
-    crate::handlers::users::user_artifact(state, name, format).await
+    crate::handlers::users::user_artifact(state, name, target).await
 }
 
 #[cfg(not(feature = "singbox-core"))]
 async fn user_artifact(
     _: &AppState,
     _: &str,
-    _: suba_core::format::Format,
+    _: suba_core::target::Target,
 ) -> Result<crate::state::render::Artifact, Error> {
     Err(Error::NoSuchDelivery)
 }
@@ -273,7 +273,7 @@ mod tests {
             state,
             prefix,
             token,
-            &Choice::default(),
+            &TargetChoice::default(),
             &HeaderMap::new(),
             false,
         )
@@ -284,13 +284,13 @@ mod tests {
     async fn get_as(
         state: &AppState,
         token: &str,
-        format: Option<&str>,
+        target: Option<&str>,
         agent: &str,
     ) -> Result<(HeaderMap, String), Error> {
         let mut request = HeaderMap::new();
         request.insert(header::USER_AGENT, HeaderValue::from_str(agent).unwrap());
-        let choice = Choice {
-            format: format.map(str::to_owned),
+        let choice = TargetChoice {
+            target: target.map(str::to_owned),
         };
 
         deliver(state, "s", token, &choice, &request, false).await
@@ -331,7 +331,7 @@ mod tests {
             .unwrap();
         let (_, body) = get(&state, "s", &token).await.unwrap();
 
-        // A client that names no format is served base64-wrapped.
+        // A client that names no target is served base64-wrapped.
         let links = suba_core::proto::base64::decode_to_string(body.as_bytes()).unwrap();
         assert!(!body.contains("://"), "{body}");
         assert!(links.contains("#US-01"), "{links}");
@@ -477,7 +477,7 @@ mod tests {
             &state,
             "s",
             &token,
-            &Choice::default(),
+            &TargetChoice::default(),
             &HeaderMap::new(),
             true,
         )
@@ -537,10 +537,10 @@ mod tests {
         assert_eq!(headers["profile-update-interval"], "2");
     }
 
-    /// The query names a format; failing that, a client that can read only one
+    /// The query names a target; failing that, a client that can read only one
     /// shape gets that shape; failing that, base64.
     #[tokio::test]
-    async fn the_format_is_asked_for_or_recognised() {
+    async fn the_target_is_asked_for_or_recognised() {
         let state = state().await;
         served(&state).await;
         let token = state
@@ -552,7 +552,7 @@ mod tests {
         let (headers, body) = get_as(&state, &token, Some("links"), "clash-verge/v2")
             .await
             .unwrap();
-        assert_eq!(headers["x-suba-format"], "links");
+        assert_eq!(headers["x-suba-target"], "links");
         assert!(body.contains("#US-01"), "{body}");
 
         #[cfg(feature = "clash")]
@@ -560,13 +560,13 @@ mod tests {
             let (headers, body) = get_as(&state, &token, None, "clash-verge/v2")
                 .await
                 .unwrap();
-            assert_eq!(headers["x-suba-format"], "clash");
+            assert_eq!(headers["x-suba-target"], "clash");
             assert_eq!(headers[header::CONTENT_TYPE], "text/yaml; charset=utf-8");
             assert!(body.contains("proxies:"), "{body}");
         }
 
         let (headers, _) = get_as(&state, &token, None, "curl/8.7.1").await.unwrap();
-        assert_eq!(headers["x-suba-format"], "base64");
+        assert_eq!(headers["x-suba-target"], "base64");
 
         // A sing-box client asks with its own name, and the name comes back
         // in the headers spelled the same way.
@@ -575,7 +575,7 @@ mod tests {
             let (headers, body) = get_as(&state, &token, None, "SFA/1.11.0 (Android)")
                 .await
                 .unwrap();
-            assert_eq!(headers["x-suba-format"], "sing-box");
+            assert_eq!(headers["x-suba-target"], "sing-box");
             assert_eq!(
                 headers[header::CONTENT_TYPE],
                 "application/json; charset=utf-8"
@@ -585,7 +585,7 @@ mod tests {
 
         assert!(matches!(
             get_as(&state, &token, Some("xray"), "curl/8.7.1").await,
-            Err(Error::UnknownFormat)
+            Err(Error::UnknownTarget)
         ));
     }
 
