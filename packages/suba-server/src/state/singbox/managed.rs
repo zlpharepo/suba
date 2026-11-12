@@ -398,7 +398,13 @@ pub(crate) fn shared_warning(inbound: &Value) -> Option<&'static str> {
 
 pub(crate) fn managed_warning(inbound: &Value) -> Option<&'static str> {
     (inbound.get("type").and_then(Value::as_str) == Some("snell"))
-        .then_some("Surge cannot use Snell user keys; use shared access for Surge")
+        .then_some("Surge cannot use Snell user keys")
+}
+
+pub(crate) fn shared_refusal(inbound: &Value) -> Option<&'static str> {
+    (inbound.get("type").and_then(Value::as_str) == Some("snell"))
+        .then(|| users::shareable(inbound).err())
+        .flatten()
 }
 
 impl Placement {
@@ -795,6 +801,10 @@ mod tests {
             placement(&with_native_users, &shared),
             Placement::Refused(_)
         ));
+        assert_eq!(
+            shared_refusal(&with_native_users["inbounds"][0]),
+            Some("Snell users require a user key, not a shared PSK alone")
+        );
     }
 
     #[test]

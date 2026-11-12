@@ -84,6 +84,8 @@ pub struct EndpointView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_warning: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_refused: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub managed_warning: Option<&'static str>,
     /// The stored override, when the operator set one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -730,6 +732,7 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
                     inbound: tag.to_owned(),
                     modes,
                     shared_warning: managed::shared_warning(inbound),
+                    shared_refused: managed::shared_refusal(inbound),
                     managed_warning: managed::managed_warning(inbound),
                     address: stored.and_then(|endpoint| endpoint.address.clone()),
                     port: stored.and_then(|endpoint| endpoint.port),
@@ -757,7 +760,8 @@ pub async fn put_endpoint(
     // An address for an inbound that is not there would never be read, so it is
     // refused where an operator can still fix it rather than stored quietly.
     let placement = placement(&state, &at).await?;
-    let (modes, shared_warning, managed_warning) = endpoint_access(&state, &at).await?;
+    let (modes, shared_warning, shared_refused, managed_warning) =
+        endpoint_access(&state, &at).await?;
     let reason = if modes.is_empty() {
         placement.reason()
     } else {
@@ -786,6 +790,7 @@ pub async fn put_endpoint(
         inbound,
         modes,
         shared_warning,
+        shared_refused,
         managed_warning,
         address: endpoint.address,
         port: endpoint.port,
@@ -796,7 +801,15 @@ pub async fn put_endpoint(
 async fn endpoint_access(
     state: &AppState,
     at: &Entry,
-) -> Result<(Vec<GrantMode>, Option<&'static str>, Option<&'static str>), Error> {
+) -> Result<
+    (
+        Vec<GrantMode>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    ),
+    Error,
+> {
     let store = state.singbox();
     let at = at.clone();
     tokio::task::spawn_blocking(move || -> Result<_, Error> {
@@ -813,6 +826,7 @@ async fn endpoint_access(
         Ok((
             inbound.map_or_else(Vec::new, managed::modes),
             inbound.and_then(managed::shared_warning),
+            inbound.and_then(managed::shared_refusal),
             inbound.and_then(managed::managed_warning),
         ))
     })
