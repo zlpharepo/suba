@@ -1,4 +1,4 @@
-//! Inbound users, read from the server's side and handed to a client's.
+//! Inbound user capabilities and shared access, read from the server's side.
 //!
 //! Three things a managed user needs from a native inbound, and nothing
 //! else: whether the inbound can take one, the user entry the core reads, and
@@ -116,6 +116,90 @@ pub fn grantable(inbound: &Value) -> Result<Protocol, &'static str> {
     }
 }
 
+/// Whether an inbound can be distributed with its existing shared credential.
+/// No user is added to the sing-box document in this mode.
+pub fn shareable(inbound: &Value) -> Result<(), &'static str> {
+    let users = inbound
+        .get("users")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    match inbound.get("type").and_then(Value::as_str) {
+        Some("shadowsocks") => {
+            if !users
+                || inbound
+                    .get("destinations")
+                    .and_then(Value::as_array)
+                    .is_some_and(|destinations| !destinations.is_empty())
+                || inbound.get("managed").and_then(Value::as_bool) == Some(true)
+            {
+                return Err("this Shadowsocks inbound does not use a single password");
+            }
+            let method = inbound
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !shadowsocks_method(method) {
+                return Err("this Shadowsocks method has no shared credential");
+            }
+            if inbound
+                .get("password")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err("a shared Shadowsocks password is needed");
+            }
+            Ok(())
+        }
+        Some("snell") => {
+            if !users {
+                return Err("Snell users require a user key, not a shared PSK alone");
+            }
+            let version = inbound.get("version").and_then(Value::as_u64);
+            if !matches!(version, Some(5 | 6)) {
+                return Err("Snell version 5 or 6 is needed");
+            }
+            let psk = inbound
+                .get("psk")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if psk.is_empty() {
+                return Err("a shared Snell PSK is needed");
+            }
+            if version == Some(6) && !(12..=255).contains(&psk.len()) {
+                return Err("Snell version 6 needs a 12 to 255 byte PSK");
+            }
+            Ok(())
+        }
+        Some("shadowtls") => match inbound.get("version").and_then(Value::as_u64).unwrap_or(1) {
+            1 => Ok(()),
+            2 if inbound
+                .get("password")
+                .and_then(Value::as_str)
+                .is_some_and(|password| !password.is_empty()) =>
+            {
+                Ok(())
+            }
+            2 => Err("a shared ShadowTLS password is needed"),
+            _ => Err("ShadowTLS shared binding requires version 1 or 2"),
+        },
+        _ => Err("this inbound has no shared access mode"),
+    }
+}
+
+fn shadowsocks_method(method: &str) -> bool {
+    matches!(
+        method,
+        "aes-128-gcm"
+            | "aes-192-gcm"
+            | "aes-256-gcm"
+            | "chacha20-ietf-poly1305"
+            | "xchacha20-ietf-poly1305"
+            | "2022-blake3-aes-128-gcm"
+            | "2022-blake3-aes-256-gcm"
+            | "2022-blake3-chacha20-poly1305"
+    )
+}
+
 /// Whether a Shadowsocks inbound can carry managed users, and why not when it
 /// cannot.
 ///
@@ -128,7 +212,11 @@ fn shadowsocks(inbound: &Value) -> Result<Protocol, &'static str> {
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    if inbound.get("destinations").is_some() {
+    if inbound
+        .get("destinations")
+        .and_then(Value::as_array)
+        .is_some_and(|destinations| !destinations.is_empty())
+    {
         return Err("a relay inbound takes destinations, not users");
     }
     // `managed` is a plain flag, not an `{enabled}` block, and the core
@@ -141,6 +229,9 @@ fn shadowsocks(inbound: &Value) -> Result<Protocol, &'static str> {
     // and the chacha20-poly1305 one refuses multi-user outright.
     if method == "2022-blake3-chacha20-poly1305" {
         return Err("this cipher cannot have more than one user");
+    }
+    if !shadowsocks_method(method) {
+        return Err("this Shadowsocks method cannot have users");
     }
     if method.starts_with("2022-blake3-") && shadowsocks_key_len(method).is_none() {
         return Err("only the 2022 key lengths can be derived");
@@ -671,6 +762,75 @@ mod tests {
         ("vless", true),
         ("vmess", true),
     ];
+
+    #[test]
+    fn shared_bindings_only_cover_native_single_credential_modes() {
+        for method in [
+            "aes-128-gcm",
+            "aes-192-gcm",
+            "aes-256-gcm",
+            "chacha20-ietf-poly1305",
+            "xchacha20-ietf-poly1305",
+            "2022-blake3-aes-128-gcm",
+            "2022-blake3-aes-256-gcm",
+            "2022-blake3-chacha20-poly1305",
+        ] {
+            assert_eq!(
+                shareable(&json!({"type": "shadowsocks", "method": method, "password": "key"})),
+                Ok(()),
+                "{method}"
+            );
+        }
+        for method in ["none", "unknown"] {
+            let inbound = json!({"type": "shadowsocks", "method": method, "password": "key"});
+            assert!(shareable(&inbound).is_err(), "{method}");
+            assert!(grantable(&inbound).is_err(), "{method}");
+        }
+        for extra in [
+            json!({"users": [{"name": "a", "password": "key"}]}),
+            json!({"managed": true}),
+            json!({"destinations": [{"name": "relay"}]}),
+        ] {
+            let mut inbound =
+                json!({"type": "shadowsocks", "method": "aes-256-gcm", "password": "key"});
+            inbound
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(shareable(&inbound).is_err());
+        }
+        let empty_relay = json!({"type": "shadowsocks", "method": "aes-256-gcm", "password": "key", "destinations": []});
+        assert_eq!(shareable(&empty_relay), Ok(()));
+        assert_eq!(grantable(&empty_relay), Ok(Protocol::Shadowsocks));
+        for version in [5, 6] {
+            assert_eq!(
+                shareable(&json!({"type": "snell", "version": version, "psk": "shared-secret"})),
+                Ok(())
+            );
+            assert!(shareable(&json!({"type": "snell", "version": version, "psk": "shared-secret", "users": [{"name": "a", "userkey": "key"}]})).is_err());
+        }
+        assert!(shareable(&json!({"type": "snell", "version": 6, "psk": "short"})).is_err());
+        assert_eq!(
+            shareable(&json!({"type": "shadowtls", "version": 1})),
+            Ok(())
+        );
+        assert_eq!(
+            shareable(&json!({"type": "shadowtls", "version": 2, "password": "key"})),
+            Ok(())
+        );
+        assert!(shareable(&json!({"type": "shadowtls", "version": 2})).is_err());
+        assert!(shareable(&json!({"type": "shadowtls", "version": 3})).is_err());
+        for kind in [
+            "direct",
+            "tun",
+            "redirect",
+            "tproxy",
+            "cloudflared",
+            "mixed",
+        ] {
+            assert!(shareable(&json!({"type": kind})).is_err(), "{kind}");
+        }
+    }
 
     /// Every protocol whose inbound takes per-user credentials is grantable,
     /// and what cannot be is refused with the reason that makes it true.

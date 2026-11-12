@@ -1,5 +1,5 @@
-//! Managed users in the configuration the core runs, and the clients that
-//! reach every user of an inbound.
+//! Managed users in the configuration the core runs, and the status of shared
+//! bindings that leave the native document untouched.
 //!
 //! **Injected, never written back.** A managed user exists only in the
 //! assembled document: the operator's configuration keeps its hand-written
@@ -20,7 +20,7 @@ use suba_core::proto::{write_link, Client, Host, Node};
 use suba_singbox::users::{self, Protocol};
 
 use crate::error::Error;
-use crate::state::access::{Access, Entry};
+use crate::state::access::{Access, Entry, GrantMode};
 
 /// The managed users one inbound of a configuration gets.
 struct Planned {
@@ -64,7 +64,7 @@ fn plan(document: &Value, config: &str, access: &Access) -> Plan {
             // it injects nothing here however it was granted.
             // `at` names a local inbound, and a hosted entry is never equal to
             // it, so another instance's inbound injects nothing here.
-            .filter(|grant| grant.entry == at)
+            .filter(|grant| grant.entry.same_inbound(&at) && grant.entry.mode == GrantMode::Managed)
             .filter_map(|grant| {
                 let material = access.material(&grant.user, &grant.entry)?;
                 Some(PlannedUser {
@@ -140,7 +140,7 @@ pub(crate) enum Serving<'a> {
     Not { in_use: bool },
 }
 
-/// How far a managed user's credential has got.
+/// How far a managed credential or shared inbound configuration has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum State {
@@ -181,6 +181,10 @@ pub(crate) struct InboundUsers {
     pub flow: Option<&'static str>,
     pub users: Vec<HandWritten>,
     pub managed: Vec<Managed>,
+    /// Distribution-only bindings; no native user is added for these.
+    pub shared: Vec<Shared>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_refused: Option<&'static str>,
     /// Users the running core still has here that this configuration no
     /// longer gives it; a restart takes them away.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -204,7 +208,15 @@ pub(crate) struct Managed {
     pub export: Export,
 }
 
-/// Every user of every inbound of `config`, hand-written and managed.
+#[derive(Debug, Serialize)]
+pub(crate) struct Shared {
+    pub user: String,
+    pub state: State,
+    #[serde(flatten)]
+    pub export: Export,
+}
+
+/// Hand-written users, managed users, and shared bindings of `config`.
 pub(crate) fn exports(
     document: &Value,
     config: &str,
@@ -213,6 +225,7 @@ pub(crate) fn exports(
     serving: &Serving<'_>,
 ) -> Vec<InboundUsers> {
     let plan = plan(document, config, access);
+    let grants = access.grants();
 
     inbounds(document)
         .iter()
@@ -255,6 +268,27 @@ pub(crate) fn exports(
                         .collect()
                 })
                 .unwrap_or_default();
+            let shared = if users::shareable(inbound).is_ok() {
+                grants
+                    .iter()
+                    .filter(|grant| {
+                        grant.entry.mode == GrantMode::Shared
+                            && grant
+                                .entry
+                                .same_inbound(&Entry::local(config, tag.unwrap_or_default()))
+                    })
+                    .map(|grant| Shared {
+                        user: grant.user.clone(),
+                        state: shared_state(serving, tag, inbound),
+                        export: refusal(
+                            "type: shared inbound subscription export is not available yet"
+                                .to_string(),
+                        ),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let departing = departing(serving, tag, written, &managed);
 
             InboundUsers {
@@ -264,14 +298,15 @@ pub(crate) fn exports(
                 flow: users::flow(inbound),
                 users,
                 managed,
+                shared,
+                shared_refused: users::shareable(inbound).err(),
                 departing,
             }
         })
         .collect()
 }
 
-/// The client nodes of one managed user in `config`, each named after its
-/// inbound, or why one cannot be.
+/// The client nodes of one user in `config`, or why an entry has none yet.
 pub(crate) fn nodes(
     document: &Value,
     config: &str,
@@ -281,7 +316,8 @@ pub(crate) fn nodes(
 ) -> Vec<Result<Node<Client>, String>> {
     let plan = plan(document, config, access);
 
-    plan.inbounds
+    let mut nodes: Vec<_> = plan
+        .inbounds
         .iter()
         .filter_map(|(index, planned)| {
             let managed = planned.users.iter().find(|held| held.name == user)?;
@@ -303,7 +339,20 @@ pub(crate) fn nodes(
                 .map_err(|refused| refused.to_string()),
             })
         })
-        .collect()
+        .collect();
+    nodes.extend(
+        access
+            .users
+            .get(user)
+            .into_iter()
+            .flat_map(|held| access.grants_of(user, held))
+            .filter(|grant| grant.entry.config == config && grant.entry.host.is_none())
+            .filter(|grant| grant.entry.mode == GrantMode::Shared)
+            .map(|_| {
+                Err("type: shared inbound subscription export is not available yet".to_string())
+            }),
+    );
+    nodes
 }
 
 /// Where an entry stands against the configuration document it names.
@@ -314,6 +363,42 @@ pub(crate) enum Placement {
     Unknown,
     /// The inbound is there but cannot take users.
     Refused(&'static str),
+}
+
+pub(crate) fn modes(inbound: &Value) -> Vec<GrantMode> {
+    let mut modes = Vec::new();
+    if users::grantable(inbound).is_ok() {
+        modes.push(GrantMode::Managed);
+    }
+    if users::shareable(inbound).is_ok() {
+        modes.push(GrantMode::Shared);
+    }
+    modes
+}
+
+pub(crate) fn shared_warning(inbound: &Value) -> Option<&'static str> {
+    match inbound.get("type").and_then(Value::as_str) {
+        Some("shadowtls")
+            if matches!(
+                inbound.get("version").and_then(Value::as_u64),
+                None | Some(0 | 1)
+            ) =>
+        {
+            Some("ShadowTLS v1 has no outer authentication")
+        }
+        Some("snell")
+            if inbound.get("version").and_then(Value::as_u64) == Some(6)
+                && inbound.get("mode").and_then(Value::as_str) == Some("unsafe-raw") =>
+        {
+            Some("Snell v6 unsafe-raw does not authenticate the PSK")
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn managed_warning(inbound: &Value) -> Option<&'static str> {
+    (inbound.get("type").and_then(Value::as_str) == Some("snell"))
+        .then_some("Surge cannot use Snell user keys; use shared access for Surge")
 }
 
 impl Placement {
@@ -334,7 +419,10 @@ pub(crate) fn placement(document: &Value, entry: &Entry) -> Placement {
         .find(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(&entry.inbound))
     {
         None => Placement::Unknown,
-        Some(inbound) => match users::grantable(inbound) {
+        Some(inbound) => match match entry.mode {
+            GrantMode::Managed => users::grantable(inbound).map(|_| ()),
+            GrantMode::Shared => users::shareable(inbound),
+        } {
             Ok(_) => Placement::Placed,
             Err(refused) => Placement::Refused(refused),
         },
@@ -464,6 +552,23 @@ fn state(serving: &Serving<'_>, tag: Option<&str>, entry: &Value) -> State {
             true => State::Applied,
             false => State::Pending,
         },
+    }
+}
+
+fn shared_state(serving: &Serving<'_>, tag: Option<&str>, inbound: &Value) -> State {
+    match serving {
+        Serving::Not { in_use: true } => State::Stopped,
+        Serving::Not { in_use: false } => State::Unused,
+        Serving::Running(product) => {
+            let applied = inbounds(product)
+                .iter()
+                .find(|held| tag.is_some() && held.get("tag").and_then(Value::as_str) == tag);
+            if applied == Some(inbound) {
+                State::Applied
+            } else {
+                State::Pending
+            }
+        }
     }
 }
 
@@ -611,6 +716,88 @@ mod tests {
     }
 
     #[test]
+    fn shared_bindings_do_not_inject_users_and_are_reported_as_unexported() {
+        let document = json!({"inbounds": [
+            {"type": "shadowsocks", "tag": "ss", "method": "2022-blake3-chacha20-poly1305", "password": "key", "listen_port": 1080},
+            {"type": "snell", "tag": "snell", "version": 6, "psk": "shared-secret", "listen_port": 1081},
+            {"type": "shadowtls", "tag": "shadow", "version": 2, "password": "key", "listen_port": 1082},
+            {"type": "shadowtls", "tag": "legacy", "version": 1, "listen_port": 1083}
+        ]});
+        let mut access = Access::default();
+        let inbounds = ["ss", "snell", "shadow", "legacy"]
+            .into_iter()
+            .map(|tag| Entry {
+                mode: GrantMode::Shared,
+                ..entry("server", tag)
+            })
+            .collect();
+        access.users.insert(
+            "alice".into(),
+            User {
+                inbounds,
+                secret: "11".repeat(32),
+                ..User::default()
+            },
+        );
+
+        assert_eq!(inject(&document, "server", &access).unwrap(), document);
+        assert_eq!(modes(&document["inbounds"][0]), [GrantMode::Shared]);
+        assert_eq!(
+            modes(&document["inbounds"][1]),
+            [GrantMode::Managed, GrantMode::Shared]
+        );
+        assert_eq!(
+            shared_warning(&document["inbounds"][3]),
+            Some("ShadowTLS v1 has no outer authentication")
+        );
+        assert_eq!(
+            shared_warning(&json!({"type": "snell", "version": 6, "mode": "unsafe-raw"})),
+            Some("Snell v6 unsafe-raw does not authenticate the PSK")
+        );
+        let exports = exports(
+            &document,
+            "server",
+            &access,
+            Ok(&host()),
+            &Serving::Running(&document),
+        );
+        for inbound in &exports {
+            assert!(inbound.managed.is_empty());
+            assert_eq!(inbound.shared.len(), 1);
+            assert_eq!(inbound.shared[0].user, "alice");
+            assert_eq!(inbound.shared[0].state, State::Applied);
+            assert!(inbound.shared[0].export.reason.is_some());
+        }
+        let nodes = nodes(&document, "server", &access, "alice", Ok(&host()));
+        assert_eq!(nodes.len(), 4);
+        assert!(nodes.iter().all(Result::is_err));
+        let managed_document = json!({"inbounds": [{"type": "snell", "tag": "snell", "version": 5, "psk": "shared-secret"}]});
+        let mut managed_access = Access::default();
+        managed_access.users.insert(
+            "alice".into(),
+            User {
+                inbounds: vec![entry("server", "snell")],
+                secret: "11".repeat(32),
+                ..User::default()
+            },
+        );
+        let injected = inject(&managed_document, "server", &managed_access).unwrap();
+        assert_eq!(names(&injected, 0), ["alice"]);
+        assert!(injected["inbounds"][0]["users"][0]["userkey"].is_string());
+
+        let shared = Entry {
+            mode: GrantMode::Shared,
+            ..entry("server", "snell")
+        };
+        let mut with_native_users = managed_document;
+        with_native_users["inbounds"][0]["users"] = json!([{"name": "native", "userkey": "key"}]);
+        assert!(matches!(
+            placement(&with_native_users, &shared),
+            Placement::Refused(_)
+        ));
+    }
+
+    #[test]
     fn managed_users_join_the_inbounds_of_their_configuration_only() {
         let injected = inject(&document(), "server", &access()).unwrap();
 
@@ -647,6 +834,7 @@ mod tests {
                 host: Some(elsewhere),
                 config: "server".to_string(),
                 inbound: "vless-in".to_string(),
+                mode: GrantMode::Managed,
             },
         ];
 

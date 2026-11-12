@@ -23,7 +23,7 @@ use crate::{
     handlers::collections::{
         artifact_headers, provider_filters, token_view, update_hours, TargetChoice, TokenView,
     },
-    state::access::{Access, Endpoint, Entry},
+    state::access::{Access, Endpoint, Entry, GrantMode},
     state::render::Artifact,
     state::singbox::{
         managed::{self, Export, InboundUsers, Placement, Serving, State as Applied},
@@ -63,7 +63,8 @@ pub struct GrantView {
     pub host: Option<uuid::Uuid>,
     pub config: String,
     pub inbound: String,
-    /// Absent when the entry reaches no inbound that can take users.
+    pub mode: GrantMode,
+    /// Absent when the entry cannot use its selected access mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<Applied>,
     #[serde(flatten)]
@@ -79,12 +80,17 @@ pub struct EndpointView {
     pub host_name: Option<String>,
     pub config: String,
     pub inbound: String,
+    pub modes: Vec<GrantMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_warning: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_warning: Option<&'static str>,
     /// The stored override, when the operator set one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
-    /// Why this inbound cannot be exported at all, when it cannot.
+    /// Why this inbound has no binding mode, when it has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
 }
@@ -264,6 +270,7 @@ pub async fn index(
                     host: entry.host,
                     config: entry.config.clone(),
                     inbound: entry.inbound.clone(),
+                    mode: entry.mode,
                     state: None,
                     export: Export {
                         reason: Some("host: the Agent is not configured".to_string()),
@@ -383,6 +390,7 @@ fn grant_view(inbounds: &[InboundUsers], entry: Entry, user: &str) -> GrantView 
         host: entry.host,
         config: entry.config.clone(),
         inbound: entry.inbound.clone(),
+        mode: entry.mode,
         state: None,
         export: Export {
             reason: Some(reason),
@@ -396,20 +404,35 @@ fn grant_view(inbounds: &[InboundUsers], entry: Entry, user: &str) -> GrantView 
     else {
         return refused("inbound: no inbound has this tag".to_string());
     };
-    if let Some(reason) = inbound.refused {
-        return refused(format!("inbound: {reason}"));
-    }
-    let Some(managed) = inbound.managed.iter().find(|managed| managed.user == user) else {
-        return refused("inbound: the user is not in it".to_string());
+    let (state, export) = match entry.mode {
+        GrantMode::Managed => {
+            if let Some(reason) = inbound.refused {
+                return refused(format!("inbound: {reason}"));
+            }
+            let Some(managed) = inbound.managed.iter().find(|held| held.user == user) else {
+                return refused("inbound: the user is not in it".to_string());
+            };
+            (managed.state, managed.export.clone())
+        }
+        GrantMode::Shared => {
+            if let Some(reason) = inbound.shared_refused {
+                return refused(format!("inbound: {reason}"));
+            }
+            let Some(shared) = inbound.shared.iter().find(|held| held.user == user) else {
+                return refused("inbound: the user is not bound to it".to_string());
+            };
+            (shared.state, shared.export.clone())
+        }
     };
 
     GrantView {
         host_name: None,
-        state: Some(managed.state),
-        export: managed.export.clone(),
+        state: Some(state),
+        export,
         host: entry.host,
         config: entry.config,
         inbound: entry.inbound,
+        mode: entry.mode,
     }
 }
 
@@ -429,8 +452,13 @@ pub async fn put(
                 ));
             }
             let scoped = state.for_agent(id).await?;
-            let local = Entry::local(&entry.config, &entry.inbound);
+            let mut local = Entry::local(&entry.config, &entry.inbound);
+            local.mode = entry.mode;
             if let Some(reason) = placement(&scoped, &local).await?.reason() {
+                return Err(Error::Document(format!("inbounds.inbound: {reason}")));
+            }
+        } else if entry.mode == GrantMode::Shared {
+            if let Some(reason) = placement(&state, entry).await?.reason() {
                 return Err(Error::Document(format!("inbounds.inbound: {reason}")));
             }
         }
@@ -454,8 +482,7 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Forget every credential of a user; new ones derive from a new secret, and
-/// each host serves them once it applies.
+/// Rotate a user's managed credentials; shared inbound secrets are untouched.
 pub async fn renew(
     State(state): State<AppState>,
     _auth: Operator,
@@ -507,8 +534,8 @@ pub async fn content(
     Ok((headers, artifact.body.to_string()))
 }
 
-/// A user's subscription: a node per inbound it may use in the configuration
-/// the core runs, then the nodes of its collections.
+/// A user's subscription: exportable managed nodes from the selected core
+/// configurations, then collection nodes. Shared bindings count as skipped.
 ///
 /// Not memoised: it holds credentials derived on the way, and the address of
 /// the bytes would have to include the user's secret to be one.
@@ -690,12 +717,20 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
                 };
                 let at = Entry::local(&name, tag);
                 let stored = access.endpoint(&at);
+                let modes = managed::modes(inbound);
                 entries.push(EndpointView {
                     host: None,
                     host_name: None,
-                    reason: managed::placement(&document, &at).reason(),
+                    reason: if modes.is_empty() {
+                        managed::placement(&document, &at).reason()
+                    } else {
+                        None
+                    },
                     config: name.clone(),
                     inbound: tag.to_owned(),
+                    modes,
+                    shared_warning: managed::shared_warning(inbound),
+                    managed_warning: managed::managed_warning(inbound),
                     address: stored.and_then(|endpoint| endpoint.address.clone()),
                     port: stored.and_then(|endpoint| endpoint.port),
                 });
@@ -722,6 +757,12 @@ pub async fn put_endpoint(
     // An address for an inbound that is not there would never be read, so it is
     // refused where an operator can still fix it rather than stored quietly.
     let placement = placement(&state, &at).await?;
+    let (modes, shared_warning, managed_warning) = endpoint_access(&state, &at).await?;
+    let reason = if modes.is_empty() {
+        placement.reason()
+    } else {
+        None
+    };
     let stored = access.endpoint(&at).cloned().unwrap_or_default();
     let endpoint = Endpoint {
         address: match body.address {
@@ -743,10 +784,39 @@ pub async fn put_endpoint(
         host_name: None,
         config,
         inbound,
+        modes,
+        shared_warning,
+        managed_warning,
         address: endpoint.address,
         port: endpoint.port,
-        reason: placement.reason(),
+        reason,
     }))
+}
+
+async fn endpoint_access(
+    state: &AppState,
+    at: &Entry,
+) -> Result<(Vec<GrantMode>, Option<&'static str>, Option<&'static str>), Error> {
+    let store = state.singbox();
+    let at = at.clone();
+    tokio::task::spawn_blocking(move || -> Result<_, Error> {
+        let document = store.config_document(&at.config)?.value;
+        let inbound = document
+            .get("inbounds")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|inbounds| {
+                inbounds.iter().find(|inbound| {
+                    inbound.get("tag").and_then(serde_json::Value::as_str)
+                        == Some(at.inbound.as_str())
+                })
+            });
+        Ok((
+            inbound.map_or_else(Vec::new, managed::modes),
+            inbound.and_then(managed::shared_warning),
+            inbound.and_then(managed::managed_warning),
+        ))
+    })
+    .await?
 }
 
 pub async fn delete_endpoint(

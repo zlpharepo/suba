@@ -5,11 +5,11 @@
 //! subscription out, and one secret. An inbound is named by its configuration
 //! and tag.
 //!
-//! **One secret per user, one credential per inbound.** Every credential a
-//! user has is derived from its secret and the inbound it is for (HMAC-SHA256),
-//! so exposing one inbound's credential does not reveal another's. Changes
-//! to grants persist their relationships without storing derived credentials.
-//! A new secret replaces all of a user's credentials at once.
+//! **One secret per user, one managed credential per inbound.** Managed
+//! credentials derive from that secret and the inbound (HMAC-SHA256), so
+//! exposing one does not reveal another. Shared bindings use the inbound's
+//! existing credential and never add a native user. A new secret rotates only
+//! managed credentials.
 //! Agent projections bind a host-specific key first, preserving local credentials
 //! while separating otherwise identical configuration names and inbound tags.
 //!
@@ -56,7 +56,7 @@ pub struct User {
     /// Subscription link name to token.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tokens: BTreeMap<String, String>,
-    /// Hex: what every credential of this user derives from.
+    /// Hex: what this user's managed credentials derive from.
     #[serde(default)]
     pub secret: String,
 }
@@ -97,6 +97,23 @@ pub struct Entry {
     pub host: Option<Uuid>,
     pub config: String,
     pub inbound: String,
+    /// Shared credentials are distributed without adding a native user.
+    #[serde(default, skip_serializing_if = "GrantMode::is_managed")]
+    pub mode: GrantMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GrantMode {
+    #[default]
+    Managed,
+    Shared,
+}
+
+impl GrantMode {
+    fn is_managed(&self) -> bool {
+        *self == Self::Managed
+    }
 }
 
 impl Entry {
@@ -107,7 +124,12 @@ impl Entry {
             host: None,
             config: config.to_owned(),
             inbound: inbound.to_owned(),
+            mode: GrantMode::Managed,
         }
+    }
+
+    pub(crate) fn same_inbound(&self, other: &Self) -> bool {
+        self.host == other.host && self.config == other.config && self.inbound == other.inbound
     }
 }
 
@@ -163,7 +185,7 @@ impl Access {
         for entry in &user.inbounds {
             // A repeated entry grants nothing more, so it is collapsed here
             // rather than being exported twice.
-            if grants.iter().any(|grant| &grant.entry == entry) {
+            if grants.iter().any(|grant| grant.entry.same_inbound(entry)) {
                 continue;
             }
             grants.push(Grant {
@@ -244,6 +266,23 @@ impl AccessStore {
 
         let locked = self.users.lock().await;
         let mut config = locked.get().clone();
+        for (index, entry) in inbounds.iter().enumerate() {
+            if inbounds[..index]
+                .iter()
+                .any(|held| held.same_inbound(entry) && held.mode != entry.mode)
+                || config.users.iter().any(|(held_name, held_user)| {
+                    held_name != name
+                        && held_user
+                            .inbounds
+                            .iter()
+                            .any(|held| held.same_inbound(entry) && held.mode != entry.mode)
+                })
+            {
+                return Err(Error::Document(format!(
+                    "inbounds[{index}].mode: every binding of an inbound must use the same mode"
+                )));
+            }
+        }
         let user = match config.users.remove(name) {
             Some(user) => user,
             None => User {
@@ -274,7 +313,7 @@ impl AccessStore {
         Ok(())
     }
 
-    /// Replace every credential of a user at once; its links stay.
+    /// Replace managed credentials of a user; shared inbound secrets and links stay.
     pub(crate) async fn renew_secret(&self, name: &str) -> Result<(), Error> {
         let locked = self.users.lock().await;
         let mut config = locked.get().clone();
@@ -520,6 +559,37 @@ mod tests {
         Entry::local(config, inbound)
     }
 
+    #[tokio::test]
+    async fn shared_mode_survives_storage_and_conflicting_bindings_are_rejected() {
+        let dir = scratch();
+        let store = AccessStore::load(&dir).unwrap();
+        let shared = Entry {
+            mode: GrantMode::Shared,
+            ..entry("server", "snell")
+        };
+        store
+            .put_user("alice", vec![shared.clone()], Vec::new())
+            .await
+            .unwrap();
+        let reloaded = AccessStore::load(&dir).unwrap().snapshot().await;
+        assert_eq!(
+            reloaded.users["alice"].inbounds,
+            std::slice::from_ref(&shared)
+        );
+        let conflict = store
+            .put_user("bob", vec![entry("server", "snell")], Vec::new())
+            .await;
+        assert!(
+            matches!(conflict, Err(Error::Document(ref reason)) if reason == "inbounds[0].mode: every binding of an inbound must use the same mode")
+        );
+        assert!(!store.snapshot().await.users.contains_key("bob"));
+        store
+            .put_user("bob", vec![shared], Vec::new())
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn agent_projection_separates_host_credentials_and_preserves_local_material() {
         let first = Uuid::now_v7();
@@ -575,6 +645,7 @@ mod tests {
                         host: Some(elsewhere),
                         config: "server".to_string(),
                         inbound: "vless-in".to_string(),
+                        mode: GrantMode::Managed,
                     },
                 ],
                 Vec::new(),
@@ -591,6 +662,7 @@ mod tests {
                     host: Some(elsewhere),
                     config: "server".to_string(),
                     inbound: "vless-in".to_string(),
+                    mode: GrantMode::Managed,
                 },
             ]
         );
