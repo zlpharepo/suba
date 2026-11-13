@@ -18,10 +18,10 @@
 
 use serde_json::{json, Value};
 use suba_proto::protocol::{
-    anytls, http, hysteria2, shadowsocks, socks, trojan, tuic, vless, vmess,
+    anytls, http, hysteria, hysteria2, naive, shadowsocks, snell, socks, trojan, tuic, vless, vmess,
 };
 use suba_proto::tls::{Alpn, Fingerprint, RealityClient, RealityServer, ShortId};
-use suba_proto::transport::{Grpc, HttpUpgrade, Ws};
+use suba_proto::transport::{Grpc, HttpUpgrade, Quic, Ws};
 use suba_proto::{
     Client, Endpoint, Host, Name, Node, Outbound, Port, RawParams, Secret, TlsClient, Transport,
     Uuid,
@@ -141,12 +141,28 @@ pub fn shareable(inbound: &Value) -> Result<(), &'static str> {
             if !shadowsocks_method(method) {
                 return Err("this Shadowsocks method has no shared credential");
             }
-            if inbound
+            let password = inbound
                 .get("password")
                 .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
+                .unwrap_or_default();
+            if password.is_empty() {
                 return Err("a shared Shadowsocks password is needed");
+            }
+            let key_size = match method {
+                "2022-blake3-aes-128-gcm" => Some(16),
+                "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Some(32),
+                _ => None,
+            };
+            if let Some(key_size) = key_size {
+                let valid = suba_proto::base64::decode(password.as_bytes()).is_ok_and(|key| {
+                    key.len() == key_size && suba_proto::base64::encode_standard(&key) == password
+                });
+                if !valid {
+                    return Err(match key_size {
+                        16 => "a 16-byte base64 Shadowsocks key is needed",
+                        _ => "a 32-byte base64 Shadowsocks key is needed",
+                    });
+                }
             }
             Ok(())
         }
@@ -376,7 +392,15 @@ pub fn client(
         .and_then(Port::new)
         .ok_or_else(|| unexportable("listen_port", "a port clients can dial is needed"))?;
     let tls = tls(inbound, host)?;
-    let transport = transport(inbound)?;
+    let transport = if matches!(
+        protocol,
+        Protocol::Hysteria | Protocol::Hysteria2 | Protocol::Tuic
+    ) || (protocol == Protocol::Naive && text(inbound, "network") == Some("udp"))
+    {
+        Transport::Quic(Quic::default())
+    } else {
+        transport(inbound)?
+    };
 
     let protocol = match protocol {
         Protocol::Vless => {
@@ -487,20 +511,24 @@ pub fn client(
             username: Some(Box::from(username(user, user_path)?)),
             password: Some(password(user, user_path)?),
         }),
-        // Snell, Hysteria v1 and ShadowTLS each need a client shape this build
-        // does not have yet. The credential is injected and the core serves it;
-        // only the subscription is missing the node.
-        Protocol::Snell => {
-            return Err(unexportable(
-                "type",
-                "Snell has no client model yet, so this user's node cannot be written",
-            ))
-        }
+        Protocol::Snell => Outbound::Snell(snell_client(
+            inbound,
+            Some(text(user, "userkey").ok_or_else(|| {
+                unexportable(format!("{user_path}.userkey"), "a user key is needed")
+            })?),
+        )?),
         Protocol::Hysteria => {
-            return Err(unexportable(
-                "type",
-                "Hysteria v1 has no client model yet, so this user's node cannot be written",
-            ))
+            let auth = text(user, "auth_str").ok_or_else(|| {
+                unexportable(
+                    format!("{user_path}.auth_str"),
+                    "an authentication password is needed",
+                )
+            })?;
+            let mut client = hysteria::Client::new(auth);
+            client.obfs = text(inbound, "obfs").map(|value| Secret::new(Box::from(value)));
+            client.up = Some(hysteria_rate(inbound, "up")?);
+            client.down = Some(hysteria_rate(inbound, "down")?);
+            Outbound::Hysteria(client)
         }
         Protocol::ShadowTls => {
             return Err(unexportable(
@@ -511,10 +539,14 @@ pub fn client(
         // Naive serves HTTPS and HTTP/3 rather than a TLS proxy inbound, so it
         // has no client model here even though the credential pair is the same.
         Protocol::Naive => {
-            return Err(unexportable(
-                "type",
-                "Naive has no client model yet, so this user's node cannot be written",
-            ))
+            if tls.is_none() {
+                return Err(unexportable("tls", "Naive requires TLS"));
+            }
+            Outbound::Naive(naive::Client {
+                username: Box::from(username(user, user_path)?),
+                password: password(user, user_path)?,
+                quic: matches!(transport, Transport::Quic(_)),
+            })
         }
     };
 
@@ -527,6 +559,87 @@ pub fn client(
         protocol,
         extra: RawParams::new(),
     })
+}
+
+fn hysteria_rate(inbound: &Value, field: &'static str) -> Result<u64, Unexportable> {
+    let mbps = format!("{field}_mbps");
+    if let Some(value) = inbound.get(&mbps) {
+        return value
+            .as_u64()
+            .ok_or_else(|| unexportable(mbps, "a rate in Mbps is needed for client export"));
+    }
+    let value = text(inbound, field)
+        .and_then(|value| value.strip_suffix(" Mbps"))
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| unexportable(field, "a rate in Mbps is needed for client export"))?;
+    Ok(value)
+}
+
+/// The client node of a shared inbound, without adding a native user.
+pub fn shared_client(
+    inbound: &Value,
+    host: &Host,
+    name: &str,
+) -> Result<Node<Client>, Unexportable> {
+    shareable(inbound).map_err(|reason| unexportable("type", reason))?;
+    let port = inbound
+        .get("listen_port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .and_then(Port::new)
+        .ok_or_else(|| unexportable("listen_port", "a port clients can dial is needed"))?;
+    let protocol = match inbound.get("type").and_then(Value::as_str) {
+        Some("shadowsocks") => {
+            let method = text(inbound, "method").expect("shareable Shadowsocks has a method");
+            let password = text(inbound, "password").expect("shareable Shadowsocks has a password");
+            Outbound::Shadowsocks(shadowsocks::Client {
+                method: Box::from(method),
+                password: Secret::new(Box::from(password)),
+                plugin: None,
+            })
+        }
+        Some("snell") => Outbound::Snell(snell_client(inbound, None)?),
+        _ => {
+            return Err(unexportable(
+                "type",
+                "this shared protocol has no client model yet",
+            ))
+        }
+    };
+
+    Ok(Node {
+        name: Name::from(name),
+        endpoint: Endpoint::new(host.clone(), port),
+        listen: (),
+        transport: transport(inbound)?,
+        tls: tls(inbound, host)?,
+        protocol,
+        extra: RawParams::new(),
+    })
+}
+
+fn snell_client(inbound: &Value, userkey: Option<&str>) -> Result<snell::Client, Unexportable> {
+    let version = inbound
+        .get("version")
+        .and_then(Value::as_u64)
+        .filter(|version| matches!(version, 5 | 6))
+        .ok_or_else(|| unexportable("version", "Snell version 5 or 6 is needed"))?
+        as u8;
+    let psk = text(inbound, "psk")
+        .filter(|psk| !psk.is_empty())
+        .ok_or_else(|| unexportable("psk", "a shared Snell PSK is needed"))?;
+    if version == 6 && !(12..=255).contains(&psk.len()) {
+        return Err(unexportable(
+            "psk",
+            "Snell version 6 needs a 12 to 255 byte PSK",
+        ));
+    }
+    let mut client = snell::Client::new(version, psk);
+    client.userkey = userkey.map(|key| Secret::new(Box::from(key)));
+    client.obfs_mode = text(inbound, "obfs_mode").map(Box::from);
+    client.obfs_host = text(inbound, "obfs_host").map(Box::from);
+    client.mode = text(inbound, "mode").map(Box::from);
+    Ok(client)
 }
 
 /// A `uuid` field, parsed.
@@ -775,12 +888,25 @@ mod tests {
             "2022-blake3-aes-256-gcm",
             "2022-blake3-chacha20-poly1305",
         ] {
+            let password = if method == "2022-blake3-aes-128-gcm" {
+                "AAAAAAAAAAAAAAAAAAAAAA=="
+            } else if method.starts_with("2022-") {
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            } else {
+                "key"
+            };
             assert_eq!(
-                shareable(&json!({"type": "shadowsocks", "method": method, "password": "key"})),
+                shareable(&json!({"type": "shadowsocks", "method": method, "password": password})),
                 Ok(()),
                 "{method}"
             );
         }
+        assert_eq!(
+            shareable(
+                &json!({"type": "shadowsocks", "method": "2022-blake3-chacha20-poly1305", "password": "key"})
+            ),
+            Err("a 32-byte base64 Shadowsocks key is needed")
+        );
         for method in ["none", "unknown"] {
             let inbound = json!({"type": "shadowsocks", "method": method, "password": "key"});
             assert!(shareable(&inbound).is_err(), "{method}");
@@ -1072,6 +1198,74 @@ mod tests {
             );
             let _ = raw_len;
         }
+    }
+
+    #[test]
+    fn snell_clients_carry_the_shared_psk_and_optional_user_key() {
+        let inbound = json!({"type": "snell", "version": 5, "psk": "shared-secret", "listen_port": 1080, "obfs_mode": "http", "obfs_host": "example.com"});
+        let user = json!({"name": "alice", "userkey": "personal-key"});
+        let managed = client(&inbound, &user, "users[0]", &host(), "managed").unwrap();
+        let shared = shared_client(&inbound, &host(), "shared").unwrap();
+        for node in [managed, shared] {
+            let Outbound::Snell(client) = node.protocol else {
+                panic!("a Snell node is needed")
+            };
+            assert_eq!(client.psk.as_str(), "shared-secret");
+            assert_eq!(client.obfs_mode.as_deref(), Some("http"));
+            assert_eq!(client.obfs_host.as_deref(), Some("example.com"));
+            assert_eq!(
+                client.userkey.as_ref().map(Secret::as_str),
+                (node.name.as_str() == "managed").then_some("personal-key")
+            );
+        }
+    }
+
+    #[test]
+    fn native_quic_inbounds_export_quic_nodes() {
+        for (kind, user) in [
+            ("hysteria2", json!({"password": "key"})),
+            (
+                "tuic",
+                json!({"uuid": "11111111-2222-3333-4444-555555555555", "password": "key"}),
+            ),
+        ] {
+            let inbound = json!({"type": kind, "listen_port": 443, "tls": {"enabled": true}});
+            let node = client(&inbound, &user, "users[0]", &host(), kind).unwrap();
+            assert!(matches!(node.transport, Transport::Quic(_)), "{kind}");
+            assert_eq!(
+                suba_proto::parse_link(&suba_proto::write_link(&node).unwrap()).unwrap(),
+                node
+            );
+        }
+    }
+
+    #[test]
+    fn hysteria_v1_inbound_exports_its_shared_obfs_and_user_auth() {
+        let inbound = json!({"type": "hysteria", "listen_port": 443, "up_mbps": 20, "down_mbps": 50, "obfs": "shared-obfs", "tls": {"enabled": true}});
+        let user = json!({"name": "alice", "auth_str": "personal-key"});
+        let node = client(&inbound, &user, "users[0]", &host(), "hysteria").unwrap();
+        let Outbound::Hysteria(client) = node.protocol else {
+            panic!("a Hysteria v1 client is needed")
+        };
+        assert_eq!(client.auth.as_str(), "personal-key");
+        assert_eq!(
+            client.obfs.as_ref().map(Secret::as_str),
+            Some("shared-obfs")
+        );
+        assert_eq!((client.up, client.down), (Some(20), Some(50)));
+    }
+
+    #[test]
+    fn naive_inbound_exports_its_username_and_password() {
+        let inbound = json!({"type": "naive", "listen_port": 443, "network": "udp", "tls": {"enabled": true}});
+        let user = json!({"username": "alice", "password": "personal-key"});
+        let node = client(&inbound, &user, "users[0]", &host(), "naive").unwrap();
+        let Outbound::Naive(client) = node.protocol else {
+            panic!("a Naive client is needed")
+        };
+        assert_eq!(client.username.as_ref(), "alice");
+        assert_eq!(client.password.as_str(), "personal-key");
+        assert!(client.quic);
     }
 
     #[test]

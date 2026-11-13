@@ -61,21 +61,24 @@ pub struct User {
     pub secret: String,
 }
 
-/// The address clients dial for one inbound, when the operator sets one.
+/// Client address overrides and an optional ShadowTLS inner relation.
 ///
-/// Both halves are optional: an address without a port keeps the inbound's own
-/// `listen_port`, and a port alone reuses the host it would otherwise inherit.
+/// Address and port are independent: an address without a port keeps the
+/// inbound's own `listen_port`, and a port alone reuses the inherited host.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// The inner proxy carried by this ShadowTLS inbound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_inbound: Option<String>,
 }
 
 impl Endpoint {
     fn is_empty(&self) -> bool {
-        self.address.is_none() && self.port.is_none()
+        self.address.is_none() && self.port.is_none() && self.inner_inbound.is_none()
     }
 }
 
@@ -402,10 +405,9 @@ impl EndpointStore {
         self.0.read(|config| config.configs.clone()).await
     }
 
-    /// Store, replace or clear the address override of one inbound.
+    /// Store, replace or clear one inbound's client endpoint settings.
     ///
-    /// Clearing both halves removes the entry rather than keeping an empty one,
-    /// so an override that says nothing is not mistaken for one that does.
+    /// An entry with no address, port, or inner relation is removed.
     pub(crate) async fn put_endpoint(
         &self,
         config: &str,
@@ -421,6 +423,11 @@ impl EndpointStore {
         }
         if let Some(address) = &endpoint.address {
             endpoint_host(address)?;
+        }
+        if endpoint.inner_inbound.as_deref().is_some_and(str::is_empty) {
+            return Err(Error::Document(
+                "inner_inbound: an inbound is named by its tag".to_string(),
+            ));
         }
 
         let locked = self.0.lock().await;
@@ -697,6 +704,7 @@ mod tests {
                 Endpoint {
                     address: Some("cdn.example.com".into()),
                     port: Some(443),
+                    ..Endpoint::default()
                 },
             )
             .await
@@ -716,7 +724,8 @@ mod tests {
             reloaded.endpoint(&entry("server", "vless-in")),
             Some(&Endpoint {
                 address: Some("cdn.example.com".into()),
-                port: Some(443)
+                port: Some(443),
+                ..Endpoint::default()
             })
         );
 
@@ -814,6 +823,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_inner_relation_survives_without_an_address_override() {
+        let dir = scratch();
+        let store = AccessStore::load(&dir).unwrap();
+        let endpoint = Endpoint {
+            inner_inbound: Some("inner".into()),
+            ..Endpoint::default()
+        };
+        store
+            .put_endpoint("server", "outer", endpoint.clone())
+            .await
+            .unwrap();
+        let loaded = AccessStore::load(&dir).unwrap().snapshot().await;
+        assert_eq!(loaded.endpoint(&entry("server", "outer")), Some(&endpoint));
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
     async fn an_address_override_is_stored_cleared_and_validated() {
         let dir = scratch();
         let store = AccessStore::load(&dir).unwrap();
@@ -829,6 +855,7 @@ mod tests {
                     Endpoint {
                         address: Some(address.to_string()),
                         port: None,
+                        ..Endpoint::default()
                     },
                 )
                 .await
@@ -851,7 +878,8 @@ mod tests {
                         "vless-in",
                         Endpoint {
                             address: Some(address.to_string()),
-                            port: None
+                            port: None,
+                            ..Endpoint::default()
                         }
                     )
                     .await
@@ -869,6 +897,7 @@ mod tests {
                 Endpoint {
                     address: None,
                     port: Some(8443),
+                    ..Endpoint::default()
                 },
             )
             .await
@@ -877,7 +906,8 @@ mod tests {
             store.snapshot().await.endpoint(&entry),
             Some(&Endpoint {
                 address: None,
-                port: Some(8443)
+                port: Some(8443),
+                ..Endpoint::default()
             })
         );
         store
@@ -900,6 +930,7 @@ mod tests {
                 Endpoint {
                     address: Some("cdn.example.com".into()),
                     port: None,
+                    ..Endpoint::default()
                 },
             )
             .await

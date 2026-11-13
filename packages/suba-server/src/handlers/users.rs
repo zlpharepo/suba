@@ -71,7 +71,7 @@ pub struct GrantView {
     pub export: Export,
 }
 
-/// One inbound of one configuration, with the address a client dials.
+/// One inbound's client endpoint and supported binding modes.
 #[derive(Debug, Serialize)]
 pub struct EndpointView {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,6 +92,8 @@ pub struct EndpointView {
     pub address: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_inbound: Option<String>,
     /// Why this inbound has no binding mode, when it has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -105,14 +107,15 @@ pub struct EndpointsView {
     pub entries: Vec<EndpointView>,
 }
 
-/// What a form says about one inbound's address: omitted keeps the stored
-/// value, explicit null clears it.
+/// Omitted endpoint fields keep stored values; explicit null clears them.
 #[derive(Debug, Default, Deserialize)]
 pub struct EndpointBody {
     #[serde(default, deserialize_with = "keep_or_clear")]
     pub address: Option<Option<String>>,
     #[serde(default, deserialize_with = "keep_or_clear")]
     pub port: Option<Option<u16>>,
+    #[serde(default, deserialize_with = "keep_or_clear")]
+    pub inner_inbound: Option<Option<String>>,
 }
 
 /// Tell an omitted field from an explicit `null`.
@@ -537,7 +540,7 @@ pub async fn content(
 }
 
 /// A user's subscription: exportable managed nodes from the selected core
-/// configurations, then collection nodes. Shared bindings count as skipped.
+/// configurations, then collection nodes. Bindings without a client model count as skipped.
 ///
 /// Not memoised: it holds credentials derived on the way, and the address of
 /// the bytes would have to include the user's secret to be one.
@@ -720,13 +723,26 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
                 let at = Entry::local(&name, tag);
                 let stored = access.endpoint(&at);
                 let modes = managed::modes(inbound);
+                let shadowtls_problem = if inbound.get("type").and_then(serde_json::Value::as_str)
+                    == Some("shadowtls")
+                {
+                    match stored.and_then(|endpoint| endpoint.inner_inbound.as_deref()) {
+                        None => Some("select an inner inbound before exporting this entry"),
+                        Some(inner) if managed::validate_inner(&document, tag, inner).is_err() => {
+                            Some("selected inner inbound is unavailable")
+                        }
+                        Some(_) => None,
+                    }
+                } else {
+                    None
+                };
                 entries.push(EndpointView {
                     host: None,
                     host_name: None,
                     reason: if modes.is_empty() {
                         managed::placement(&document, &at).reason()
                     } else {
-                        None
+                        shadowtls_problem
                     },
                     config: name.clone(),
                     inbound: tag.to_owned(),
@@ -736,6 +752,7 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
                     managed_warning: managed::managed_warning(inbound),
                     address: stored.and_then(|endpoint| endpoint.address.clone()),
                     port: stored.and_then(|endpoint| endpoint.port),
+                    inner_inbound: stored.and_then(|endpoint| endpoint.inner_inbound.clone()),
                 });
             }
         }
@@ -748,7 +765,7 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
     .await?
 }
 
-/// Store or clear one inbound's address override.
+/// Store or clear one inbound's client endpoint settings.
 pub async fn put_endpoint(
     State(state): State<AppState>,
     _auth: Operator,
@@ -760,13 +777,8 @@ pub async fn put_endpoint(
     // An address for an inbound that is not there would never be read, so it is
     // refused where an operator can still fix it rather than stored quietly.
     let placement = placement(&state, &at).await?;
-    let (modes, shared_warning, shared_refused, managed_warning) =
+    let (modes, shared_warning, shared_refused, managed_warning, shadowtls) =
         endpoint_access(&state, &at).await?;
-    let reason = if modes.is_empty() {
-        placement.reason()
-    } else {
-        None
-    };
     let stored = access.endpoint(&at).cloned().unwrap_or_default();
     let endpoint = Endpoint {
         address: match body.address {
@@ -777,11 +789,33 @@ pub async fn put_endpoint(
             Some(port) => port,
             None => stored.port,
         },
+        inner_inbound: match body.inner_inbound {
+            Some(inner_inbound) => inner_inbound,
+            None => stored.inner_inbound,
+        },
     };
+    let reason = if modes.is_empty() {
+        placement.reason()
+    } else if shadowtls && endpoint.inner_inbound.is_none() {
+        Some("select an inner inbound before exporting this entry")
+    } else {
+        None
+    };
+    if let Some(inner) = endpoint.inner_inbound.as_deref() {
+        let store = state.singbox();
+        let config_name = config.clone();
+        let outer_tag = inbound.clone();
+        let inner_tag = inner.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let document = store.config_document(&config_name)?.value;
+            managed::validate_inner(&document, &outer_tag, &inner_tag)
+        })
+        .await??;
+    }
     state
         .put_endpoint(&config, &inbound, endpoint.clone())
         .await?;
-    tracing::debug!("Stored an address for {} :: {inbound}", config);
+    tracing::debug!("Stored inbound endpoint settings");
 
     Ok(Json(EndpointView {
         host: state.target_host(),
@@ -794,6 +828,7 @@ pub async fn put_endpoint(
         managed_warning,
         address: endpoint.address,
         port: endpoint.port,
+        inner_inbound: endpoint.inner_inbound,
         reason,
     }))
 }
@@ -807,6 +842,7 @@ async fn endpoint_access(
         Option<&'static str>,
         Option<&'static str>,
         Option<&'static str>,
+        bool,
     ),
     Error,
 > {
@@ -828,6 +864,10 @@ async fn endpoint_access(
             inbound.and_then(managed::shared_warning),
             inbound.and_then(managed::shared_refusal),
             inbound.and_then(managed::managed_warning),
+            inbound
+                .and_then(|inbound| inbound.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("shadowtls"),
         ))
     })
     .await?

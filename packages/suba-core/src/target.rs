@@ -28,9 +28,23 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::index::IndexEntry;
-use crate::proto::{self, write_link, Kind};
-#[cfg(any(feature = "singbox", feature = "clash"))]
-use crate::proto::{Client, Node};
+
+const LINK_PROTOCOLS: &[Kind] = &[
+    Kind::Vless,
+    Kind::Trojan,
+    Kind::Shadowsocks,
+    Kind::Snell,
+    Kind::Hysteria,
+    Kind::Hysteria2,
+    Kind::Vmess,
+    Kind::ShadowsocksR,
+    Kind::Tuic,
+    Kind::AnyTls,
+    Kind::Socks,
+    Kind::Http,
+    Kind::Other,
+];
+use crate::proto::{self, write_link, Client, Kind, Node};
 
 /// A document shape a collection can be served in.
 ///
@@ -45,12 +59,15 @@ pub enum Target {
     Links,
     /// The same link list, wrapped in base64: what a subscription URL serves.
     Base64,
+    /// A Surge remote policy list, one proxy declaration per line.
+    Surge,
     /// A sing-box configuration, with one outbound per node.
     #[cfg(feature = "singbox")]
     #[serde(rename = "sing-box")]
     Singbox,
-    /// A clash configuration, with one proxy per node.
+    /// A mihomo configuration, also named `clash`, with one proxy per node.
     #[cfg(feature = "clash")]
+    #[serde(alias = "mihomo")]
     Clash,
 }
 
@@ -62,13 +79,19 @@ impl Target {
     /// that" a fact rather than a runtime check somebody can forget to perform.
     pub fn all() -> &'static [Self] {
         #[cfg(all(feature = "singbox", feature = "clash"))]
-        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox, Self::Clash];
+        let targets: &'static [Self] = &[
+            Self::Links,
+            Self::Base64,
+            Self::Singbox,
+            Self::Clash,
+            Self::Surge,
+        ];
         #[cfg(all(feature = "singbox", not(feature = "clash")))]
-        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox];
+        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Singbox, Self::Surge];
         #[cfg(all(feature = "clash", not(feature = "singbox")))]
-        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Clash];
+        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Clash, Self::Surge];
         #[cfg(not(any(feature = "singbox", feature = "clash")))]
-        let targets: &'static [Self] = &[Self::Links, Self::Base64];
+        let targets: &'static [Self] = &[Self::Links, Self::Base64, Self::Surge];
 
         targets
     }
@@ -78,6 +101,7 @@ impl Target {
         match self {
             Self::Links => "links",
             Self::Base64 => "base64",
+            Self::Surge => "surge",
             #[cfg(feature = "singbox")]
             Self::Singbox => "sing-box",
             #[cfg(feature = "clash")]
@@ -88,7 +112,7 @@ impl Target {
     /// The media type used by this conversion target.
     pub const fn media_type(self) -> &'static str {
         match self {
-            Self::Links | Self::Base64 => "text/plain; charset=utf-8",
+            Self::Links | Self::Base64 | Self::Surge => "text/plain; charset=utf-8",
             #[cfg(feature = "singbox")]
             Self::Singbox => "application/json; charset=utf-8",
             #[cfg(feature = "clash")]
@@ -100,6 +124,7 @@ impl Target {
     pub const fn extension(self) -> &'static str {
         match self {
             Self::Links | Self::Base64 => "txt",
+            Self::Surge => "conf",
             #[cfg(feature = "singbox")]
             Self::Singbox => "json",
             #[cfg(feature = "clash")]
@@ -109,6 +134,10 @@ impl Target {
 
     /// The supported target identified by this name.
     pub fn named(name: &str) -> Option<Self> {
+        #[cfg(feature = "clash")]
+        if name == "mihomo" {
+            return Some(Self::Clash);
+        }
         Self::all()
             .iter()
             .copied()
@@ -118,7 +147,7 @@ impl Target {
     /// The target a client's `User-Agent` says it reads, when it says one.
     ///
     /// Only the shapes a client cannot read otherwise are recognised: a
-    /// sing-box or clash client asked for a document it can load, and anything
+    /// sing-box, mihomo or Surge client asked for a document it can load, and anything
     /// else gets the default. Matched without regard to
     /// case, because the clients spell themselves inconsistently.
     ///
@@ -145,6 +174,10 @@ impl Target {
             return Some(Self::Clash);
         }
 
+        if agent.contains("surge") {
+            return Some(Self::Surge);
+        }
+
         let _ = agent;
         None
     }
@@ -155,11 +188,14 @@ impl Target {
             Self::Links | Self::Base64 => TargetDescriptor {
                 target: self,
                 intents: &[RenderIntent::Client],
-                // A link is what the model is parsed *from*: whatever a provider
-                // served, the model holds enough to write it back. A protocol
-                // whose link form is unknown is kept whole for exactly this
-                // reason.
-                protocols: ProtocolSupport::Everything,
+                // A source link survives a parse, including an unknown scheme.
+                // Native-only clients such as NaiveProxy have no link form.
+                protocols: ProtocolSupport::Only(LINK_PROTOCOLS),
+            },
+            Self::Surge => TargetDescriptor {
+                target: self,
+                intents: &[RenderIntent::Client],
+                protocols: ProtocolSupport::Only(crate::surge::PROTOCOLS),
             },
             // The dialect's own table, so that what it says it can write and
             // what it writes cannot drift apart.
@@ -203,6 +239,7 @@ impl Target {
                 rendered.body =
                     proto::base64::encode_standard(self.render_links(nodes, &mut rendered.skipped))
             }
+            Self::Surge => rendered.body = self.render_surge(nodes, &mut rendered.skipped),
             #[cfg(feature = "singbox")]
             Self::Singbox => rendered.body = self.render_singbox(nodes, &mut rendered.skipped),
             #[cfg(feature = "clash")]
@@ -227,14 +264,40 @@ impl Target {
                 Err(error) => skipped.push(Skipped {
                     id: entry.id,
                     name: Some(entry.name().to_owned()),
-                    reason: SkipReason::Refused {
-                        kind: error.kind(),
-                        reason: error.to_string(),
+                    reason: if error.kind() == proto::ErrorKind::NoLinkForm {
+                        SkipReason::Protocol(entry.node.protocol.kind())
+                    } else {
+                        SkipReason::Refused {
+                            kind: error.kind(),
+                            reason: error.to_string(),
+                        }
                     },
                 }),
             }
         }
 
+        body
+    }
+
+    fn render_surge(self, nodes: &[&IndexEntry], skipped: &mut Vec<Skipped>) -> String {
+        let named: Vec<(&str, &Node<Client>)> = nodes
+            .iter()
+            .map(|entry| (entry.name(), &entry.node))
+            .collect();
+        let (body, refused) = crate::surge::client_config(&named);
+        skipped.extend(refused.into_iter().map(|refusal| {
+            let entry = nodes[refusal.index];
+            Skipped {
+                id: entry.id,
+                name: Some(entry.name().to_owned()),
+                reason: match refusal.reason {
+                    crate::surge::Reason::Protocol(kind) => SkipReason::Protocol(kind),
+                    crate::surge::Reason::Field(field, reason) => {
+                        SkipReason::Field { field, reason }
+                    }
+                },
+            }
+        }));
         body
     }
 
@@ -269,6 +332,9 @@ impl Target {
                 reason: match refusal.reason {
                     suba_clash::Reason::Protocol(kind) => SkipReason::Protocol(kind),
                     suba_clash::Reason::Transport(carriage) => SkipReason::Transport(carriage),
+                    suba_clash::Reason::Field { field, reason } => {
+                        SkipReason::Field { field, reason }
+                    }
                     // The dialect could not spell a value clash accepts; the field
                     // and what the node said are the whole explanation, and
                     // neither is a credential.
@@ -697,6 +763,11 @@ mod tests {
 
     #[test]
     fn a_target_is_found_by_the_name_it_is_spelled_with() {
+        #[cfg(feature = "clash")]
+        assert_eq!(
+            serde_json::from_str::<Target>("\"mihomo\"").unwrap(),
+            Target::Clash
+        );
         for target in Target::all() {
             assert_eq!(Target::named(target.as_str()), Some(*target));
         }
@@ -812,6 +883,10 @@ mod tests {
     #[test]
     fn a_target_that_cannot_write_a_protocol_says_which_one() {
         let everything = Target::Links.descriptor();
+        assert_eq!(
+            everything.refuses(Kind::Naive),
+            Some(SkipReason::Protocol(Kind::Naive))
+        );
         for link in links() {
             let node = proto::parse_link(&link).expect("the fixture parses");
             assert_eq!(
@@ -835,6 +910,39 @@ mod tests {
     }
 
     #[test]
+    fn native_only_naive_is_delivered_to_sing_box_and_refused_as_a_link() {
+        let mut node =
+            proto::parse_link("https://alice:personal-key@example.com:443#Naive").unwrap();
+        node.protocol = proto::Outbound::Naive(proto::protocol::naive::Client::new(
+            "alice",
+            "personal-key",
+            false,
+        ));
+        let entry = IndexEntry {
+            id: node.id(),
+            source: crate::index::Source {
+                provider: "native".into(),
+                name: "Naive".into(),
+                position: 0,
+            },
+            node,
+        };
+        let links = Target::Links
+            .render(&[&entry], RenderIntent::Client)
+            .unwrap();
+        assert!(links.body.is_empty());
+        assert_eq!(links.skipped[0].reason, SkipReason::Protocol(Kind::Naive));
+        #[cfg(feature = "singbox")]
+        {
+            let rendered = Target::Singbox
+                .render(&[&entry], RenderIntent::Client)
+                .unwrap();
+            assert!(rendered.skipped.is_empty());
+            assert!(rendered.body.contains("\"type\":\"naive\""));
+        }
+    }
+
+    #[test]
     fn an_empty_collection_renders_an_empty_document() {
         let index = index(&Vec::new());
         let rendered = Target::Links
@@ -853,13 +961,13 @@ mod tests {
         let names: Vec<&str> = Target::all().iter().map(|target| target.as_str()).collect();
 
         #[cfg(all(feature = "singbox", feature = "clash"))]
-        assert_eq!(names, ["links", "base64", "sing-box", "clash"]);
+        assert_eq!(names, ["links", "base64", "sing-box", "clash", "surge"]);
         #[cfg(all(feature = "singbox", not(feature = "clash")))]
-        assert_eq!(names, ["links", "base64", "sing-box"]);
+        assert_eq!(names, ["links", "base64", "sing-box", "surge"]);
         #[cfg(all(feature = "clash", not(feature = "singbox")))]
-        assert_eq!(names, ["links", "base64", "clash"]);
+        assert_eq!(names, ["links", "base64", "clash", "surge"]);
         #[cfg(not(any(feature = "singbox", feature = "clash")))]
-        assert_eq!(names, ["links", "base64"]);
+        assert_eq!(names, ["links", "base64", "surge"]);
     }
 
     /// A node the dialect has no outbound for is left out of the document and
@@ -912,6 +1020,7 @@ mod tests {
     #[cfg(feature = "clash")]
     #[test]
     fn a_clash_document_holds_the_proxies_it_can_write() {
+        assert_eq!(Target::named("mihomo"), Some(Target::Clash));
         let fixtures = vec![
             "trojan://PASSWORD@example.com:443?sni=example.com#Trojan".to_string(),
             "snell://1.2.3.4:443?psk=PSK&version=4#Snell".to_string(),
@@ -931,12 +1040,8 @@ mod tests {
             "{}",
             rendered.body
         );
-        assert_eq!(rendered.skipped.len(), 1);
-        assert_eq!(rendered.skipped[0].name.as_deref(), Some("Snell"));
-        assert_eq!(
-            rendered.skipped[0].reason,
-            SkipReason::Protocol(Kind::Other)
-        );
+        assert!(rendered.skipped.is_empty());
+        assert!(rendered.body.contains("\n  - name: Snell\n"));
     }
 
     /// A clash document describes a client, like the links do: a server document
@@ -953,6 +1058,74 @@ mod tests {
                 intent: RenderIntent::Server
             })
         ));
+    }
+
+    #[cfg(feature = "clash")]
+    #[test]
+    fn clash_output_can_be_read_back_as_provider_input() {
+        let index = index(&links());
+        let rendered = Target::Clash
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+        let parsed = subscription::parse(rendered.body.as_bytes(), "fixture");
+        assert_eq!(parsed.format, Some(subscription::SourceFormat::Clash));
+        assert_eq!(parsed.unreadable, None);
+        assert!(parsed.skipped.is_empty(), "{:?}", parsed.skipped);
+        assert_eq!(
+            parsed.len() + parsed.duplicates,
+            index.len() - rendered.skipped.len()
+        );
+    }
+
+    #[test]
+    fn surge_target_writes_remote_policy_lines() {
+        let index = index(&[
+            "ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@example.com:8388#Shared".to_string(),
+            "trojan://PASSWORD@example.com:443#Trojan".to_string(),
+            "snell://example.com:443?psk=shared-secret&version=5&obfs_mode=http&obfs_host=example.com#Snell".to_string(),
+            "snell://example.com:444?psk=shared-secret&version=5&userkey=personal-key#Managed".to_string(),
+        ]);
+        let rendered = Target::Surge
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+        assert_eq!(rendered.skipped.len(), 1);
+        assert_eq!(
+            rendered.skipped[0].reason,
+            SkipReason::Field {
+                field: "userkey",
+                reason: "Surge cannot use Snell user keys"
+            }
+        );
+        assert!(rendered.body.contains(
+            "Shared = ss, example.com, 8388, encrypt-method=aes-256-gcm, password=PASSWORD"
+        ));
+        assert!(rendered
+            .body
+            .contains("Trojan = trojan, example.com, 443, password=PASSWORD"));
+        assert!(rendered.body.contains("Snell = snell, example.com, 443, psk=shared-secret, version=5, obfs=http, obfs-host=example.com"));
+    }
+
+    #[test]
+    fn surge_protocol_table_has_a_renderable_fixture_per_kind() {
+        let fixtures = [
+            "ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@example.com:8388#SS",
+            "snell://example.com:443?psk=shared-secret&version=5#Snell",
+            "trojan://PASSWORD@example.com:443#Trojan",
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=tls#VLESS",
+            "vmess://eyJ2IjoiMiIsInBzIjoiR29sZGVuIiwiYWRkIjoiZ29sZGVuLmV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1IiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ3cyIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ==",
+            "hysteria2://PASSWORD@example.com:443#Hysteria2",
+            "tuic://11111111-2222-3333-4444-555555555555:PASSWORD@example.com:443#TUIC",
+            "anytls://PASSWORD@example.com:443#AnyTLS",
+            "socks5://alice:PASSWORD@example.com:1080#SOCKS",
+            "http://alice:PASSWORD@example.com:8080#HTTP",
+        ];
+        let links = fixtures.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let index = index(&links);
+        let rendered = Target::Surge
+            .render(&entries(&index), RenderIntent::Client)
+            .unwrap();
+        assert!(rendered.skipped.is_empty(), "{:#?}", rendered.skipped);
+        assert_eq!(rendered.body.lines().count(), crate::surge::PROTOCOLS.len());
     }
 
     /// The name in the document is the node's own name, not the provider's name
@@ -1013,6 +1186,11 @@ mod tests {
                 }
                 #[cfg(feature = "clash")]
                 Target::Clash => {
+                    for name in expected {
+                        assert!(rendered.body.contains(name));
+                    }
+                }
+                Target::Surge => {
                     for name in expected {
                         assert!(rendered.body.contains(name));
                     }

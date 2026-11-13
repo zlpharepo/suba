@@ -1,6 +1,6 @@
-//! Nodes as a clash document.
+//! Nodes as a mihomo document; `clash` is an alias for this format.
 //!
-//! clash — and the cores that read its configuration, mihomo among them — spells
+//! Mihomo spells
 //! a node as one flat YAML entry: `name`, `type`, `server`, `port`, a field per
 //! credential, TLS spread over the same entry (`tls`, `sni`, `skip-cert-verify`)
 //! and the carriage in `network` with an `*-opts` mapping beside it. This crate
@@ -48,6 +48,8 @@ pub const PROTOCOLS: &[Kind] = &[
     Kind::Vless,
     Kind::Trojan,
     Kind::Shadowsocks,
+    Kind::Snell,
+    Kind::Hysteria,
     Kind::ShadowsocksR,
     Kind::Vmess,
     Kind::Hysteria2,
@@ -73,6 +75,11 @@ pub enum Reason {
     Protocol(Kind),
     /// How the node is carried has no representation.
     Transport(String),
+    /// A modeled field cannot be preserved, without revealing its value.
+    Field {
+        field: &'static str,
+        reason: &'static str,
+    },
     /// A value clash has no spelling for.
     Value {
         /// Which field.
@@ -147,6 +154,59 @@ pub fn proxy(name: &str, node: &Node<Client>) -> Result<Yaml<'static>, Reason> {
                 entry.insert(text("plugin-opts"), plugin_opts(plugin)?);
             }
         }
+        Outbound::Snell(client) => {
+            if client.userkey.is_some() {
+                return Err(Reason::Field {
+                    field: "userkey",
+                    reason: "mihomo cannot use Snell user keys",
+                });
+            }
+            if client.version == 6 && (client.obfs_mode.is_some() || client.obfs_host.is_some()) {
+                return Err(Reason::Field {
+                    field: "obfs_mode",
+                    reason: "Snell v6 does not support HTTP obfuscation",
+                });
+            }
+            if client.version != 6 && client.mode.is_some() {
+                return Err(Reason::Field {
+                    field: "mode",
+                    reason: "traffic shaping belongs to Snell v6",
+                });
+            }
+            entry.insert(text("version"), count(i64::from(client.version)));
+            entry.insert(text("psk"), text(client.psk.as_str()));
+            if client.reuse {
+                entry.insert(text("reuse"), flag(true));
+            }
+            if let Some(mode) = &client.obfs_mode {
+                if !matches!(mode.as_ref(), "none" | "http") {
+                    return Err(Reason::Field {
+                        field: "obfs_mode",
+                        reason: "mihomo supports only HTTP obfuscation",
+                    });
+                }
+                let mut opts = Mapping::new();
+                opts.insert(text("mode"), text(mode.as_ref()));
+                if let Some(host) = &client.obfs_host {
+                    opts.insert(text("host"), text(host.as_ref()));
+                }
+                entry.insert(text("obfs-opts"), Yaml::Mapping(opts));
+            } else if client.obfs_host.is_some() {
+                return Err(Reason::Field {
+                    field: "obfs_host",
+                    reason: "an obfuscation mode is needed",
+                });
+            }
+            if let Some(mode) = &client.mode {
+                if !matches!(mode.as_ref(), "default" | "unshaped" | "unsafe-raw") {
+                    return Err(Reason::Field {
+                        field: "mode",
+                        reason: "this Snell traffic mode is unsupported",
+                    });
+                }
+                entry.insert(text("mode"), text(mode.as_ref()));
+            }
+        }
         Outbound::ShadowsocksR(client) => {
             entry.insert(text("cipher"), text(client.method.as_ref()));
             entry.insert(text("password"), text(client.password.as_str()));
@@ -200,6 +260,46 @@ pub fn proxy(name: &str, node: &Node<Client>) -> Result<Yaml<'static>, Reason> {
             }
             if let Some(down) = client.down {
                 entry.insert(text("down"), text(format!("{down} Mbps")));
+            }
+        }
+        Outbound::Hysteria(client) => {
+            if !node.extra.is_empty() {
+                return Err(Reason::Field {
+                    field: "extra",
+                    reason: "a Hysteria v1 option has no mihomo mapping",
+                });
+            }
+            let up = client.up.ok_or(Reason::Field {
+                field: "up",
+                reason: "Hysteria v1 needs an uplink rate",
+            })?;
+            let down = client.down.ok_or(Reason::Field {
+                field: "down",
+                reason: "Hysteria v1 needs a downlink rate",
+            })?;
+            entry.insert(text("auth-str"), text(client.auth.as_str()));
+            entry.insert(
+                text("up"),
+                count(i64::try_from(up).map_err(|_| Reason::Field {
+                    field: "up",
+                    reason: "this rate is too large",
+                })?),
+            );
+            entry.insert(
+                text("down"),
+                count(i64::try_from(down).map_err(|_| Reason::Field {
+                    field: "down",
+                    reason: "this rate is too large",
+                })?),
+            );
+            if let Some(obfs) = &client.obfs {
+                entry.insert(text("obfs"), text(obfs.as_str()));
+            }
+            if let Some(ports) = &client.ports {
+                entry.insert(text("ports"), text(ports.as_ref()));
+            }
+            if let Some(interval) = client.hop_interval {
+                entry.insert(text("hop-interval"), text(interval.to_string()));
             }
         }
         Outbound::Tuic(client) => {
@@ -292,6 +392,8 @@ fn proxy_type(protocol: &Outbound) -> Result<&'static str, Reason> {
         Outbound::Vless(_) => "vless",
         Outbound::Trojan(_) => "trojan",
         Outbound::Shadowsocks(_) => "ss",
+        Outbound::Snell(_) => "snell",
+        Outbound::Hysteria(_) => "hysteria",
         Outbound::ShadowsocksR(_) => "ssr",
         Outbound::Vmess(_) => "vmess",
         Outbound::Hysteria2(_) => "hysteria2",
@@ -316,7 +418,10 @@ fn proxy_type(protocol: &Outbound) -> Result<&'static str, Reason> {
 /// It is one property with two consequences: there is nothing to say about the
 /// carriage, and the core needs no field to know TLS is on.
 fn carries_itself(kind: Kind) -> bool {
-    matches!(kind, Kind::Hysteria2 | Kind::Tuic | Kind::AnyTls)
+    matches!(
+        kind,
+        Kind::Hysteria | Kind::Hysteria2 | Kind::Tuic | Kind::AnyTls
+    )
 }
 
 /// The carriage, as clash spells it: `network` and an `*-opts` mapping beside
@@ -436,7 +541,7 @@ fn tls_fields(entry: &mut Mapping<'static>, kind: Kind, node: &Node<Client>) -> 
         Kind::Trojan => (false, Some("sni"), true, true),
         // Mihomo does not support AnyTLS with Reality and says it will not.
         Kind::AnyTls => (false, Some("sni"), true, false),
-        Kind::Hysteria2 | Kind::Tuic => (false, Some("sni"), false, false),
+        Kind::Hysteria | Kind::Hysteria2 | Kind::Tuic => (false, Some("sni"), false, false),
         Kind::Http => (true, Some("sni"), false, false),
         // A SOCKS proxy verifies against the address it dials and has no field
         // for another name, which is the same default the model has.
@@ -1154,14 +1259,24 @@ alpn:
     }
 
     #[test]
-    fn a_protocol_with_no_proxy_type_is_refused_by_name() {
+    fn a_snell_client_uses_the_mihomo_proxy_type() {
         let snell = node("snell://1.2.3.4:443?psk=PSK&version=4#Snell");
+        let yaml = proxy("Snell", &snell).expect("mihomo supports Snell");
+        let body = emit(&yaml);
+        assert!(body.contains("type: snell"), "{body}");
+        assert!(body.contains("version: 4"), "{body}");
+        assert!(body.contains("psk: PSK"), "{body}");
+    }
 
-        assert_eq!(
-            proxy("Snell", &snell),
-            Err(Reason::Protocol(Kind::Other)),
-            "a protocol the model does not know has no proxy type either"
-        );
+    #[test]
+    fn hysteria_v1_keeps_auth_bandwidth_and_obfs() {
+        let node = node("hysteria://example.com:443?auth=personal-key&upmbps=20&downmbps=50&obfsParam=shared-obfs#Hysteria");
+        let body = emit(&proxy("Hysteria", &node).expect("mihomo supports Hysteria v1"));
+        assert!(body.contains("type: hysteria"), "{body}");
+        assert!(body.contains("auth-str: personal-key"), "{body}");
+        assert!(body.contains("up: 20"), "{body}");
+        assert!(body.contains("down: 50"), "{body}");
+        assert!(body.contains("obfs: shared-obfs"), "{body}");
     }
 
     /// The test the whole table hangs on: every fixture either becomes a proxy or
@@ -1187,7 +1302,6 @@ alpn:
             [
                 (Kind::Trojan, Reason::Transport("h2".to_string())),
                 (Kind::Other, Reason::Protocol(Kind::Other)),
-                (Kind::Other, Reason::Protocol(Kind::Other)),
             ],
             "the shapes providers serve that this dialect cannot write"
         );
@@ -1206,7 +1320,7 @@ alpn:
 
         let (body, refused) = client_config(&named);
 
-        assert_eq!(refused.len(), 3, "the three fixtures with no proxy type");
+        assert_eq!(refused.len(), 2, "the fixtures with no proxy type");
         assert_eq!(reread(&body), body);
 
         // Nothing else is in the document: the entries are the collection's, the
@@ -1226,15 +1340,10 @@ alpn:
         let (body, refused) =
             client_config(&[("Trojan", &trojan), ("Snell", &snell), ("SSR", &ssr)]);
 
-        assert_eq!(
-            refused,
-            [Refused {
-                index: 1,
-                reason: Reason::Protocol(Kind::Other)
-            }]
-        );
-        assert_eq!(body.matches("\n  - name: ").count(), 2, "{body}");
+        assert!(refused.is_empty());
+        assert_eq!(body.matches("\n  - name: ").count(), 3, "{body}");
         assert!(body.contains("\n  - name: Trojan\n"), "{body}");
+        assert!(body.contains("\n  - name: Snell\n"), "{body}");
         assert!(body.contains("\n  - name: SSR\n"), "{body}");
     }
 
@@ -1287,7 +1396,9 @@ alpn:
     fn the_capability_list_is_the_truth() {
         let fixtures = [
             "trojan://PASSWORD@example.com:443?sni=example.com#Trojan",
+            "hysteria://example.com:443?auth=personal-key&upmbps=20&downmbps=50#Hysteria",
             "ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@192.0.2.10:1080#SIP002",
+            "snell://1.2.3.4:443?psk=PSK&version=4#Snell",
             "ssr://Z29sZGVuLmV4YW1wbGUuY29tOjQ0MzphdXRoX3NoYTFfdjQ6YWVzLTI1Ni1jZmI6aHR0cF9zaW1wbGU6YkdWMGJXVnBiZy8_b2Jmc3BhcmFtPSZyZW1hcmtzPVUxTlM",
             "socks5://doge:letmein@127.0.0.1:1080#LocalSocks",
             "http://doge:letmein@127.0.0.1:8080#LocalHttp",

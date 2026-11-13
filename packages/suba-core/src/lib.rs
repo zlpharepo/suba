@@ -31,6 +31,7 @@ pub mod node;
 pub mod observation;
 pub mod provider;
 pub mod subscription;
+mod surge;
 pub mod target;
 
 /// The protocol model, under the name this crate refers to it by.

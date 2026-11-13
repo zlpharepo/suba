@@ -16,7 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 use serde_json::Value;
-use suba_core::proto::{write_link, Client, Host, Node};
+use suba_core::proto::protocol::shadowtls;
+use suba_core::proto::{
+    write_link, Client, Endpoint as NodeEndpoint, Host, Name, Node, Outbound, RawParams, Secret,
+    TlsClient, Transport,
+};
 use suba_singbox::users::{self, Protocol};
 
 use crate::error::Error;
@@ -64,14 +68,29 @@ fn plan(document: &Value, config: &str, access: &Access) -> Plan {
             // it injects nothing here however it was granted.
             // `at` names a local inbound, and a hosted entry is never equal to
             // it, so another instance's inbound injects nothing here.
-            .filter(|grant| grant.entry.same_inbound(&at) && grant.entry.mode == GrantMode::Managed)
+            .filter(|grant| {
+                (grant.entry.same_inbound(&at) && grant.entry.mode == GrantMode::Managed)
+                    || (grant.entry.host.is_none()
+                        && grant.entry.config == config
+                        && access
+                            .endpoint(&grant.entry)
+                            .and_then(|endpoint| endpoint.inner_inbound.as_deref())
+                            == Some(tag)
+                        && matches!(placement(document, &grant.entry), Placement::Placed)
+                        && validate_inner(document, &grant.entry.inbound, tag).is_ok())
+            })
             .filter_map(|grant| {
-                let material = access.material(&grant.user, &grant.entry)?;
+                let material = access.material(&grant.user, &at)?;
                 Some(PlannedUser {
                     name: grant.user.clone(),
                     entry: users::user(protocol, inbound, &grant.user, &material)?,
                 })
             })
+            .fold(BTreeMap::new(), |mut users, planned| {
+                users.insert(planned.name.clone(), planned);
+                users
+            })
+            .into_values()
             .collect();
 
         if !planned.is_empty() {
@@ -258,12 +277,26 @@ pub(crate) fn exports(
                         .map(|user| Managed {
                             user: user.name.clone(),
                             state: state(serving, tag, &user.entry),
-                            export: export(
-                                address_of(inbound, tag, config, access, host),
-                                &user.entry,
-                                "users",
-                                tag.unwrap_or_default(),
-                            ),
+                            export: if inbound.get("type").and_then(Value::as_str)
+                                == Some("shadowtls")
+                            {
+                                composite_export(
+                                    document,
+                                    config,
+                                    access,
+                                    &plan,
+                                    &user.name,
+                                    &Entry::local(config, tag.unwrap_or_default()),
+                                    host,
+                                )
+                            } else {
+                                export(
+                                    address_of(inbound, tag, config, access, host),
+                                    &user.entry,
+                                    "users",
+                                    tag.unwrap_or_default(),
+                                )
+                            },
                         })
                         .collect()
                 })
@@ -280,10 +313,23 @@ pub(crate) fn exports(
                     .map(|grant| Shared {
                         user: grant.user.clone(),
                         state: shared_state(serving, tag, inbound),
-                        export: refusal(
-                            "type: shared inbound subscription export is not available yet"
-                                .to_string(),
-                        ),
+                        export: if inbound.get("type").and_then(Value::as_str) == Some("shadowtls")
+                        {
+                            composite_export(
+                                document,
+                                config,
+                                access,
+                                &plan,
+                                &grant.user,
+                                &grant.entry,
+                                host,
+                            )
+                        } else {
+                            shared_export(
+                                address_of(inbound, tag, config, access, host),
+                                tag.unwrap_or_default(),
+                            )
+                        },
                     })
                     .collect()
             } else {
@@ -315,6 +361,22 @@ pub(crate) fn nodes(
     host: Result<&Host, &str>,
 ) -> Vec<Result<Node<Client>, String>> {
     let plan = plan(document, config, access);
+    let grants: Vec<_> = access
+        .users
+        .get(user)
+        .into_iter()
+        .flat_map(|held| access.grants_of(user, held))
+        .filter(|grant| grant.entry.config == config && grant.entry.host.is_none())
+        .collect();
+    let inner_tags: BTreeSet<&str> = grants
+        .iter()
+        .filter_map(|grant| {
+            let inner = access.endpoint(&grant.entry)?.inner_inbound.as_deref()?;
+            (matches!(placement(document, &grant.entry), Placement::Placed)
+                && validate_inner(document, &grant.entry.inbound, inner).is_ok())
+            .then_some(inner)
+        })
+        .collect();
 
     let mut nodes: Vec<_> = plan
         .inbounds
@@ -326,7 +388,13 @@ pub(crate) fn nodes(
                 .get("tag")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            if inner_tags.contains(tag) {
+                return None;
+            }
             let at = Entry::local(config, tag);
+            if inbound.get("type").and_then(Value::as_str) == Some("shadowtls") {
+                return Some(composite(document, config, access, &plan, user, &at, host));
+            }
             Some(match address(inbound, access.endpoint(&at), host) {
                 Err(reason) => Err(reason),
                 Ok(dialable) => users::client(
@@ -341,18 +409,146 @@ pub(crate) fn nodes(
         })
         .collect();
     nodes.extend(
-        access
-            .users
-            .get(user)
-            .into_iter()
-            .flat_map(|held| access.grants_of(user, held))
-            .filter(|grant| grant.entry.config == config && grant.entry.host.is_none())
-            .filter(|grant| grant.entry.mode == GrantMode::Shared)
-            .map(|_| {
-                Err("type: shared inbound subscription export is not available yet".to_string())
+        grants
+            .iter()
+            .filter(|grant| {
+                grant.entry.mode == GrantMode::Shared
+                    && !inner_tags.contains(grant.entry.inbound.as_str())
+            })
+            .map(|grant| {
+                let inbound = inbounds(document).iter().find(|inbound| {
+                    inbound.get("tag").and_then(Value::as_str) == Some(&grant.entry.inbound)
+                });
+                let Some(inbound) = inbound else {
+                    return Err("inbound: no inbound has this tag".to_string());
+                };
+                if inbound.get("type").and_then(Value::as_str) == Some("shadowtls") {
+                    return composite(document, config, access, &plan, user, &grant.entry, host);
+                }
+                let dialable = address(inbound, access.endpoint(&grant.entry), host)?;
+                users::shared_client(dialable.inbound(), &dialable.host, &grant.entry.inbound)
+                    .map_err(|refused| refused.to_string())
             }),
     );
     nodes
+}
+
+fn composite(
+    document: &Value,
+    config: &str,
+    access: &Access,
+    plan: &Plan,
+    user: &str,
+    outer: &Entry,
+    public: Result<&Host, &str>,
+) -> Result<Node<Client>, String> {
+    if !matches!(placement(document, outer), Placement::Placed) {
+        return Err("inbound: this access mode is unavailable".to_string());
+    }
+    let inner_tag = access
+        .endpoint(outer)
+        .and_then(|endpoint| endpoint.inner_inbound.as_deref())
+        .ok_or("inner_inbound: select an inner inbound".to_string())?;
+    validate_inner(document, &outer.inbound, inner_tag)
+        .map_err(|_| "inner_inbound: the selected inner inbound is unavailable".to_string())?;
+    let outer_inbound = inbounds(document)
+        .iter()
+        .find(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(&outer.inbound))
+        .ok_or("inbound: no inbound has this tag".to_string())?;
+    let inner_index = inbounds(document)
+        .iter()
+        .position(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(inner_tag))
+        .ok_or("inner_inbound: no inbound has this tag".to_string())?;
+    let inner_inbound = &inbounds(document)[inner_index];
+    let inner_at = Entry::local(config, inner_tag);
+    let inner_address = address(inner_inbound, access.endpoint(&inner_at), public)?;
+    let inner = if let Some(planned) = plan
+        .inbounds
+        .get(&inner_index)
+        .and_then(|planned| planned.users.iter().find(|held| held.name == user))
+    {
+        users::client(
+            inner_address.inbound(),
+            &planned.entry,
+            "users",
+            &inner_address.host,
+            inner_tag,
+        )
+    } else {
+        users::shared_client(inner_address.inbound(), &inner_address.host, inner_tag)
+    }
+    .map_err(|refused| refused.to_string())?;
+    if !matches!(inner.transport, Transport::Tcp) {
+        return Err("inner_inbound.transport: ShadowTLS carries TCP only".to_string());
+    }
+    let outer_address = address(outer_inbound, access.endpoint(outer), public)?;
+    let sni = outer_inbound
+        .get("handshake")
+        .and_then(|handshake| handshake.get("server"))
+        .and_then(Value::as_str)
+        .and_then(|value| Host::parse(value).ok())
+        .ok_or("handshake.server: a TLS server name is needed".to_string())?;
+    let version = outer_inbound
+        .get("version")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let password = match version {
+        1 => None,
+        2 => Some(
+            outer_inbound
+                .get("password")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or("password: a shared ShadowTLS password is needed".to_string())?,
+        ),
+        3 => Some(
+            plan.inbounds
+                .iter()
+                .find_map(|(index, planned)| {
+                    (inbounds(document)[*index]
+                        .get("tag")
+                        .and_then(Value::as_str)
+                        == Some(&outer.inbound))
+                    .then(|| {
+                        planned
+                            .users
+                            .iter()
+                            .find(|held| held.name == user)
+                            .and_then(|held| held.entry.get("password"))
+                            .and_then(Value::as_str)
+                    })
+                    .flatten()
+                })
+                .ok_or("users.password: a managed ShadowTLS password is needed".to_string())?,
+        ),
+        _ => return Err("version: ShadowTLS version 1, 2, or 3 is needed".to_string()),
+    };
+    let tls = TlsClient {
+        server_name: Some(sni),
+        ..TlsClient::default()
+    };
+    Ok(Node {
+        name: Name::from(outer.inbound.as_str()),
+        endpoint: NodeEndpoint::new(
+            outer_address.host.clone(),
+            outer_address
+                .inbound()
+                .get("listen_port")
+                .and_then(Value::as_u64)
+                .and_then(|port| u16::try_from(port).ok())
+                .and_then(suba_core::proto::Port::new)
+                .ok_or("listen_port: a port clients can dial is needed".to_string())?,
+        ),
+        listen: (),
+        transport: Transport::Tcp,
+        tls: Some(tls),
+        protocol: Outbound::ShadowTls(shadowtls::Client {
+            version: version as u8,
+            password: password.map(|value| Secret::new(Box::from(value))),
+            inner: Box::new(inner),
+        }),
+        extra: RawParams::new(),
+    })
 }
 
 /// Where an entry stands against the configuration document it names.
@@ -374,6 +570,59 @@ pub(crate) fn modes(inbound: &Value) -> Vec<GrantMode> {
         modes.push(GrantMode::Shared);
     }
     modes
+}
+
+/// A ShadowTLS relationship is explicit and stays inside one configuration.
+pub(crate) fn validate_inner(document: &Value, outer: &str, inner: &str) -> Result<(), Error> {
+    let inbounds = inbounds(document);
+    let outer_inbound = inbounds
+        .iter()
+        .find(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(outer));
+    if outer_inbound.and_then(|inbound| inbound.get("type").and_then(Value::as_str))
+        != Some("shadowtls")
+    {
+        return Err(Error::Document(
+            "inner_inbound: only ShadowTLS carries an inner inbound".to_string(),
+        ));
+    }
+    if outer == inner {
+        return Err(Error::Document(
+            "inner_inbound: an inbound cannot carry itself".to_string(),
+        ));
+    }
+    let Some(inner_inbound) = inbounds
+        .iter()
+        .find(|inbound| inbound.get("tag").and_then(Value::as_str) == Some(inner))
+    else {
+        return Err(Error::Document(
+            "inner_inbound: no inbound has this tag".to_string(),
+        ));
+    };
+    if inner_inbound.get("type").and_then(Value::as_str) == Some("shadowtls") {
+        return Err(Error::Document(
+            "inner_inbound: nested ShadowTLS is unsupported".to_string(),
+        ));
+    }
+    if matches!(
+        inner_inbound.get("type").and_then(Value::as_str),
+        Some("hysteria" | "hysteria2" | "tuic" | "anytls")
+    ) || inner_inbound.get("network").and_then(Value::as_str) == Some("udp")
+        || inner_inbound
+            .get("transport")
+            .and_then(|transport| transport.get("type"))
+            .and_then(Value::as_str)
+            == Some("quic")
+    {
+        return Err(Error::Document(
+            "inner_inbound: ShadowTLS carries TCP only".to_string(),
+        ));
+    }
+    if users::grantable(inner_inbound).is_err() && users::shareable(inner_inbound).is_err() {
+        return Err(Error::Document(
+            "inner_inbound: this inbound has no client credential".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn shared_warning(inbound: &Value) -> Option<&'static str> {
@@ -478,8 +727,48 @@ fn export(dialable: Result<Dialable<'_>, String>, user: &Value, path: &str, name
     }
 }
 
+fn shared_export(dialable: Result<Dialable<'_>, String>, name: &str) -> Export {
+    let dialable = match dialable {
+        Ok(dialable) => dialable,
+        Err(reason) => return refusal(reason),
+    };
+    match users::shared_client(dialable.inbound(), &dialable.host, name) {
+        Err(refused) => refusal(refused.to_string()),
+        Ok(node) => Export {
+            link: write_link(&node).ok(),
+            outbound: outbound(name, &node),
+            reason: None,
+        },
+    }
+}
+
+fn composite_export(
+    document: &Value,
+    config: &str,
+    access: &Access,
+    plan: &Plan,
+    user: &str,
+    outer: &Entry,
+    host: Result<&Host, &str>,
+) -> Export {
+    match composite(document, config, access, plan, user, outer, host) {
+        Err(reason) => refusal(reason),
+        Ok(node) => Export {
+            link: None,
+            outbound: outbound(&outer.inbound, &node),
+            reason: None,
+        },
+    }
+}
+
 #[cfg(feature = "singbox")]
 fn outbound(tag: &str, node: &Node<Client>) -> Option<Value> {
+    if matches!(node.protocol, Outbound::ShadowTls(_)) {
+        let (values, refused) = suba_singbox::outbounds(&[(tag, node)]);
+        return refused
+            .is_empty()
+            .then(|| serde_json::json!({ "outbounds": values }));
+    }
     suba_singbox::outbound(tag, node).ok()
 }
 
@@ -708,6 +997,7 @@ mod tests {
                 Endpoint {
                     address: Some("cdn.example.com".to_string()),
                     port: Some(8444),
+                    ..Endpoint::default()
                 },
             )]),
         );
@@ -722,9 +1012,188 @@ mod tests {
     }
 
     #[test]
-    fn shared_bindings_do_not_inject_users_and_are_reported_as_unexported() {
+    fn shadowtls_binding_injects_inner_user_and_delivers_only_composite() {
         let document = json!({"inbounds": [
-            {"type": "shadowsocks", "tag": "ss", "method": "2022-blake3-chacha20-poly1305", "password": "key", "listen_port": 1080},
+            {"type": "shadowtls", "tag": "outer", "version": 3, "listen_port": 443,
+             "handshake": {"server": "cover.example.com", "server_port": 443}},
+            {"type": "trojan", "tag": "inner", "listen_port": 8443,
+             "tls": {"enabled": true}}
+        ]});
+        let mut access = Access::default();
+        access.users.insert(
+            "alice".into(),
+            User {
+                inbounds: vec![entry("server", "outer")],
+                secret: "11".repeat(32),
+                ..User::default()
+            },
+        );
+        access.endpoints.insert(
+            "server".into(),
+            BTreeMap::from([(
+                "outer".into(),
+                Endpoint {
+                    inner_inbound: Some("inner".into()),
+                    ..Endpoint::default()
+                },
+            )]),
+        );
+
+        let product = inject(&document, "server", &access).unwrap();
+        assert_eq!(names(&product, 0), ["alice"]);
+        assert_eq!(names(&product, 1), ["alice"]);
+        let nodes = nodes(&document, "server", &access, "alice", Ok(&host()));
+        assert_eq!(nodes.len(), 1);
+        let node = nodes[0].as_ref().unwrap();
+        assert!(matches!(
+            node.protocol,
+            suba_core::proto::Outbound::ShadowTls(_)
+        ));
+    }
+
+    #[test]
+    fn shared_shadowtls_authorizes_its_inner_shadowsocks_user() {
+        let document = json!({"inbounds": [
+            {"type": "shadowtls", "tag": "outer", "version": 2, "password": "outer-key",
+             "listen_port": 443, "handshake": {"server": "cover.example.com", "server_port": 443}},
+            {"type": "shadowsocks", "tag": "inner", "listen_port": 8443,
+             "method": "aes-256-gcm", "password": "inner-key"}
+        ]});
+        let mut access = Access::default();
+        access.users.insert(
+            "alice".into(),
+            User {
+                inbounds: vec![Entry {
+                    mode: GrantMode::Shared,
+                    ..entry("server", "outer")
+                }],
+                secret: "11".repeat(32),
+                ..User::default()
+            },
+        );
+        access.endpoints.insert(
+            "server".into(),
+            BTreeMap::from([(
+                "outer".into(),
+                Endpoint {
+                    inner_inbound: Some("inner".into()),
+                    ..Endpoint::default()
+                },
+            )]),
+        );
+
+        let product = inject(&document, "server", &access).unwrap();
+        assert_eq!(names(&product, 1), ["alice"]);
+        let nodes = nodes(&document, "server", &access, "alice", Ok(&host()));
+        assert_eq!(nodes.len(), 1);
+        let node = nodes[0].as_ref().unwrap();
+        let Outbound::ShadowTls(client) = &node.protocol else {
+            panic!("a composite node is needed")
+        };
+        assert_eq!(client.password.as_ref().unwrap().as_str(), "outer-key");
+        assert!(matches!(client.inner.protocol, Outbound::Shadowsocks(_)));
+        let preview = exports(
+            &document,
+            "server",
+            &access,
+            Ok(&host()),
+            &Serving::Not { in_use: false },
+        );
+        assert!(preview[0].shared[0].export.reason.is_none());
+        #[cfg(feature = "singbox")]
+        assert_eq!(
+            preview[0].shared[0].export.outbound.as_ref().unwrap()["outbounds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn shared_shadowtls_carries_single_credential_2022_chacha_without_injection() {
+        let document = json!({"inbounds": [
+            {"type": "shadowtls", "tag": "outer", "version": 2, "password": "outer-key",
+             "listen_port": 443, "handshake": {"server": "cover.example.com", "server_port": 443}},
+            {"type": "shadowsocks", "tag": "inner", "listen_port": 8443,
+             "method": "2022-blake3-chacha20-poly1305",
+             "password": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}
+        ]});
+        let mut access = Access::default();
+        access.users.insert(
+            "alice".into(),
+            User {
+                inbounds: vec![Entry {
+                    mode: GrantMode::Shared,
+                    ..entry("server", "outer")
+                }],
+                secret: "11".repeat(32),
+                ..User::default()
+            },
+        );
+        access.endpoints.insert(
+            "server".into(),
+            BTreeMap::from([(
+                "outer".into(),
+                Endpoint {
+                    inner_inbound: Some("inner".into()),
+                    ..Endpoint::default()
+                },
+            )]),
+        );
+
+        assert_eq!(inject(&document, "server", &access).unwrap(), document);
+        let nodes = nodes(&document, "server", &access, "alice", Ok(&host()));
+        assert_eq!(nodes.len(), 1);
+        let Outbound::ShadowTls(client) = &nodes[0].as_ref().unwrap().protocol else {
+            panic!("a composite node is needed")
+        };
+        let Outbound::Shadowsocks(inner) = &client.inner.protocol else {
+            panic!("the inner Shadowsocks credential is needed")
+        };
+        assert_eq!(inner.method.as_ref(), "2022-blake3-chacha20-poly1305");
+        assert_eq!(
+            inner.password.as_str(),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+    }
+
+    #[test]
+    fn stale_outer_access_mode_cannot_authorize_inner_users() {
+        let document = json!({"inbounds": [
+            {"type": "shadowtls", "tag": "outer", "version": 3, "listen_port": 443},
+            {"type": "trojan", "tag": "inner", "listen_port": 8443}
+        ]});
+        let mut access = Access::default();
+        access.users.insert(
+            "alice".into(),
+            User {
+                inbounds: vec![Entry {
+                    mode: GrantMode::Shared,
+                    ..entry("server", "outer")
+                }],
+                secret: "11".repeat(32),
+                ..User::default()
+            },
+        );
+        access.endpoints.insert(
+            "server".into(),
+            BTreeMap::from([(
+                "outer".into(),
+                Endpoint {
+                    inner_inbound: Some("inner".into()),
+                    ..Endpoint::default()
+                },
+            )]),
+        );
+        let product = inject(&document, "server", &access).unwrap();
+        assert!(names(&product, 1).is_empty());
+    }
+
+    #[test]
+    fn shared_credential_inbounds_export_without_injecting_users() {
+        let document = json!({"inbounds": [
+            {"type": "shadowsocks", "tag": "ss", "method": "2022-blake3-chacha20-poly1305", "password": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "listen_port": 1080},
             {"type": "snell", "tag": "snell", "version": 6, "psk": "shared-secret", "listen_port": 1081},
             {"type": "shadowtls", "tag": "shadow", "version": 2, "password": "key", "listen_port": 1082},
             {"type": "shadowtls", "tag": "legacy", "version": 1, "listen_port": 1083}
@@ -772,11 +1241,31 @@ mod tests {
             assert_eq!(inbound.shared.len(), 1);
             assert_eq!(inbound.shared[0].user, "alice");
             assert_eq!(inbound.shared[0].state, State::Applied);
-            assert!(inbound.shared[0].export.reason.is_some());
         }
+        assert!(exports[0].shared[0]
+            .export
+            .link
+            .as_deref()
+            .is_some_and(|link| link.starts_with("ss://")));
+        #[cfg(feature = "singbox")]
+        assert_eq!(
+            exports[0].shared[0].export.outbound.as_ref().unwrap()["type"],
+            "shadowsocks"
+        );
+        assert!(exports[0].shared[0].export.reason.is_none());
+        assert!(exports[1].shared[0]
+            .export
+            .link
+            .as_deref()
+            .is_some_and(|link| link.starts_with("snell://")));
+        assert!(exports[2..]
+            .iter()
+            .all(|inbound| inbound.shared[0].export.reason.is_some()));
         let nodes = nodes(&document, "server", &access, "alice", Ok(&host()));
         assert_eq!(nodes.len(), 4);
-        assert!(nodes.iter().all(Result::is_err));
+        assert!(nodes[0].is_ok());
+        assert!(nodes[1].is_ok());
+        assert!(nodes[2..].iter().all(Result::is_err));
         let managed_document = json!({"inbounds": [{"type": "snell", "tag": "snell", "version": 5, "psk": "shared-secret"}]});
         let mut managed_access = Access::default();
         managed_access.users.insert(
@@ -1052,6 +1541,7 @@ mod tests {
                 Endpoint {
                     address: Some("cdn.example.com".to_string()),
                     port: None,
+                    ..Endpoint::default()
                 },
                 "cdn.example.com",
                 "8443",
@@ -1060,6 +1550,7 @@ mod tests {
                 Endpoint {
                     address: None,
                     port: Some(443),
+                    ..Endpoint::default()
                 },
                 "proxy.example.com",
                 "443",
@@ -1092,6 +1583,7 @@ mod tests {
                 Endpoint {
                     address: Some("not a host".to_string()),
                     port: None,
+                    ..Endpoint::default()
                 },
             )]),
         );

@@ -37,6 +37,10 @@ pub const PROTOCOLS: &[Kind] = &[
     Kind::Vless,
     Kind::Trojan,
     Kind::Shadowsocks,
+    Kind::Snell,
+    Kind::Hysteria,
+    Kind::Naive,
+    Kind::ShadowTls,
     Kind::Vmess,
     Kind::Hysteria2,
     Kind::Tuic,
@@ -81,6 +85,12 @@ pub enum Reason {
 /// `tag` is what the document calls it: what sing-box refers to it by in a
 /// selector or a routing rule.
 pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
+    if matches!(node.protocol, Outbound::ShadowTls(_)) {
+        return Err(Reason::Field {
+            field: "protocol",
+            reason: "ShadowTLS needs two outbounds; use outbounds",
+        });
+    }
     if !PROTOCOLS.contains(&node.protocol.kind()) {
         return Err(Reason::Protocol(node.protocol.kind()));
     }
@@ -139,11 +149,100 @@ pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
                 outbound.insert("plugin_opts".to_string(), json!(plugin.to_string()));
             }
         }
+        Outbound::Snell(client) => {
+            let version = match client.version {
+                4 | 5 => 4,
+                6 => 6,
+                _ => {
+                    return Err(Reason::Field {
+                        field: "version",
+                        reason: "sing-box only dials Snell v4/v5 TCP or v6",
+                    })
+                }
+            };
+            if !matches!(node.transport, Transport::Tcp)
+                || node.tls.is_some()
+                || !node.extra.is_empty()
+            {
+                return Err(Reason::Field {
+                    field: "snell",
+                    reason: "this transport or TLS combination has no Snell outbound",
+                });
+            }
+            outbound.insert("type".to_string(), json!("snell"));
+            outbound.insert("version".to_string(), json!(version));
+            outbound.insert("psk".to_string(), json!(client.psk.as_str()));
+            if let Some(userkey) = &client.userkey {
+                outbound.insert("userkey".to_string(), json!(userkey.as_str()));
+            }
+            if client.reuse {
+                outbound.insert("reuse".to_string(), json!(true));
+            }
+            if version == 4 {
+                if let Some(mode) = &client.obfs_mode {
+                    outbound.insert("obfs_mode".to_string(), json!(mode.as_ref()));
+                }
+                if let Some(host) = &client.obfs_host {
+                    outbound.insert("obfs_host".to_string(), json!(host.as_ref()));
+                }
+                if client.mode.is_some() {
+                    return Err(Reason::Field {
+                        field: "mode",
+                        reason: "traffic shaping belongs to Snell v6",
+                    });
+                }
+            } else {
+                if client.obfs_mode.is_some() || client.obfs_host.is_some() {
+                    return Err(Reason::Field {
+                        field: "obfs_mode",
+                        reason: "HTTP obfuscation belongs to Snell v4/v5",
+                    });
+                }
+                if let Some(mode) = &client.mode {
+                    outbound.insert("mode".to_string(), json!(mode.as_ref()));
+                }
+            }
+        }
         Outbound::Vmess(client) => {
             outbound.insert("type".to_string(), json!("vmess"));
             outbound.insert("uuid".to_string(), json!(client.id.expose().to_string()));
             outbound.insert("security".to_string(), json!(client.security.as_str()));
             outbound.insert("alter_id".to_string(), json!(client.alter_id));
+        }
+        Outbound::Hysteria(client) => {
+            if !node.extra.is_empty() {
+                return Err(Reason::Field {
+                    field: "extra",
+                    reason: "a Hysteria v1 option has no native mapping",
+                });
+            }
+            if !matches!(node.transport, Transport::Quic(_)) {
+                return Err(Reason::Field {
+                    field: "transport",
+                    reason: "Hysteria v1 runs over QUIC",
+                });
+            }
+            let up = client.up.ok_or(Reason::Field {
+                field: "up",
+                reason: "Hysteria v1 needs an uplink rate",
+            })?;
+            let down = client.down.ok_or(Reason::Field {
+                field: "down",
+                reason: "Hysteria v1 needs a downlink rate",
+            })?;
+            outbound.insert("type".to_string(), json!("hysteria"));
+            outbound.insert("auth_str".to_string(), json!(client.auth.as_str()));
+            outbound.insert("up_mbps".to_string(), json!(up));
+            outbound.insert("down_mbps".to_string(), json!(down));
+            if let Some(obfs) = &client.obfs {
+                outbound.insert("obfs".to_string(), json!(obfs.as_str()));
+            }
+            if let Some(ports) = &client.ports {
+                outbound.insert("server_ports".to_string(), json!(server_ports(ports)?));
+            }
+            if let Some(interval) = client.hop_interval {
+                outbound.insert("hop_interval".to_string(), json!(format!("{interval}s")));
+            }
         }
         Outbound::Hysteria2(client) => {
             outbound.insert("type".to_string(), json!("hysteria2"));
@@ -198,6 +297,40 @@ pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
         Outbound::AnyTls(client) => {
             outbound.insert("type".to_string(), json!("anytls"));
             outbound.insert("password".to_string(), json!(client.password.as_str()));
+        }
+        Outbound::Naive(client) => {
+            let tls = node.tls.as_ref().ok_or(Reason::Field {
+                field: "tls",
+                reason: "Naive requires TLS",
+            })?;
+            if tls.insecure
+                || !tls.alpn.is_empty()
+                || tls.fingerprint.is_some()
+                || tls.reality.is_some()
+                || !tls.extra.is_empty()
+            {
+                return Err(Reason::Field {
+                    field: "tls",
+                    reason: "a Naive TLS option has no native mapping",
+                });
+            }
+            if !node.extra.is_empty()
+                || !matches!(
+                    (&node.transport, client.quic),
+                    (Transport::Tcp, false) | (Transport::Quic(_), true)
+                )
+            {
+                return Err(Reason::Field {
+                    field: "transport",
+                    reason: "this Naive transport has no native mapping",
+                });
+            }
+            outbound.insert("type".to_string(), json!("naive"));
+            outbound.insert("username".to_string(), json!(client.username.as_ref()));
+            outbound.insert("password".to_string(), json!(client.password.as_str()));
+            if client.quic {
+                outbound.insert("quic".to_string(), json!(true));
+            }
         }
         Outbound::Socks(client) => {
             outbound.insert("type".to_string(), json!("socks"));
@@ -258,7 +391,7 @@ pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
     // Hysteria2, TUIC and AnyTLS run over QUIC by construction: a link that says
     // `quic` is saying what the protocol already is, and sing-box has no carriage
     // field for them.
-    if !carries_itself(node.protocol.kind()) {
+    if !carries_itself(node.protocol.kind()) && node.protocol.kind() != Kind::Naive {
         if let Some(carriage) = transport_of(&node.transport) {
             outbound.insert("transport".to_string(), carriage?);
         }
@@ -272,7 +405,10 @@ pub fn outbound(tag: &str, node: &Node<Client>) -> Result<Value, Reason> {
 /// It is one property with two consequences: there is nothing to say about the
 /// carriage, and there is nothing to say about whether TLS is on.
 fn carries_itself(kind: Kind) -> bool {
-    matches!(kind, Kind::Hysteria2 | Kind::Tuic | Kind::AnyTls)
+    matches!(
+        kind,
+        Kind::Hysteria | Kind::Hysteria2 | Kind::Tuic | Kind::AnyTls
+    )
 }
 
 /// One outbound per node, in the order they are given.
@@ -290,13 +426,66 @@ pub fn outbounds(nodes: &[(&str, &Node<Client>)]) -> (Vec<Value>, Vec<Refused>) 
     for (index, (name, node)) in nodes.iter().enumerate() {
         let tag = unique_tag(name, index, &mut tags);
 
-        match outbound(&tag, node) {
-            Ok(outbound) => outbounds.push(outbound),
+        let written = match &node.protocol {
+            Outbound::ShadowTls(client) => {
+                let outer_tag = unique_tag(&format!("{tag} ShadowTLS"), index, &mut tags);
+                composite_outbounds(&tag, &outer_tag, node, client)
+            }
+            _ => outbound(&tag, node).map(|outbound| vec![outbound]),
+        };
+        match written {
+            Ok(values) => outbounds.extend(values),
             Err(reason) => refused.push(Refused { index, reason }),
         }
     }
 
     (outbounds, refused)
+}
+
+fn composite_outbounds(
+    tag: &str,
+    outer_tag: &str,
+    node: &Node<Client>,
+    client: &suba_proto::protocol::shadowtls::Client,
+) -> Result<Vec<Value>, Reason> {
+    if !matches!(node.transport, Transport::Tcp)
+        || !matches!(client.inner.transport, Transport::Tcp)
+    {
+        return Err(Reason::Field {
+            field: "transport",
+            reason: "ShadowTLS carries TCP only",
+        });
+    }
+    if !(1..=3).contains(&client.version) {
+        return Err(Reason::Field {
+            field: "version",
+            reason: "ShadowTLS version 1, 2, or 3 is needed",
+        });
+    }
+    if client.version != 1 && client.password.is_none() {
+        return Err(Reason::Field {
+            field: "password",
+            reason: "ShadowTLS needs a password for this version",
+        });
+    }
+    let tls = node.tls.as_ref().ok_or(Reason::Field {
+        field: "tls",
+        reason: "ShadowTLS requires TLS",
+    })?;
+    let mut inner = outbound(tag, &client.inner)?;
+    inner["detour"] = json!(outer_tag);
+    let mut outer = json!({
+        "type": "shadowtls",
+        "tag": outer_tag,
+        "server": node.endpoint.host.to_string(),
+        "server_port": node.endpoint.port.get(),
+        "version": client.version,
+        "tls": tls_of(tls, &node.endpoint),
+    });
+    if let Some(password) = &client.password {
+        outer["password"] = json!(password.as_str());
+    }
+    Ok(vec![outer, inner])
 }
 
 /// The tag for one node.
@@ -494,6 +683,41 @@ mod tests {
         parse_link(link).expect("the fixture parses")
     }
 
+    fn shadowtls_fixture() -> Node<Client> {
+        let inner = node("trojan://PASSWORD@example.com:8443#Inner");
+        Node {
+            name: suba_proto::Name::from("Outer"),
+            endpoint: suba_proto::Endpoint::new(
+                suba_proto::Host::parse("edge.example.com").unwrap(),
+                suba_proto::Port::new(443).unwrap(),
+            ),
+            listen: (),
+            transport: Transport::Tcp,
+            tls: Some(TlsClient {
+                server_name: Some(suba_proto::Host::parse("cover.example.com").unwrap()),
+                ..TlsClient::default()
+            }),
+            protocol: Outbound::ShadowTls(suba_proto::protocol::shadowtls::Client {
+                version: 3,
+                password: Some(suba_proto::Secret::new(Box::from("OUTER"))),
+                inner: Box::new(inner),
+            }),
+            extra: suba_proto::RawParams::new(),
+        }
+    }
+
+    #[test]
+    fn shadowtls_composite_writes_outer_and_detoured_inner() {
+        let outer = shadowtls_fixture();
+        let (outbounds, refused) = outbounds(&[("Outer", &outer)]);
+        assert!(refused.is_empty());
+        assert_eq!(outbounds.len(), 2);
+        assert_eq!(outbounds[0]["type"], "shadowtls");
+        assert_eq!(outbounds[0]["password"], "OUTER");
+        assert_eq!(outbounds[1]["type"], "trojan");
+        assert_eq!(outbounds[1]["detour"], outbounds[0]["tag"]);
+    }
+
     fn written(tag: &str, link: &str) -> Value {
         outbound(tag, &node(link)).expect("the fixture is expressible")
     }
@@ -536,6 +760,45 @@ mod tests {
                 "password": "PASSWORD"
             })
         );
+    }
+
+    #[test]
+    fn hysteria_v1_keeps_auth_bandwidth_and_obfs() {
+        let outbound = written("Hysteria", "hysteria://example.com:443?auth=personal-key&upmbps=20&downmbps=50&obfsParam=shared-obfs#Hysteria");
+        assert_eq!(outbound["type"], "hysteria");
+        assert_eq!(outbound["auth_str"], "personal-key");
+        assert_eq!(outbound["up_mbps"], 20);
+        assert_eq!(outbound["down_mbps"], 50);
+        assert_eq!(outbound["obfs"], "shared-obfs");
+    }
+
+    #[test]
+    fn hysteria_v1_refuses_unmapped_link_options() {
+        let node = node("hysteria://example.com:443?auth=personal-key&upmbps=20&downmbps=50&obfs=unknown#Hysteria");
+        assert_eq!(
+            outbound("Hysteria", &node),
+            Err(Reason::Field {
+                field: "extra",
+                reason: "a Hysteria v1 option has no native mapping"
+            })
+        );
+    }
+
+    #[test]
+    fn naive_uses_its_native_outbound_without_a_link() {
+        let inbound = json!({"type": "naive", "listen_port": 443, "network": "udp", "tls": {"enabled": true}});
+        let user = json!({"username": "alice", "password": "personal-key"});
+        let host = suba_proto::Host::parse("example.com").unwrap();
+        let node = crate::users::client(&inbound, &user, "users[0]", &host, "Naive").unwrap();
+        assert_eq!(
+            suba_proto::write_link(&node).unwrap_err().kind(),
+            suba_proto::ErrorKind::NoLinkForm
+        );
+        let outbound = outbound("Naive", &node).unwrap();
+        assert_eq!(outbound["type"], "naive");
+        assert_eq!(outbound["username"], "alice");
+        assert_eq!(outbound["password"], "personal-key");
+        assert_eq!(outbound["quic"], true);
     }
 
     #[test]
@@ -781,11 +1044,8 @@ mod tests {
         );
 
         let snell = node("snell://1.2.3.4:443?psk=PSK&version=4#Snell");
-        assert_eq!(
-            outbound("Snell", &snell),
-            Err(Reason::Protocol(Kind::Other)),
-            "a protocol the model does not know has no outbound either"
-        );
+        assert_eq!(outbound("Snell", &snell).unwrap()["version"], 4);
+        assert_eq!(outbound("Snell", &snell).unwrap()["psk"], "PSK");
     }
 
     #[test]
@@ -862,7 +1122,9 @@ mod tests {
     fn the_capability_list_is_the_truth() {
         let fixtures = [
             "trojan://PASSWORD@example.com:443?sni=example.com#Trojan",
+            "hysteria://example.com:443?auth=personal-key&upmbps=20&downmbps=50#Hysteria",
             "ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@192.0.2.10:1080#SIP002",
+            "snell://192.0.2.10:1080?psk=PSK&version=4#Snell",
             "socks5://doge:letmein@127.0.0.1:1080#LocalSocks",
             "http://doge:letmein@127.0.0.1:8080#LocalHttp",
             "vless://11111111-2222-3333-4444-555555555555@example.com:443?encryption=none#IPv6",
@@ -883,6 +1145,24 @@ mod tests {
             assert!(outbound("tag", &node).is_ok(), "{fixture} was refused");
             kinds.push(node.protocol.kind());
         }
+
+        let host = suba_proto::Host::parse("example.com").unwrap();
+        let naive = crate::users::client(
+            &json!({"type": "naive", "listen_port": 443, "tls": {"enabled": true}}),
+            &json!({"username": "alice", "password": "personal-key"}),
+            "users[0]",
+            &host,
+            "Naive",
+        )
+        .unwrap();
+        assert!(outbound("Naive", &naive).is_ok());
+        kinds.push(naive.protocol.kind());
+        let composite = shadowtls_fixture();
+        assert_eq!(composite.protocol.kind(), Kind::ShadowTls);
+        let (written, refused) = outbounds(&[("ShadowTLS", &composite)]);
+        assert_eq!(written.len(), 2);
+        assert!(refused.is_empty());
+        kinds.push(composite.protocol.kind());
 
         for kind in PROTOCOLS {
             assert!(
