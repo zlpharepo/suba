@@ -723,6 +723,7 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
                 let at = Entry::local(&name, tag);
                 let stored = access.endpoint(&at);
                 let modes = managed::modes(inbound);
+                let shared_refused = managed::shared_refusal(inbound);
                 let shadowtls_problem = if inbound.get("type").and_then(serde_json::Value::as_str)
                     == Some("shadowtls")
                 {
@@ -740,7 +741,7 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
                     host: None,
                     host_name: None,
                     reason: if modes.is_empty() {
-                        managed::placement(&document, &at).reason()
+                        shared_refused.or_else(|| managed::placement(&document, &at).reason())
                     } else {
                         shadowtls_problem
                     },
@@ -748,7 +749,7 @@ async fn endpoint_view(state: &AppState) -> Result<EndpointsView, Error> {
                     inbound: tag.to_owned(),
                     modes,
                     shared_warning: managed::shared_warning(inbound),
-                    shared_refused: managed::shared_refusal(inbound),
+                    shared_refused,
                     managed_warning: managed::managed_warning(inbound),
                     address: stored.and_then(|endpoint| endpoint.address.clone()),
                     port: stored.and_then(|endpoint| endpoint.port),
@@ -795,7 +796,7 @@ pub async fn put_endpoint(
         },
     };
     let reason = if modes.is_empty() {
-        placement.reason()
+        shared_refused.or_else(|| placement.reason())
     } else if shadowtls && endpoint.inner_inbound.is_none() {
         Some("select an inner inbound before exporting this entry")
     } else {

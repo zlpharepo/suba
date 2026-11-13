@@ -651,9 +651,11 @@ pub(crate) fn managed_warning(inbound: &Value) -> Option<&'static str> {
 }
 
 pub(crate) fn shared_refusal(inbound: &Value) -> Option<&'static str> {
-    (inbound.get("type").and_then(Value::as_str) == Some("snell"))
-        .then(|| users::shareable(inbound).err())
-        .flatten()
+    (inbound.get("type").and_then(Value::as_str) == Some("snell")
+        || (inbound.get("type").and_then(Value::as_str) == Some("shadowsocks")
+            && users::grantable(inbound).is_err()))
+    .then(|| users::shareable(inbound).err())
+    .flatten()
 }
 
 impl Placement {
@@ -1293,6 +1295,20 @@ mod tests {
         assert_eq!(
             shared_refusal(&with_native_users["inbounds"][0]),
             Some("Snell users require a user key, not a shared PSK alone")
+        );
+    }
+
+    #[test]
+    fn invalid_2022_chacha_key_exposes_a_shared_access_refusal() {
+        let inbound = json!({
+            "type": "shadowsocks",
+            "method": "2022-blake3-chacha20-poly1305",
+            "password": "too-short"
+        });
+        assert!(modes(&inbound).is_empty());
+        assert_eq!(
+            shared_refusal(&inbound),
+            Some("a 32-byte base64 Shadowsocks key is needed")
         );
     }
 
