@@ -1,0 +1,100 @@
+name: Server
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: 1.98.1
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo clippy -p suba-server --no-default-features --features json --all-targets -- -D warnings
+      - run: cargo test -p suba-server --no-default-features --features json
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "suba") | .version')" = "$GITHUB_REF_NAME"
+
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ghcr.io/zlpharepo/suba:${{ github.ref_name }}-${{ matrix.arch }}
+      - name: Export CLI binary
+        run: |
+          docker buildx build --platform linux/${{ matrix.arch }} --target binary --output type=local,dest=out .
+          tar -C out -czf suba-linux-${{ matrix.arch }}.tar.gz suba
+          sha256sum suba-linux-${{ matrix.arch }}.tar.gz > suba-linux-${{ matrix.arch }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            suba-linux-${{ matrix.arch }}.tar.gz
+            suba-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish multiarch image
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/zlpharepo/suba:$GITHUB_REF_NAME \
+            -t ghcr.io/zlpharepo/suba:${GITHUB_REF_NAME#v} \
+            -t ghcr.io/zlpharepo/suba:latest \
+            ghcr.io/zlpharepo/suba:$GITHUB_REF_NAME-amd64 \
+            ghcr.io/zlpharepo/suba:$GITHUB_REF_NAME-arm64
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" suba-linux-*.tar.gz suba-linux-*.tar.gz.sha256 --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
