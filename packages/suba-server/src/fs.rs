@@ -47,15 +47,19 @@ use std::{
 use rustix::{
     fs::{chown, open, openat, renameat, unlinkat, AtFlags, Gid, Mode, OFlags, Uid},
     io::Errno,
-    process::geteuid,
+    process::{getegid, geteuid},
 };
 
 /// Mode for files that may contain credentials.
 pub const FILE_MODE: u32 = 0o600;
 /// Mode for directories that may contain credential-bearing files.
 pub const DIR_MODE: u32 = 0o700;
-/// The permission bits that mean "somebody other than the owner may write".
-const OTHER_WRITE: u32 = 0o022;
+/// The permission bit that means anybody at all may write.
+const OTHER_WRITE: u32 = 0o002;
+/// The permission bit that means a group may write. Only a group this process
+/// runs as is the operator's own business; a directory shared with a group
+/// nobody here belongs to is somebody else's write access.
+const GROUP_WRITE: u32 = 0o020;
 /// The longest name this will create or open.
 const MAX_NAME: usize = 255;
 
@@ -274,7 +278,13 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
     let metadata = directory.metadata()?;
     let mode = metadata.mode() & 0o777;
 
-    if let Err(reason) = trust(metadata.uid(), mode, geteuid().as_raw()) {
+    if let Err(reason) = trust(
+        metadata.uid(),
+        metadata.gid(),
+        mode,
+        geteuid().as_raw(),
+        getegid().as_raw(),
+    ) {
         return Err(refused(path, "", reason));
     }
 
@@ -292,12 +302,22 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
 /// Root is answered on its own, because it can reach any directory there is: who
 /// owns one says nothing about what root may do, and comparing against root's
 /// own id was what stopped a root run from using the operator's data directory.
-fn trust(owner: u32, mode: u32, euid: u32) -> Result<(), &'static str> {
+///
+/// Group write is judged against the group the process runs as. A desktop
+/// distribution hands the operator a private group and umask `002`, so a
+/// directory they just created is `0775` and nobody else can actually reach it;
+/// refusing that turned away every first run. A group this process does not run
+/// as is somebody else's write access, and stays refused. The mode is tightened
+/// to `0700` immediately afterwards either way.
+fn trust(owner: u32, group: u32, mode: u32, euid: u32, egid: u32) -> Result<(), &'static str> {
     if euid != 0 && owner != euid {
         return Err("is not owned by the user running suba");
     }
     if mode & OTHER_WRITE != 0 {
         return Err("is writable by a user other than its owner");
+    }
+    if euid != 0 && mode & GROUP_WRITE != 0 && group != egid {
+        return Err("is writable by a group this process does not run as");
     }
 
     Ok(())
@@ -414,21 +434,42 @@ mod tests {
     }
 
     /// Root is answered on its own, and a directory somebody else can write to
-    /// is never trusted — which is the one thing that check is for.
+    /// is never trusted — which is the one thing that check is for. A group the
+    /// process itself runs as is the operator's own group, not somebody else.
     #[test]
     fn a_directory_is_trusted_by_who_may_write_it() {
-        assert!(trust(501, 0o700, 501).is_ok(), "its own owner");
-        assert!(trust(0, 0o700, 0).is_ok(), "root, owning it");
+        assert!(trust(501, 501, 0o700, 501, 501).is_ok(), "its own owner");
+        assert!(trust(0, 0, 0o700, 0, 0).is_ok(), "root, owning it");
         assert!(
-            trust(501, 0o700, 0).is_ok(),
+            trust(501, 501, 0o700, 0, 0).is_ok(),
             "root, on a directory that is somebody else's: it can reach \
              anything there is, so the owner says nothing about what it may do"
         );
 
-        assert!(trust(501, 0o700, 502).is_err(), "another user's directory");
-        assert!(trust(501, 0o755, 501).is_ok(), "readable by others is fine");
-        assert!(trust(501, 0o777, 501).is_err(), "writable by others");
-        assert!(trust(501, 0o777, 0).is_err(), "writable by others, as root");
+        assert!(
+            trust(501, 501, 0o700, 502, 502).is_err(),
+            "another user's directory"
+        );
+        assert!(
+            trust(501, 501, 0o755, 501, 501).is_ok(),
+            "readable by others is fine"
+        );
+        assert!(
+            trust(501, 501, 0o775, 501, 501).is_ok(),
+            "a private group's umask is not somebody else's write access"
+        );
+        assert!(
+            trust(501, 501, 0o775, 501, 502).is_err(),
+            "a group this process does not run as is somebody else's"
+        );
+        assert!(
+            trust(501, 501, 0o777, 501, 501).is_err(),
+            "writable by others"
+        );
+        assert!(
+            trust(501, 501, 0o777, 0, 0).is_err(),
+            "writable by others, as root"
+        );
     }
 
     /// The root of a filesystem is not a data directory, and a mistyped
