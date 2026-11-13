@@ -6,10 +6,10 @@
 //! keep what is written there private, whole, and where it was meant to go:
 //!
 //! * **Trusted.** A directory is opened, checked to be owned by the user running
-//!   this process and not writable by anyone else, and tightened to `0700`.
-//!   A directory someone else can write to is refused rather than fixed: that is
-//!   the case where another user can plant files, and repairing the mode would
-//!   hide it.
+//!   this process and not writable outside the group this run is allowed to
+//!   share with, and tightened to `0700`. A directory someone else can write to
+//!   is refused rather than fixed: that is the case where another user can plant
+//!   files, and repairing the mode would hide it.
 //! * **Relative.** Every operation goes through a descriptor for the directory,
 //!   so the path that led to it cannot be swapped underneath the operation and
 //!   redirect it somewhere else.
@@ -277,14 +277,13 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
     let directory = File::from(fd);
     let metadata = directory.metadata()?;
     let mode = metadata.mode() & 0o777;
+    let euid = geteuid().as_raw();
+    let trusted_group = match euid {
+        0 => FOR.get().copied().flatten().map(|(_, gid)| gid),
+        _ => Some(getegid().as_raw()),
+    };
 
-    if let Err(reason) = trust(
-        metadata.uid(),
-        metadata.gid(),
-        mode,
-        geteuid().as_raw(),
-        getegid().as_raw(),
-    ) {
+    if let Err(reason) = trust(metadata.uid(), metadata.gid(), mode, euid, trusted_group) {
         return Err(refused(path, "", reason));
     }
 
@@ -303,21 +302,26 @@ fn open_private(path: &Path, create: bool) -> io::Result<File> {
 /// owns one says nothing about what root may do, and comparing against root's
 /// own id was what stopped a root run from using the operator's data directory.
 ///
-/// Group write is judged against the group the process runs as. A desktop
-/// distribution hands the operator a private group and umask `002`, so a
-/// directory they just created is `0775` and nobody else can actually reach it;
-/// refusing that turned away every first run. A group this process does not run
-/// as is somebody else's write access, and stays refused. The mode is tightened
-/// to `0700` immediately afterwards either way.
-fn trust(owner: u32, group: u32, mode: u32, euid: u32, egid: u32) -> Result<(), &'static str> {
+/// Group write is judged against the group this run is allowed to share with: the
+/// effective group for a non-root run, or the operator's group for a root run. A
+/// desktop distribution commonly gives the operator a private group, so a
+/// directory they just created can be `0775` without being reachable by anyone
+/// else. The mode is tightened to `0700` immediately afterwards either way.
+fn trust(
+    owner: u32,
+    group: u32,
+    mode: u32,
+    euid: u32,
+    trusted_group: Option<u32>,
+) -> Result<(), &'static str> {
     if euid != 0 && owner != euid {
         return Err("is not owned by the user running suba");
     }
     if mode & OTHER_WRITE != 0 {
         return Err("is writable by a user other than its owner");
     }
-    if euid != 0 && mode & GROUP_WRITE != 0 && group != egid {
-        return Err("is writable by a group this process does not run as");
+    if mode & GROUP_WRITE != 0 && Some(group) != trusted_group {
+        return Err("is writable by a group this run does not trust");
     }
 
     Ok(())
@@ -434,41 +438,60 @@ mod tests {
     }
 
     /// Root is answered on its own, and a directory somebody else can write to
-    /// is never trusted — which is the one thing that check is for. A group the
-    /// process itself runs as is the operator's own group, not somebody else.
+    /// is never trusted. A root run still trusts only the group chosen for the
+    /// operator, not any group that happens to be able to write the directory.
     #[test]
     fn a_directory_is_trusted_by_who_may_write_it() {
-        assert!(trust(501, 501, 0o700, 501, 501).is_ok(), "its own owner");
-        assert!(trust(0, 0, 0o700, 0, 0).is_ok(), "root, owning it");
         assert!(
-            trust(501, 501, 0o700, 0, 0).is_ok(),
+            trust(501, 501, 0o700, 501, Some(501)).is_ok(),
+            "its own owner"
+        );
+        assert!(trust(0, 0, 0o700, 0, Some(0)).is_ok(), "root, owning it");
+        assert!(
+            trust(501, 501, 0o700, 0, Some(1000)).is_ok(),
             "root, on a directory that is somebody else's: it can reach \
              anything there is, so the owner says nothing about what it may do"
         );
 
         assert!(
-            trust(501, 501, 0o700, 502, 502).is_err(),
+            trust(501, 501, 0o700, 502, Some(502)).is_err(),
             "another user's directory"
         );
         assert!(
-            trust(501, 501, 0o755, 501, 501).is_ok(),
+            trust(501, 501, 0o755, 501, Some(501)).is_ok(),
             "readable by others is fine"
         );
         assert!(
-            trust(501, 501, 0o775, 501, 501).is_ok(),
+            trust(501, 501, 0o775, 501, Some(501)).is_ok(),
             "a private group's umask is not somebody else's write access"
         );
         assert!(
-            trust(501, 501, 0o775, 501, 502).is_err(),
+            trust(501, 501, 0o775, 501, Some(502)).is_err(),
             "a group this process does not run as is somebody else's"
         );
         assert!(
-            trust(501, 501, 0o777, 501, 501).is_err(),
+            trust(501, 501, 0o777, 501, Some(501)).is_err(),
             "writable by others"
         );
         assert!(
-            trust(501, 501, 0o777, 0, 0).is_err(),
+            trust(501, 501, 0o777, 0, Some(0)).is_err(),
             "writable by others, as root"
+        );
+        assert!(
+            trust(1000, 1000, 0o775, 0, Some(1000)).is_ok(),
+            "the operator's own group"
+        );
+        assert!(
+            trust(1000, 999, 0o775, 0, Some(1000)).is_err(),
+            "a root run must not trust a group other than the operator's"
+        );
+        assert!(
+            trust(1000, 999, 0o755, 0, None).is_ok(),
+            "root needs a trusted group only when the group can write"
+        );
+        assert!(
+            trust(1000, 1000, 0o775, 0, None).is_err(),
+            "a root run cannot trust group write before its operator is known"
         );
     }
 
