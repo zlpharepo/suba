@@ -1,3 +1,4 @@
+pub mod account;
 #[cfg(feature = "singbox-core")]
 pub(crate) mod agents;
 pub mod auth;

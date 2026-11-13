@@ -1,3 +1,4 @@
+mod account;
 mod auth;
 mod collections;
 #[cfg(feature = "singbox-core")]
@@ -77,6 +78,8 @@ impl AppRouter {
     pub fn route(web_path: impl AsRef<Path>) -> Router<AppState> {
         let api_router = Self::resources()
             .nest("/auth", auth::route())
+            .merge(account::route())
+            .merge(system::local_route())
             .merge(peers::route());
 
         let not_found_service = not_found.into_service();
@@ -114,6 +117,7 @@ impl AppRouter {
 /// headers added after a handler returns — is pinned rather than smoke-tested.
 #[cfg(test)]
 mod tests {
+    mod account_settings;
     #[cfg(feature = "singbox-core")]
     mod agents;
     #[cfg(all(feature = "singbox", feature = "singbox-core"))]

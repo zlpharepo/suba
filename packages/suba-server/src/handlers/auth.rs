@@ -24,6 +24,7 @@ pub async fn password_login(
     State(state): State<AppState>,
     ValidatedJson(payload): ValidatedJson<PasswordAuthRequest>,
 ) -> ResponseResult<impl IntoResponse> {
+    let _auth_lock = state.auth_lock().lock().await;
     let user = state
         .settings()
         .login_or_register(&payload.username, &payload.password)

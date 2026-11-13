@@ -70,6 +70,12 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Revoke every login before a new password is adopted.
+    pub(crate) async fn clear(&self) -> Result<(), Error> {
+        self.file.lock().await.commit(Sessions::default()).await?;
+        Ok(())
+    }
+
     /// Whether `id` names a live session.
     pub(crate) async fn contains(&self, id: Uuid) -> bool {
         let now = Utc::now().timestamp();

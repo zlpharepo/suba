@@ -70,6 +70,10 @@ pub enum Error {
     #[error(transparent)]
     Password(#[from] crate::password::Error),
 
+    /// An authenticated session must survive a mistyped current password.
+    #[error("current_password: incorrect")]
+    CurrentPassword,
+
     #[error(transparent)]
     Jwt(#[from] jsonwebtoken::errors::Error),
 
@@ -120,7 +124,7 @@ pub enum Error {
     /// Said out loud because an operator can fix it: a prefix that is not one
     /// path segment addresses nothing, and a URL that silently answers 404 for
     /// that reason is the kind of failure nobody can find.
-    #[error("subscription prefix: {reason}")]
+    #[error("subscription.prefix: {reason}")]
     Prefix { reason: &'static str },
 
     /// A proxy user this instance does not have.
@@ -337,6 +341,10 @@ impl IntoHttpError for Error {
                 message: "Internal server error".to_string(),
             },
             Error::Password(e) => e.into_http_error(),
+            Error::CurrentPassword => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: "current_password: incorrect".to_string(),
+            },
             Error::Jwt(_) => HttpError {
                 status_code: StatusCode::UNAUTHORIZED,
                 message: "Unauthorized".to_string(),
@@ -371,7 +379,7 @@ impl IntoHttpError for Error {
             }
             Error::Prefix { reason } => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
-                message: format!("subscription prefix: {reason}"),
+                message: format!("subscription.prefix: {reason}"),
             },
             #[cfg(feature = "singbox-core")]
             Error::UserNotFound(name) => HttpError {

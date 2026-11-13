@@ -1,9 +1,10 @@
 use axum::{extract::State, Json};
+use garde::Validate;
 use serde::{Deserialize, Serialize};
 use suba_core::{ProtocolSupport, Target};
 
 use crate::{
-    dto::{Operator, ResponseResult},
+    dto::{Authenticated, Operator, ResponseResult, ValidatedJson},
     AppState,
 };
 
@@ -14,6 +15,43 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct SystemStatus {
     version: String,
     administrator_configured: bool,
+}
+
+/// The operator-editable settings of this instance.
+#[derive(Serialize)]
+pub struct SystemSettings {
+    subscription_prefix: String,
+}
+
+/// Only the delivery prefix can be changed through this resource.
+#[derive(Deserialize, Validate)]
+pub struct SystemSettingsChange {
+    #[garde(length(min = 1, max = 64))]
+    subscription_prefix: String,
+}
+
+/// Read the local instance settings, independent of the selected environment.
+pub async fn settings(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+) -> ResponseResult<Json<SystemSettings>> {
+    Ok(Json(SystemSettings {
+        subscription_prefix: state.settings().subscription_prefix().await?,
+    }))
+}
+
+/// Change the delivery segment; existing tokens remain valid at the new path.
+pub async fn save_settings(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+    ValidatedJson(payload): ValidatedJson<SystemSettingsChange>,
+) -> ResponseResult<Json<SystemSettings>> {
+    Ok(Json(SystemSettings {
+        subscription_prefix: state
+            .settings()
+            .set_subscription_prefix(&payload.subscription_prefix)
+            .await?,
+    }))
 }
 
 /// Operator status: what this instance is, and what it can serve.

@@ -41,14 +41,72 @@ impl SettingsStore {
             .await
             .and_then(|subscription| subscription.prefix)
             .unwrap_or_else(|| DEFAULT_PREFIX.to_string());
-        let prefix = written.trim_matches('/').to_string();
+        validate_prefix(&written)
+    }
 
-        match prefix.is_empty() || prefix.contains('/') {
-            true => Err(Error::Prefix {
-                reason: "a prefix is one path segment",
-            }),
-            false => Ok(prefix),
+    /// Persist the instance's delivery segment without replacing unrelated settings.
+    pub(crate) async fn set_subscription_prefix(&self, written: &str) -> Result<String, Error> {
+        let prefix = validate_prefix(written)?;
+        let locked = self.file.lock().await;
+        let mut config = locked.get().clone();
+        config.subscription = Some(crate::config::SubscriptionConfig {
+            prefix: Some(prefix.clone()),
+        });
+        locked.commit(config).await?;
+        Ok(prefix)
+    }
+
+    /// Sessions are revoked before the new hash is adopted, so a failed write
+    /// cannot leave the old password paired with still-valid sessions.
+    pub(crate) async fn change_password(
+        &self,
+        sessions: &super::sessions::SessionStore,
+        username: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), Error> {
+        let locked = self.file.lock().await;
+        let administrator = locked
+            .get()
+            .administrator
+            .as_ref()
+            .ok_or(Error::Unauthorized)?;
+        verify_current(administrator, username, current_password).await?;
+        let replacement = Administrator::create(username, new_password).await?;
+        let mut config = locked.get().clone();
+        config.administrator = Some(replacement);
+        sessions.clear().await?;
+        locked.commit(config).await?;
+        Ok(())
+    }
+
+    /// Keep the existing password hash and machine key while changing the login name.
+    pub(crate) async fn change_username(
+        &self,
+        sessions: &super::sessions::SessionStore,
+        current_username: &str,
+        current_password: &str,
+        new_username: &str,
+    ) -> Result<(), Error> {
+        let locked = self.file.lock().await;
+        let administrator = locked
+            .get()
+            .administrator
+            .as_ref()
+            .ok_or(Error::Unauthorized)?;
+        verify_current(administrator, current_username, current_password).await?;
+        if administrator.username == new_username {
+            return Ok(());
         }
+        let mut config = locked.get().clone();
+        config
+            .administrator
+            .as_mut()
+            .expect("verified administrator")
+            .username = new_username.to_string();
+        sessions.clear().await?;
+        locked.commit(config).await?;
+        Ok(())
     }
 
     /// Where clients reach this machine, when the operator has said.
@@ -139,6 +197,36 @@ impl SettingsStore {
 
         Ok(key_pair)
     }
+}
+
+async fn verify_current(
+    administrator: &Administrator,
+    username: &str,
+    password: &str,
+) -> Result<(), Error> {
+    match administrator.verify(username, password).await {
+        Err(Error::Password(crate::password::Error::Password(_))) => Err(Error::CurrentPassword),
+        result => result,
+    }
+}
+
+fn validate_prefix(written: &str) -> Result<String, Error> {
+    let prefix = written.trim_matches('/');
+    if prefix.is_empty()
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(Error::Prefix {
+            reason: "use one URL segment with letters, digits, hyphens or underscores",
+        });
+    }
+    if prefix.eq_ignore_ascii_case("api") || prefix.eq_ignore_ascii_case("assets") {
+        return Err(Error::Prefix {
+            reason: "this path is reserved",
+        });
+    }
+    Ok(prefix.to_string())
 }
 
 #[cfg(test)]

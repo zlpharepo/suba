@@ -66,6 +66,8 @@ struct Inner {
     rendered: Option<RenderMemo>,
     deliveries: Option<Limiter>,
     sessions: Option<SessionStore>,
+    /// Serializes login issuance with password rotation across both stores.
+    auth_lock: tokio::sync::Mutex<()>,
     metrics: Arc<MetricsStore>,
     #[cfg(feature = "singbox-core")]
     singbox: Arc<SingboxStore>,
@@ -140,6 +142,7 @@ impl AppState {
                 } else {
                     Some(SessionStore::load(&config.data_dir)?)
                 },
+                auth_lock: tokio::sync::Mutex::new(()),
                 metrics: Arc::new(MetricsStore::new(&config.data_dir)),
                 #[cfg(feature = "singbox-core")]
                 singbox: Arc::new(SingboxStore::new(
@@ -237,6 +240,10 @@ impl AppState {
 
     pub(crate) fn sessions(&self) -> &SessionStore {
         self.inner.sessions.as_ref().expect("manager sessions")
+    }
+
+    pub(crate) fn auth_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.auth_lock
     }
 
     /// The proxy users and the addresses their clients dial.
