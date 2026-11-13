@@ -35,10 +35,14 @@ ss://YWVzLTI1Ni1nY206UEFTU1dPUkQ@192.0.2.10:1080?plugin=obfs-local%3Bobfs%3Dhttp
 ss://YWVzLTI1Ni1nY206UEFTU1dPUkRAMS4yLjMuNDo4NDQz#Legacy
 # Shadowsocks 2022.
 ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206S0VZ@192.0.2.10:8388#SS2022
-# A protocol this build does not model: kept whole, given back unchanged.
+# Snell is modelled for client distribution; a v5 server uses a v4 TCP client.
 snell://1.2.3.4:443?psk=PSK&version=4#Snell
-# Another unmodelled one, with an IPv6 literal.
-snell://[2605:52c0:2:129::1]:443?psk=PSK#Snell6
+# A Snell link without an explicit version retains Surge's v1 default.
+snell://[2605:52c0:2:129::1]:443?psk=PSK#Snell1
+# Hysteria v1 keeps its user authentication and shared obfuscation separately.
+hysteria://example.com:443?auth=personal-key&upmbps=20&downmbps=50&obfsParam=shared-obfs#Hysteria
+# An unmodelled scheme is still kept whole.
+mystery://example.com:443?psk=PSK#Mystery
 vmess://eyJ2IjoiMiIsInBzIjoiR29sZGVuIiwiYWRkIjoiZ29sZGVuLmV4YW1wbGUuY29tIiwicG9ydCI6IjQ0MyIsImlkIjoiMTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1IiwiYWlkIjoiMCIsInNjeSI6ImF1dG8iLCJuZXQiOiJ3cyIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ==
 anytls://letmein@golden.example.com:443?sni=www.apple.com#GoldenAnyTLS
 tuic://11111111-2222-3333-4444-555555555555:letmein@golden.example.com:443?congestion_control=bbr&udp_relay_mode=native&sni=www.apple.com#GoldenTUIC

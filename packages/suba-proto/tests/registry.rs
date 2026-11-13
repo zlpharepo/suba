@@ -6,7 +6,7 @@
 //! which is the one failure that announces itself nowhere else: the subscription keeps working and
 //! quietly drops nodes.
 //!
-//! The corpus is deliberately mixed: modelled dialects, one scheme nobody models (`snell`, kept whole
+//! The corpus is deliberately mixed: modelled dialects, one scheme nobody models (`mystery`, kept whole
 //! on purpose), and one line that is not a link at all.
 
 use suba_proto::protocol::Kind;
@@ -35,6 +35,8 @@ fn known(scheme: &str) -> Option<Kind> {
         "vless" => Some(Kind::Vless),
         "trojan" => Some(Kind::Trojan),
         "ss" => Some(Kind::Shadowsocks),
+        "snell" => Some(Kind::Snell),
+        "hysteria" => Some(Kind::Hysteria),
         "hysteria2" | "hy2" => Some(Kind::Hysteria2),
         "vmess" => Some(Kind::Vmess),
         "ssr" => Some(Kind::ShadowsocksR),
@@ -46,11 +48,13 @@ fn known(scheme: &str) -> Option<Kind> {
     }
 }
 
-/// Every kind this crate models, `Other` aside: `Other` is what holds the protocols it does not.
-const MODELLED: [Kind; 10] = [
+/// Every modeled kind with a share-link dialect; NaiveProxy has only native output.
+const MODELLED: [Kind; 12] = [
     Kind::Vless,
     Kind::Trojan,
     Kind::Shadowsocks,
+    Kind::Snell,
+    Kind::Hysteria,
     Kind::Hysteria2,
     Kind::Vmess,
     Kind::ShadowsocksR,

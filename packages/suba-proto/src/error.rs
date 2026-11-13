@@ -19,9 +19,9 @@ pub enum ErrorKind {
     /// The scheme is known, but the role cannot express it: a share link describes a client.
     UnsupportedRole,
     /// The payload has no share link, and never did. Reserved for the shapes that genuinely have no
-    /// dialect — a `tun`/`mixed` listener, or a routing target such as `direct` — so that asking for a
-    /// link is this error rather than a made-up string. Nothing in the model uses it yet: SOCKS and
-    /// HTTP are names others do write (`socks5://`, `http://`), so they have a link form.
+    /// dialect — NaiveProxy, a `tun`/`mixed` listener, or a routing target such as `direct` — so
+    /// asking for a link is this error rather than a made-up string. SOCKS and HTTP do have
+    /// share-link spellings (`socks5://`, `http://`).
     NoLinkForm,
     /// The link is well formed but something required is missing.
     MissingField,

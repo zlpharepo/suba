@@ -15,9 +15,13 @@
 //! * [`ClientLink`] — the trait a payload implements to be spelled as a share link. Links describe
 //!   clients only, so it is implemented for the client half alone.
 
+pub mod hysteria;
 pub mod hysteria2;
+pub mod naive;
 pub mod opaque;
 pub mod shadowsocks;
+pub mod shadowtls;
+pub mod snell;
 pub mod trojan;
 use crate::addr::Endpoint;
 
@@ -58,6 +62,14 @@ pub enum Kind {
     Trojan,
     /// Shadowsocks, including its 2022 ciphers.
     Shadowsocks,
+    /// Snell, including v5 servers reached with the v4 TCP client.
+    Snell,
+    /// Hysteria v1.
+    Hysteria,
+    /// NaiveProxy.
+    Naive,
+    /// A ShadowTLS outer layer with an inner TCP proxy.
+    ShadowTls,
     /// Hysteria2.
     Hysteria2,
     /// VMess.
@@ -83,6 +95,10 @@ impl Kind {
             Self::Vless => "vless",
             Self::Trojan => "trojan",
             Self::Shadowsocks => "shadowsocks",
+            Self::Snell => "snell",
+            Self::Hysteria => "hysteria",
+            Self::Naive => "naive",
+            Self::ShadowTls => "shadowtls",
             Self::Hysteria2 => "hysteria2",
             Self::Vmess => "vmess",
             Self::ShadowsocksR => "shadowsocksr",
@@ -202,6 +218,14 @@ pub enum Outbound {
     Trojan(trojan::Client),
     /// Shadowsocks.
     Shadowsocks(shadowsocks::Client),
+    /// Snell.
+    Snell(snell::Client),
+    /// Hysteria v1.
+    Hysteria(hysteria::Client),
+    /// NaiveProxy, which has no share-link dialect.
+    Naive(naive::Client),
+    /// ShadowTLS with its explicitly selected inner proxy.
+    ShadowTls(shadowtls::Client),
     /// Hysteria2.
     Hysteria2(hysteria2::Client),
     /// VMess.
@@ -254,6 +278,10 @@ impl Outbound {
             Self::Vless(_) => Kind::Vless,
             Self::Trojan(_) => Kind::Trojan,
             Self::Shadowsocks(_) => Kind::Shadowsocks,
+            Self::Snell(_) => Kind::Snell,
+            Self::Hysteria(_) => Kind::Hysteria,
+            Self::Naive(_) => Kind::Naive,
+            Self::ShadowTls(_) => Kind::ShadowTls,
             Self::Hysteria2(_) => Kind::Hysteria2,
             Self::Vmess(_) => Kind::Vmess,
             Self::ShadowsocksR(_) => Kind::ShadowsocksR,
@@ -271,6 +299,10 @@ impl Outbound {
             Self::Vless(_) => <vless::Client as ClientLink>::SCHEME,
             Self::Trojan(_) => <trojan::Client as ClientLink>::SCHEME,
             Self::Shadowsocks(_) => <shadowsocks::Client as ClientLink>::SCHEME,
+            Self::Snell(_) => <snell::Client as ClientLink>::SCHEME,
+            Self::Hysteria(_) => <hysteria::Client as ClientLink>::SCHEME,
+            Self::Naive(_) => "naive",
+            Self::ShadowTls(_) => "shadowtls",
             Self::Hysteria2(_) => <hysteria2::Client as ClientLink>::SCHEME,
             Self::Vmess(_) => <vmess::Client as ClientLink>::SCHEME,
             Self::ShadowsocksR(_) => <shadowsocksr::Client as ClientLink>::SCHEME,
@@ -302,6 +334,14 @@ impl Outbound {
     pub fn as_shadowsocks(&self) -> Option<&shadowsocks::Client> {
         match self {
             Self::Shadowsocks(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    /// Cast to a Snell client payload.
+    pub fn as_snell(&self) -> Option<&snell::Client> {
+        match self {
+            Self::Snell(payload) => Some(payload),
             _ => None,
         }
     }
@@ -368,6 +408,11 @@ impl Outbound {
             Self::Vless(_) => vless::Client::default_transport(),
             Self::Trojan(_) => trojan::Client::default_transport(),
             Self::Shadowsocks(_) => shadowsocks::Client::default_transport(),
+            Self::Snell(_) => snell::Client::default_transport(),
+            Self::Hysteria(_) => hysteria::Client::default_transport(),
+            Self::Naive(client) if client.quic => Transport::Quic(transport::Quic::default()),
+            Self::Naive(_) => Transport::Tcp,
+            Self::ShadowTls(_) => Transport::Tcp,
             Self::Hysteria2(_) => hysteria2::Client::default_transport(),
             Self::Vmess(_) => vmess::Client::default_transport(),
             Self::ShadowsocksR(_) => shadowsocksr::Client::default_transport(),
@@ -385,6 +430,16 @@ impl Outbound {
             Self::Vless(payload) => payload.write_link(node, out),
             Self::Trojan(payload) => payload.write_link(node, out),
             Self::Shadowsocks(payload) => payload.write_link(node, out),
+            Self::Snell(payload) => payload.write_link(node, out),
+            Self::Hysteria(payload) => payload.write_link(node, out),
+            Self::Naive(_) => Err(crate::error::Error::field(
+                crate::error::ErrorKind::NoLinkForm,
+                "naive",
+            )),
+            Self::ShadowTls(_) => Err(crate::error::Error::field(
+                crate::error::ErrorKind::NoLinkForm,
+                "shadowtls",
+            )),
             Self::Hysteria2(payload) => payload.write_link(node, out),
             Self::Vmess(payload) => payload.write_link(node, out),
             Self::ShadowsocksR(payload) => payload.write_link(node, out),
@@ -411,6 +466,10 @@ impl Protocol for Outbound {
             Self::Vless(payload) => payload.has_credentials(),
             Self::Trojan(payload) => payload.has_credentials(),
             Self::Shadowsocks(payload) => payload.has_credentials(),
+            Self::Snell(payload) => payload.has_credentials(),
+            Self::Hysteria(payload) => payload.has_credentials(),
+            Self::Naive(payload) => payload.has_credentials(),
+            Self::ShadowTls(payload) => payload.has_credentials(),
             Self::Hysteria2(payload) => payload.has_credentials(),
             Self::Vmess(payload) => payload.has_credentials(),
             Self::ShadowsocksR(payload) => payload.has_credentials(),
@@ -427,6 +486,10 @@ impl Protocol for Outbound {
             Self::Vless(_) => true,
             Self::Trojan(_) => true,
             Self::Shadowsocks(_) => true,
+            Self::Snell(_) => false,
+            Self::Hysteria(_) => false,
+            Self::Naive(_) => false,
+            Self::ShadowTls(_) => false,
             Self::Hysteria2(_) => true,
             Self::Vmess(_) => true,
             Self::ShadowsocksR(_) => true,
@@ -548,6 +611,10 @@ impl Encode for Outbound {
             Self::Vless(payload) => payload.encode(out),
             Self::Trojan(payload) => payload.encode(out),
             Self::Shadowsocks(payload) => payload.encode(out),
+            Self::Snell(payload) => payload.encode(out),
+            Self::Hysteria(payload) => payload.encode(out),
+            Self::Naive(payload) => payload.encode(out),
+            Self::ShadowTls(payload) => payload.encode(out),
             Self::Hysteria2(payload) => payload.encode(out),
             Self::Vmess(payload) => payload.encode(out),
             Self::ShadowsocksR(payload) => payload.encode(out),
@@ -587,6 +654,10 @@ impl fmt::Debug for Outbound {
             Self::Vless(payload) => fmt::Debug::fmt(payload, f),
             Self::Trojan(payload) => fmt::Debug::fmt(payload, f),
             Self::Shadowsocks(payload) => fmt::Debug::fmt(payload, f),
+            Self::Snell(payload) => fmt::Debug::fmt(payload, f),
+            Self::Hysteria(payload) => fmt::Debug::fmt(payload, f),
+            Self::Naive(payload) => fmt::Debug::fmt(payload, f),
+            Self::ShadowTls(payload) => fmt::Debug::fmt(payload, f),
             Self::Hysteria2(payload) => fmt::Debug::fmt(payload, f),
             Self::Vmess(payload) => fmt::Debug::fmt(payload, f),
             Self::ShadowsocksR(payload) => fmt::Debug::fmt(payload, f),
@@ -663,6 +734,10 @@ pub fn parse_link(input: &str) -> Result<Node<Client>> {
 
             Outbound::Shadowsocks(client)
         }
+        Some(Kind::Snell) => Outbound::Snell(snell::Client::from_query(&mut reader, &userinfo)?),
+        Some(Kind::Hysteria) => {
+            Outbound::Hysteria(hysteria::Client::from_query(&mut reader, &userinfo)?)
+        }
         Some(Kind::Hysteria2) => {
             Outbound::Hysteria2(hysteria2::Client::from_query(&mut reader, &userinfo)?)
         }
@@ -724,7 +799,7 @@ pub fn write_link_into(node: &Node<Client>, out: &mut String) -> Result<()> {
 pub(crate) fn scheme_is_tls_only(scheme: &str) -> bool {
     matches!(
         scheme.to_ascii_lowercase().as_str(),
-        "trojan" | "hysteria2" | "hy2" | "tuic" | "anytls" | "https"
+        "trojan" | "hysteria" | "hysteria2" | "hy2" | "tuic" | "anytls" | "https"
     )
 }
 
@@ -734,6 +809,8 @@ pub(crate) fn scheme_kind(scheme: &str) -> Option<Kind> {
         "vless" => Some(Kind::Vless),
         "trojan" => Some(Kind::Trojan),
         "ss" | "shadowsocks" => Some(Kind::Shadowsocks),
+        "snell" => Some(Kind::Snell),
+        "hysteria" => Some(Kind::Hysteria),
         "hysteria2" | "hy2" => Some(Kind::Hysteria2),
         "vmess" => Some(Kind::Vmess),
         "ssr" | "shadowsocksr" => Some(Kind::ShadowsocksR),
@@ -1252,10 +1329,10 @@ mod tests {
 
     #[test]
     fn an_unknown_scheme_is_kept_whole() {
-        let node = parse_link("snell://1.2.3.4:443?psk=secret#Mystery").unwrap();
+        let node = parse_link("mystery://1.2.3.4:443?psk=secret#Mystery").unwrap();
 
         assert_eq!(node.protocol.kind(), Kind::Other);
-        assert_eq!(node.protocol.scheme(), "snell");
+        assert_eq!(node.protocol.scheme(), "mystery");
         assert!(
             !node.protocol.has_credentials(),
             "an unmodelled payload claims nothing"
@@ -1263,25 +1340,42 @@ mod tests {
     }
 
     #[test]
+    fn snell_links_are_modelled_for_client_distribution() {
+        let node = parse_link("snell://example.com:443?psk=shared-secret&version=6#Snell").unwrap();
+        assert_eq!(node.protocol.kind(), Kind::Snell);
+        assert_eq!(parse_link(&write_link(&node).unwrap()).unwrap(), node);
+    }
+
+    #[test]
+    fn hysteria_v1_links_keep_auth_and_bandwidth() {
+        let node = parse_link("hysteria://example.com:443?auth=personal-key&upmbps=20&downmbps=50&obfsParam=shared-obfs#Hysteria").unwrap();
+        assert_eq!(node.protocol.kind(), Kind::Hysteria);
+        assert_eq!(parse_link(&write_link(&node).unwrap()).unwrap(), node);
+    }
+
+    #[test]
     fn a_link_without_an_address_is_reported_not_stored() {
-        let error = parse_link("snell://something-odd#Mystery").unwrap_err();
+        let error = parse_link("mystery://something-odd#Mystery").unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::MissingField);
     }
 
-    /// Every kind reaches `scheme_kind`, from a scheme that resolves back to it.
+    /// Every kind with a link reaches `scheme_kind` from its scheme.
     ///
     /// The `match` is the reason this test exists and the reason it is written this way: it is
     /// exhaustive, so a new protocol does not compile until it is named here, and the assertion then
-    /// fails if `scheme_kind` was not told about the scheme either. That is the failure the migration
-    /// hit — one missing arm, and eleven dialects quietly became `Opaque` — and nothing else in the
-    /// crate notices it, because an unmodelled scheme is a supported state.
+    /// fails if `scheme_kind` was not told about the scheme either. A missing arm otherwise makes
+    /// a known link quietly become `Opaque`; Naive has no link, and `Other` holds unknown schemes.
     #[test]
-    fn every_kind_is_reachable_from_its_scheme() {
+    fn every_linkable_kind_is_reachable_from_its_scheme() {
         for kind in [
             Kind::Vless,
             Kind::Trojan,
             Kind::Shadowsocks,
+            Kind::Snell,
+            Kind::Hysteria,
+            Kind::Naive,
+            Kind::ShadowTls,
             Kind::Hysteria2,
             Kind::Vmess,
             Kind::ShadowsocksR,
@@ -1291,12 +1385,15 @@ mod tests {
             Kind::Http,
             Kind::Other,
         ] {
-            // `Other` is not a protocol — it is the payload that holds the ones this build does not
-            // model — so it is the one kind with no scheme to check.
+            // `Other` holds unknown schemes; Naive has no share-link dialect.
             let Some(scheme) = (match kind {
                 Kind::Vless => Some("vless"),
                 Kind::Trojan => Some("trojan"),
                 Kind::Shadowsocks => Some("ss"),
+                Kind::Snell => Some("snell"),
+                Kind::Hysteria => Some("hysteria"),
+                Kind::Naive => None,
+                Kind::ShadowTls => None,
                 Kind::Hysteria2 => Some("hysteria2"),
                 Kind::Vmess => Some("vmess"),
                 Kind::ShadowsocksR => Some("ssr"),
@@ -1314,7 +1411,7 @@ mod tests {
 
         // A scheme nobody models is `None`, never `Other`: the distinction is what makes the
         // completeness above checkable at all.
-        assert_eq!(scheme_kind("snell"), None);
+        assert_eq!(scheme_kind("mystery"), None);
     }
 
     /// The aliases a provider may write, which are the schemes that are not canonical.

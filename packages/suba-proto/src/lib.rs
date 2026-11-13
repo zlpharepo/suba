@@ -65,9 +65,9 @@
 
 extern crate alloc;
 
-/// The README is compiled as documentation, so its examples cannot rot.
+/// The protocol guide is compiled as documentation, so its examples cannot rot.
 #[cfg(doctest)]
-#[doc = include_str!("../README.md")]
+#[doc = include_str!("../docs/protocol.md")]
 pub struct ReadmeDoctests;
 
 mod prelude;

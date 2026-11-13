@@ -187,6 +187,30 @@ fn to_inbound(protocol: Outbound) -> Result<Inbound> {
             users: Vec::new(),
             plugin: client.plugin,
         }),
+        Outbound::Snell(_) => {
+            return Err(Error::field(
+                ErrorKind::UnsupportedRole,
+                "Snell inbound conversion is not modeled",
+            ))
+        }
+        Outbound::Hysteria(_) => {
+            return Err(Error::field(
+                ErrorKind::UnsupportedRole,
+                "Hysteria v1 inbound conversion is not modeled",
+            ))
+        }
+        Outbound::Naive(_) => {
+            return Err(Error::field(
+                ErrorKind::UnsupportedRole,
+                "Naive inbound conversion is not modeled",
+            ))
+        }
+        Outbound::ShadowTls(_) => {
+            return Err(Error::field(
+                ErrorKind::UnsupportedRole,
+                "ShadowTLS inbound conversion is not modeled",
+            ))
+        }
         Outbound::Hysteria2(client) => Inbound::Hysteria2(hysteria2::Server {
             users: vec![hysteria2::User {
                 password: client.password,

@@ -205,7 +205,7 @@ fn the_default_transport_is_read_and_not_written_back() {
 fn an_unmodelled_link_without_an_address_is_refused_by_name() {
     // The crate's promise about unknown schemes has a floor: a node has an address, and one that cannot
     // be read is refused rather than invented. The error names what is missing.
-    let error = parse_link("snell://example.com#Probe").expect_err("no port, no node");
+    let error = parse_link("mystery://example.com#Probe").expect_err("no port, no node");
 
     assert_eq!(error.kind(), suba_proto::ErrorKind::MissingField);
     assert!(error.reason().contains("port"), "{error}");

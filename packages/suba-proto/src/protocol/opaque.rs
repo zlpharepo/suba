@@ -140,17 +140,17 @@ mod tests {
 
     #[test]
     fn an_unmodelled_link_passes_through_untouched() {
-        let text = "snell://1.2.3.4:443?psk=hunter2&version=4#Mystery";
+        let text = "mystery://1.2.3.4:443?psk=hunter2&version=4#Mystery";
         let node = parse_link(text).unwrap();
 
         assert_eq!(node.protocol.kind(), Kind::Other);
-        assert_eq!(node.protocol.scheme(), "snell");
+        assert_eq!(node.protocol.scheme(), "mystery");
         assert_eq!(write_link(&node).unwrap(), text);
     }
 
     #[test]
     fn an_unmodelled_link_is_never_printed() {
-        let node = parse_link("snell://1.2.3.4:443?psk=hunter2#Mystery").unwrap();
+        let node = parse_link("mystery://1.2.3.4:443?psk=hunter2#Mystery").unwrap();
         let rendered = format!("{node:?}");
 
         // The parameter *names* are printed on purpose: seeing which unknowns a node carries is how

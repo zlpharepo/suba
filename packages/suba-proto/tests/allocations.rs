@@ -109,7 +109,7 @@ fn writing_is_one_allocation() {
 #[test]
 fn an_unmodelled_link_costs_its_raw_payload() {
     let count = allocations(|| {
-        let _ = parse_link("snell://1.2.3.4:443?psk=PSK&version=4#Snell").unwrap();
+        let _ = parse_link("mystery://1.2.3.4:443?psk=PSK&version=4#Mystery").unwrap();
     });
 
     // The scheme, the raw link, the name, the host, and four strings for the two parameters.
