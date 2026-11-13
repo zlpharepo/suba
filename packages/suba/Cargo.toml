@@ -28,5 +28,5 @@ clash = ["suba-server/clash"]
 # without any: every one of them is forwarded explicitly above.
 suba-server = { workspace = true, default-features = false }
 
-clap = { version = "4.5.41", features = ["derive"] }
+clap = { version = "4.5.41", features = ["derive", "env"] }
 tokio = { workspace = true }
