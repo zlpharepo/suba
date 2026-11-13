@@ -12,8 +12,13 @@ pub fn route() -> Router<AppState> {
 
 /// Local-only instance settings are not part of peer or Agent resources.
 pub fn local_route() -> Router<AppState> {
-    Router::new().route(
-        "/system/settings",
-        get(system::settings).put(system::save_settings),
-    )
+    Router::new()
+        .route(
+            "/system/settings",
+            get(system::settings).put(system::save_settings),
+        )
+        .route(
+            "/system/web",
+            get(crate::handlers::web::status).post(crate::handlers::web::install),
+        )
 }

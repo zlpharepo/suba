@@ -13,9 +13,9 @@ use std::path::Path;
 
 use axum::{
     body::Body,
-    extract::Request,
+    extract::{Request, State},
     handler::HandlerWithoutStateExt,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
@@ -32,6 +32,13 @@ async fn not_found() -> (StatusCode, &'static str) {
 
 async fn no_such_delivery() -> Response {
     Error::NoSuchDelivery.into_response()
+}
+
+async fn home(State(state): State<AppState>, request: Request) -> Response {
+    if !state.web_dir().join("index.html").is_file() {
+        return Html(include_str!("web-install.html")).into_response();
+    }
+    web_file(&state, request).await
 }
 
 fn web_files(web_path: impl AsRef<Path>) -> ServeDir {
@@ -107,6 +114,7 @@ impl AppRouter {
 
         Router::new()
             .nest("/api", api_router)
+            .route("/", get(home))
             .merge(delivery)
             .fallback_service(web_service)
     }
@@ -132,6 +140,7 @@ mod tests {
     mod settings;
     #[cfg(feature = "singbox-core")]
     mod users;
+    mod web;
 
     use http::header;
     use serde_json::{json, Value};

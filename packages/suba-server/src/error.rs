@@ -84,6 +84,9 @@ pub enum Error {
     #[error(transparent)]
     Request(#[from] reqwest::Error),
 
+    #[error("web.release: {reason}")]
+    WebRelease { reason: &'static str },
+
     /// A document this instance cannot write.
     ///
     /// Its own problem, not the caller's: the target and the direction are both
@@ -423,6 +426,10 @@ impl IntoHttpError for Error {
             Error::Request(_) => HttpError {
                 status_code: StatusCode::BAD_GATEWAY,
                 message: "Upstream request failed".to_string(),
+            },
+            Error::WebRelease { reason } => HttpError {
+                status_code: StatusCode::BAD_GATEWAY,
+                message: format!("web.release: {reason}"),
             },
             #[cfg(feature = "singbox-core")]
             Error::Singbox(error) => {

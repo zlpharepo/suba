@@ -43,6 +43,8 @@ http-serde = { workspace = true }
 jsonwebtoken = { workspace = true }
 getrandom = { workspace = true }
 reqwest = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 rustix = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
@@ -66,8 +68,4 @@ futures-util = { version = "0.3", features = ["sink"] }
 
 [dev-dependencies]
 axum-server = { version = "0.8", features = ["tls-rustls"] }
-# For the sing-box store's tests, which install a release archive they build
-# themselves rather than fetching one.
-flate2 = { workspace = true }
 rcgen = "0.14"
-tar = { workspace = true }

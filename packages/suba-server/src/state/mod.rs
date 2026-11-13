@@ -68,6 +68,8 @@ struct Inner {
     sessions: Option<SessionStore>,
     /// Serializes login issuance with password rotation across both stores.
     auth_lock: tokio::sync::Mutex<()>,
+    web_lock: tokio::sync::Mutex<()>,
+    web_release: tokio::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
     metrics: Arc<MetricsStore>,
     #[cfg(feature = "singbox-core")]
     singbox: Arc<SingboxStore>,
@@ -143,6 +145,8 @@ impl AppState {
                     Some(SessionStore::load(&config.data_dir)?)
                 },
                 auth_lock: tokio::sync::Mutex::new(()),
+                web_lock: tokio::sync::Mutex::new(()),
+                web_release: tokio::sync::Mutex::new(None),
                 metrics: Arc::new(MetricsStore::new(&config.data_dir)),
                 #[cfg(feature = "singbox-core")]
                 singbox: Arc::new(SingboxStore::new(
@@ -198,6 +202,16 @@ impl AppState {
     /// The client used for outbound subscription requests.
     pub(crate) fn http(&self) -> &Client {
         &self.inner.http
+    }
+
+    pub(crate) fn web_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.inner.web_lock
+    }
+
+    pub(crate) fn web_release(
+        &self,
+    ) -> &tokio::sync::Mutex<Option<(std::time::Instant, Option<String>)>> {
+        &self.inner.web_release
     }
 
     /// The instance settings: administrator account and key pair.
