@@ -70,6 +70,15 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Revoke every other login without issuing a replacement for this one.
+    pub(crate) async fn retain_only(&self, id: Uuid) -> Result<(), Error> {
+        let locked = self.file.lock().await;
+        let mut sessions = locked.get().clone();
+        sessions.sessions.retain(|session| session.id == id);
+        locked.commit(sessions).await?;
+        Ok(())
+    }
+
     /// Revoke every login before a new password is adopted.
     pub(crate) async fn clear(&self) -> Result<(), Error> {
         self.file.lock().await.commit(Sessions::default()).await?;

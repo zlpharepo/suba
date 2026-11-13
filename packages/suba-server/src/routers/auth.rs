@@ -9,4 +9,5 @@ pub fn route() -> Router<AppState> {
     Router::new()
         .route("/password", post(auth::password_login))
         .route("/session", delete(auth::logout))
+        .route("/sessions/others", delete(auth::logout_others))
 }

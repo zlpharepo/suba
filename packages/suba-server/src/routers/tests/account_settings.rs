@@ -4,6 +4,60 @@ use serde_json::json;
 use super::{body, Server};
 
 #[tokio::test]
+async fn signing_out_other_sessions_keeps_the_current_login() {
+    let server = Server::start().await;
+    let mut other_tokens = Vec::new();
+    for _ in 0..2 {
+        let login = server
+            .client
+            .post(format!("{}/api/auth/password", server.base))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(json!({"username": "example-admin", "password": "example-password"}).to_string())
+            .send()
+            .await
+            .unwrap();
+        other_tokens.push(
+            body(login).await["access_token"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    let anonymous = server
+        .client
+        .delete(format!("{}/api/auth/sessions/others", server.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), 401);
+
+    let revoked = server
+        .authed(reqwest::Method::DELETE, "/api/auth/sessions/others")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 204);
+
+    let current = server
+        .authed(reqwest::Method::GET, "/api/account")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(current.status(), 200);
+    for token in other_tokens {
+        let other = server
+            .client
+            .get(format!("{}/api/account", server.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status(), 401);
+    }
+}
+
+#[tokio::test]
 async fn an_account_password_change_requires_the_current_password_and_invalidates_all_sessions() {
     let server = Server::start().await;
     let second = server

@@ -49,3 +49,13 @@ pub async fn logout(
     state.sessions().remove(claims.jti).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// Revoke sessions issued before this action while keeping this login active.
+pub async fn logout_others(
+    State(state): State<AppState>,
+    Authenticated(claims): Authenticated,
+) -> ResponseResult<impl IntoResponse> {
+    let _auth_lock = state.auth_lock().lock().await;
+    state.sessions().retain_only(claims.jti).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
