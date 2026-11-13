@@ -221,13 +221,14 @@ pub struct TokenView {
     pub name: String,
     pub token: String,
     /// Where a client asks for the subscription, as this instance is configured
-    /// now. The token outlives a change of prefix, this path does not.
+    /// now. The token outlives a change of prefix, this path does not. The name
+    /// identifies the link to a client without replacing the token's authority.
     pub path: String,
 }
 
 pub(crate) fn token_view(prefix: &str, name: String, token: String) -> TokenView {
     TokenView {
-        path: format!("/{prefix}/{token}"),
+        path: format!("/{prefix}/{name}/{token}"),
         name,
         token,
     }

@@ -82,7 +82,7 @@ impl AppRouter {
         let not_found_service = not_found.into_service();
         let web_service = web_files(web_path).not_found_service(not_found_service);
 
-        // The delivery route is not under `/api`: what it serves goes to a
+        // Delivery routes are not under `/api`: what they serve goes to a
         // client's core, not to this instance's own callers, and the token in it
         // is the whole of the authorization. It is merged before the web service,
         // which is the fallback and would otherwise answer for it; a path whose
@@ -92,6 +92,14 @@ impl AppRouter {
             .route(
                 "/{prefix}/{token}/download",
                 get(handlers::delivery::download),
+            )
+            .route(
+                "/{prefix}/{name}/{token}",
+                get(handlers::delivery::serve_named),
+            )
+            .route(
+                "/{prefix}/{name}/{token}/download",
+                get(handlers::delivery::download_named),
             );
 
         Router::new()
@@ -257,7 +265,7 @@ mod tests {
         assert_eq!(main["unresolved"], json!([]));
         assert_eq!(
             main["links"],
-            json!([{"name": "phone", "token": token, "path": format!("/s/{token}")}])
+            json!([{"name": "phone", "token": token, "path": format!("/s/phone/{token}")}])
         );
     }
 
@@ -297,10 +305,14 @@ mod tests {
         assert_eq!(listed.status(), 200);
         assert_eq!(
             body(listed).await,
-            json!([{"name": "phone", "token": token, "path": format!("/s/{token}")}])
+            json!([{"name": "phone", "token": token, "path": format!("/s/phone/{token}")}])
         );
 
-        let opened = server.get(&format!("/s/{token}")).send().await.unwrap();
+        let opened = server
+            .get(&format!("/s/phone/{token}"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(opened.status(), 200);
     }
 
@@ -319,24 +331,35 @@ mod tests {
             .unwrap();
         assert_eq!(authed.status(), 200);
 
-        let delivered = server.get(&format!("/s/{token}")).send().await.unwrap();
+        let delivered = server
+            .get(&format!("/s/phone/{token}"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(delivered.status(), 200);
     }
 
     /// Shown where it lands, saved when asked to be, and one answer for every
     /// way a URL can address nothing.
     #[tokio::test]
-    async fn the_two_delivery_paths_and_their_not_found() {
+    async fn the_named_and_legacy_delivery_paths_and_their_not_found() {
         let server = Server::start().await;
         let token = server.delivery().await;
 
-        let inline = server.get(&format!("/s/{token}")).send().await.unwrap();
+        let inline = server
+            .get(&format!("/s/phone/{token}"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(inline.status(), 200);
         assert!(inline.headers().get(header::CONTENT_DISPOSITION).is_none());
         assert_eq!(inline.headers()[header::CACHE_CONTROL], "no-store");
 
+        let legacy = server.get(&format!("/s/{token}")).send().await.unwrap();
+        assert_eq!(legacy.status(), 200);
+
         let saved = server
-            .get(&format!("/s/{token}/download"))
+            .get(&format!("/s/phone/{token}/download"))
             .send()
             .await
             .unwrap();
@@ -346,10 +369,20 @@ mod tests {
             .unwrap()
             .starts_with("attachment;"));
 
+        let legacy_saved = server
+            .get(&format!("/s/{token}/download"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(legacy_saved.status(), 200);
+
         for path in [
             "/s/not-a-token".to_string(),
             "/s/not-a-token/download".to_string(),
             format!("/elsewhere/{token}"),
+            format!("/elsewhere/phone/{token}"),
+            format!("/s/wrong/{token}"),
+            format!("/s/wrong/{token}/download"),
         ] {
             let missing = server.get(&path).send().await.unwrap();
             assert_eq!(missing.status(), 404, "{path}");

@@ -1,12 +1,11 @@
-//! The delivery route: a subscription under a token, outside the API.
+//! Delivery routes for subscriptions under a token, outside the API.
 //!
-//! This is the one route a client's core talks to, so it is deliberately unlike
-//! the rest: no session, no JSON, and nothing about it that names what is behind
-//! it. A token that is not in service answers exactly what a prefix that is not
-//! the configured one answers — there is no reply that would help someone
-//! looking for a token that works.
+//! These are the routes a client's core talks to, so they are deliberately unlike
+//! the rest: no session and no JSON. A token that is not in service answers
+//! exactly what a prefix or link name that does not match answers — there is no
+//! reply that would help someone looking for a token that works.
 //!
-//! **The token is never written down**: this module logs the collection and the
+//! **The token is never written down**: this module logs the holder and the
 //! token's name, never the token or the URL it arrived on, and the request line
 //! is not logged by anything above it either.
 //!
@@ -35,11 +34,7 @@ pub async fn serve(
     Query(choice): Query<TargetChoice>,
     request: Request,
 ) -> Response {
-    if !addresses_deliveries(&state, &prefix).await {
-        return routers::web_file(&state, request).await;
-    }
-
-    respond(deliver(&state, &prefix, &token, &choice, request.headers(), false).await)
+    serve_path(state, prefix, None, token, choice, request, false).await
 }
 
 /// Serve the same document as a file, named after the collection.
@@ -49,11 +44,54 @@ pub async fn download(
     Query(choice): Query<TargetChoice>,
     request: Request,
 ) -> Response {
+    serve_path(state, prefix, None, token, choice, request, true).await
+}
+
+/// Keep the visible link name tied to the token's stored label.
+pub async fn serve_named(
+    State(state): State<AppState>,
+    Path((prefix, name, token)): Path<(String, String, String)>,
+    Query(choice): Query<TargetChoice>,
+    request: Request,
+) -> Response {
+    serve_path(state, prefix, Some(name), token, choice, request, false).await
+}
+
+/// Apply the same label check to the file download path.
+pub async fn download_named(
+    State(state): State<AppState>,
+    Path((prefix, name, token)): Path<(String, String, String)>,
+    Query(choice): Query<TargetChoice>,
+    request: Request,
+) -> Response {
+    serve_path(state, prefix, Some(name), token, choice, request, true).await
+}
+
+async fn serve_path(
+    state: AppState,
+    prefix: String,
+    path_name: Option<String>,
+    token: String,
+    choice: TargetChoice,
+    request: Request,
+    download: bool,
+) -> Response {
     if !addresses_deliveries(&state, &prefix).await {
         return routers::web_file(&state, request).await;
     }
 
-    respond(deliver(&state, &prefix, &token, &choice, request.headers(), true).await)
+    respond(
+        deliver(
+            &state,
+            &prefix,
+            path_name.as_deref(),
+            &token,
+            &choice,
+            request.headers(),
+            download,
+        )
+        .await,
+    )
 }
 
 /// Whether a path's first segment is where deliveries live.
@@ -86,6 +124,7 @@ fn respond(delivered: Result<(HeaderMap, String), Error>) -> Response {
 async fn deliver(
     state: &AppState,
     prefix: &str,
+    path_name: Option<&str>,
     token: &str,
     choice: &TargetChoice,
     request: &HeaderMap,
@@ -116,6 +155,10 @@ async fn deliver(
             None => return Err(Error::NoSuchDelivery),
         },
     };
+
+    if path_name.is_some_and(|path_name| path_name != label) {
+        return Err(Error::NoSuchDelivery);
+    }
 
     // Counted by the token's name, never by the token; a user and a collection
     // of the same name are two different budgets.
@@ -272,6 +315,7 @@ mod tests {
         deliver(
             state,
             prefix,
+            None,
             token,
             &TargetChoice::default(),
             &HeaderMap::new(),
@@ -293,7 +337,7 @@ mod tests {
             target: target.map(str::to_owned),
         };
 
-        deliver(state, "s", token, &choice, &request, false).await
+        deliver(state, "s", None, token, &choice, &request, false).await
     }
 
     async fn served(state: &AppState) {
@@ -476,6 +520,7 @@ mod tests {
         let (headers, body) = deliver(
             &state,
             "s",
+            None,
             &token,
             &TargetChoice::default(),
             &HeaderMap::new(),

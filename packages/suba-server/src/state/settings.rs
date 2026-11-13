@@ -30,9 +30,10 @@ impl SettingsStore {
     ///
     /// Written with or without its leading slash — `/s` and `s` are the same
     /// prefix — and `s` when the operator has not said, so a delivery is at
-    /// `/s/<token>`. One segment, because a prefix with a slash in it addresses
-    /// a path nothing routes to, and a URL that cannot work should be refused
-    /// where it is configured rather than answered with a 404 nobody can explain.
+    /// `/s/<name>/<token>`. One segment, because a prefix with a slash in it
+    /// addresses a path nothing routes to, and a URL that cannot work should be
+    /// refused where it is configured rather than answered with a 404 nobody can
+    /// explain.
     pub(crate) async fn subscription_prefix(&self) -> Result<String, Error> {
         let written = self
             .file

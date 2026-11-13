@@ -94,7 +94,10 @@ async fn a_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
     assert_eq!(listed["name"], "alice");
     assert_eq!(listed["inbounds"][0]["inbound"], "trojan-in");
     assert_eq!(listed["missing_collections"], json!([]));
-    assert_eq!(listed["links"][0]["path"], json!(format!("/s/{token}")));
+    assert_eq!(
+        listed["links"][0]["path"],
+        json!(format!("/s/phone/{token}"))
+    );
     let grants = listed["grants"].as_array().unwrap();
     assert_eq!(grants.len(), 3);
     let link = grants[0]["link"].as_str().unwrap().to_string();
@@ -111,7 +114,7 @@ async fn a_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
     assert_eq!(grants[2]["reason"], "inbound: no inbound has this tag");
 
     let delivered = server
-        .get(&format!("/s/{token}?target=links"))
+        .get(&format!("/s/phone/{token}?target=links"))
         .send()
         .await
         .unwrap();
