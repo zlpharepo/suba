@@ -56,11 +56,8 @@ pub(crate) enum AgentAnswer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum AgentState {
-    Disabled,
-    Connecting,
     Online,
     Offline,
-    Unauthorized,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -95,70 +92,44 @@ impl AgentStatus {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Control {
-    revision: u64,
-    stopped: bool,
-}
-
-struct HubState {
-    hosts: HashMap<Uuid, Arc<Session>>,
-    local: AgentStatus,
-}
-
 pub(crate) struct AgentHub {
-    inner: Mutex<HubState>,
-    control: watch::Sender<Control>,
+    hosts: Mutex<HashMap<Uuid, Arc<Session>>>,
+    stopped: watch::Sender<bool>,
 }
 
 impl AgentHub {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(HubState {
-                hosts: HashMap::new(),
-                local: AgentStatus::new(AgentState::Disabled, None),
-            }),
-            control: watch::channel(Control::default()).0,
+            hosts: Mutex::new(HashMap::new()),
+            stopped: watch::channel(false).0,
         }
     }
 
     pub(crate) fn host_status(&self, id: Uuid) -> AgentStatus {
-        self.inner.lock().unwrap().hosts.get(&id).map_or_else(
+        self.hosts.lock().unwrap().get(&id).map_or_else(
             || AgentStatus::new(AgentState::Offline, Some("agent.disconnected")),
             |session| session.inner.lock().unwrap().status.clone(),
         )
     }
 
-    pub(crate) fn local_status(&self) -> AgentStatus {
-        self.inner.lock().unwrap().local.clone()
-    }
-
     pub(crate) fn disconnect(&self, id: Uuid) {
-        if let Some(session) = self.inner.lock().unwrap().hosts.remove(&id) {
+        if let Some(session) = self.hosts.lock().unwrap().remove(&id) {
             session.close();
         }
-    }
-
-    pub(crate) fn reconnect(&self) {
-        self.control
-            .send_modify(|control| control.revision = control.revision.wrapping_add(1));
     }
 
     pub(crate) fn shutdown(&self) {
-        self.control.send_modify(|control| control.stopped = true);
-        let mut inner = self.inner.lock().unwrap();
-        for (_, session) in inner.hosts.drain() {
+        self.stopped.send_replace(true);
+        for (_, session) in self.hosts.lock().unwrap().drain() {
             session.close();
         }
-        inner.local = AgentStatus::new(AgentState::Offline, Some("agent.shutdown"));
     }
 
     pub(crate) async fn exchange(&self, id: Uuid, call: AgentCall) -> Result<AgentAnswer, Error> {
         let session = self
-            .inner
+            .hosts
             .lock()
             .unwrap()
-            .hosts
             .get(&id)
             .cloned()
             .ok_or(Error::PeerUnavailable)?;
@@ -177,35 +148,26 @@ impl AgentHub {
     }
 
     fn attach(&self, host: Uuid, session: Arc<Session>) -> Result<(), Error> {
-        let mut inner = self.inner.lock().unwrap();
-        if self.control.borrow().stopped {
+        let mut hosts = self.hosts.lock().unwrap();
+        if *self.stopped.borrow() {
             session.close();
             return Err(Error::PeerUnavailable);
         }
-        if let Some(old) = inner.hosts.insert(host, session) {
+        if let Some(old) = hosts.insert(host, session) {
             old.close();
         }
         Ok(())
     }
 
     fn detach(&self, host: Uuid, session: &Session) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut hosts = self.hosts.lock().unwrap();
         session.close();
-        if inner
-            .hosts
+        if hosts
             .get(&host)
             .is_some_and(|current| current.id == session.id)
         {
-            inner.hosts.remove(&host);
+            hosts.remove(&host);
         }
-    }
-
-    fn local(&self, status: AgentStatus) {
-        self.inner.lock().unwrap().local = status;
-    }
-
-    fn local_seen(&self) {
-        self.inner.lock().unwrap().local.last_seen = Some(chrono::Utc::now().timestamp_millis());
     }
 }
 

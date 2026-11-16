@@ -15,13 +15,6 @@ pub fn route() -> Router<AppState> {
         .route("/peers/{id}", delete(peers::revoke))
         .route("/peers/invitations", post(peers::invite))
         .route("/peers/invitations/{id}", delete(peers::revoke_invitation))
-        .route(
-            "/peers/agent",
-            get(agent::agent_view)
-                .post(agent::join_agent)
-                .put(agent::edit_agent)
-                .delete(agent::leave_agent),
-        )
         .route("/peers/agent/connect", get(agent::connect))
         .route("/peers/challenges", post(peers::challenge))
         .route("/peers/pairings", post(peers::accept))

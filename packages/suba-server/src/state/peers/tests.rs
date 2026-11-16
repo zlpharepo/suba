@@ -20,6 +20,51 @@ fn signer() -> IdentitySigner {
     IdentitySigner::new(Uuid::now_v7(), &KeyPair::generate().unwrap()).unwrap()
 }
 
+#[tokio::test]
+async fn an_existing_binding_records_its_startup_token_as_the_upgrade_baseline() {
+    for retained in [None, Some("example-consumed-invitation")] {
+        let scratch = Scratch::new();
+        let store = scratch.store();
+        let manager = signer().identity;
+        let locked = store.file.lock().await;
+        let mut file = locked.get().clone();
+        file.agent = Some(AgentBinding {
+            manager: manager.clone(),
+            token_digest: None,
+            retire_deployment: false,
+        });
+        file.trusted.insert(
+            manager.id,
+            TrustedPeer {
+                id: manager.id,
+                name: "Example Manager".into(),
+                public_key: manager.public_key.clone(),
+                fingerprint: manager.fingerprint.clone(),
+            },
+        );
+        locked.commit(file).await.unwrap();
+
+        assert_eq!(
+            store.reusable_agent_binding(retained).await.unwrap(),
+            Some(manager.clone())
+        );
+        let restarted = scratch.store();
+        assert_eq!(
+            restarted.reusable_agent_binding(None).await.unwrap(),
+            Some(manager.clone())
+        );
+        assert_eq!(
+            restarted.reusable_agent_binding(retained).await.unwrap(),
+            Some(manager)
+        );
+        assert!(restarted
+            .reusable_agent_binding(Some("example-new-invitation"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 async fn pair_proof(
     store: &Peers,
     receiver: &IdentitySigner,

@@ -12,12 +12,13 @@ use super::{
     *,
 };
 use crate::{
-    state::peers::{AgentSessionProof, AgentUpstream, Host, Identity, IdentitySigner},
+    agent::Upstream,
+    state::peers::{AgentSessionProof, Host, Identity, IdentitySigner},
     AppState,
 };
 
 pub(crate) async fn accept(state: AppState, id: Uuid, socket: axum::extract::ws::WebSocket) {
-    let mut control = state.peers().agent.control.subscribe();
+    let mut control = state.peers().agent.stopped.subscribe();
     let mut socket = wire::server_socket(socket);
     tokio::select! {
         _ = stopped(&mut control) => {},
@@ -25,9 +26,9 @@ pub(crate) async fn accept(state: AppState, id: Uuid, socket: axum::extract::ws:
     }
 }
 
-async fn stopped(control: &mut watch::Receiver<Control>) {
+async fn stopped(control: &mut watch::Receiver<bool>) {
     loop {
-        if control.borrow_and_update().stopped || control.changed().await.is_err() {
+        if *control.borrow_and_update() || control.changed().await.is_err() {
             return;
         }
     }
@@ -144,67 +145,46 @@ async fn valid_host(state: &AppState, host: &Host, own: &Identity) -> Result<(),
     Ok(())
 }
 
-pub(crate) async fn run(state: AppState) {
-    let hub = &state.peers().agent;
-    let mut control = hub.control.subscribe();
+pub(crate) async fn run(state: AppState, upstream: Upstream) {
+    let mut control = state.peers().agent.stopped.subscribe();
     let mut failures = 0_u32;
+    let mut last_failure = None;
     loop {
-        if control.borrow_and_update().stopped {
-            return;
-        }
-        let Some(upstream) = state.peers().agent_upstream().await else {
-            hub.local(AgentStatus::new(AgentState::Disabled, None));
-            tokio::select! {
-                _ = control.changed() => {},
-                _ = tokio::time::sleep(VALIDATE_INTERVAL) => {},
-            }
-            failures = 0;
-            continue;
-        };
-        hub.local(AgentStatus::new(AgentState::Connecting, None));
         let (result, healthy) = tokio::select! {
-            _ = control.changed() => { failures = 0; continue; },
+            _ = stopped(&mut control) => return,
             result = agent_connect(&state, &upstream) => result,
         };
         if healthy {
             failures = 0;
+            last_failure = None;
         }
-        hub.local(AgentStatus::new(
-            if matches!(result, Err(Error::Unauthorized | Error::PeerIdentity)) {
-                AgentState::Unauthorized
-            } else {
-                AgentState::Offline
-            },
-            Some(
-                if matches!(result, Err(Error::Unauthorized | Error::PeerIdentity)) {
-                    "agent.unauthorized"
-                } else {
-                    "agent.disconnected"
-                },
-            ),
-        ));
+        let reason = if matches!(result, Err(Error::Unauthorized | Error::PeerIdentity)) {
+            "the Manager's identity could not be verified"
+        } else {
+            "the Manager connection is unavailable"
+        };
+        if last_failure != Some(reason) {
+            tracing::warn!("Agent: {reason}");
+            last_failure = Some(reason);
+        }
         let delay = backoff(failures);
         failures = failures.saturating_add(1);
         tokio::select! {
-            _ = control.changed() => { failures = 0; },
+            _ = stopped(&mut control) => return,
             _ = tokio::time::sleep(delay) => {},
         }
     }
 }
 
-async fn agent_connect(state: &AppState, upstream: &AgentUpstream) -> (Result<(), Error>, bool) {
+async fn agent_connect(state: &AppState, upstream: &Upstream) -> (Result<(), Error>, bool) {
     let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         state
             .peers()
             .agent_manager_authorized(&upstream.manager)
             .await?;
         let signer = state.settings().existing_peer_signer().await?;
-        let client = crate::state::peers::outbound_builder(upstream.proxy.as_deref())?
-            .http1_only()
-            .build()
-            .map_err(|_| Error::PeerUnavailable)?;
         let socket = wire::dial(
-            &client,
+            &upstream.client,
             wire::address(&upstream.endpoint, signer.identity.id)?,
         )
         .await?;
@@ -219,7 +199,6 @@ async fn agent_connect(state: &AppState, upstream: &AgentUpstream) -> (Result<()
         Ok(Err(error)) => return (Err(error), false),
         Err(_) => return (Err(Error::PeerUnavailable), false),
     };
-    state.peers().agent.local(AgentStatus::online());
     let started = Instant::now();
     let result = agent(state, upstream, &signer.identity, session, &mut socket).await;
     (result, started.elapsed() >= STALE_TIMEOUT)
@@ -258,12 +237,10 @@ where
 
 async fn valid_upstream(
     state: &AppState,
-    upstream: &AgentUpstream,
+    upstream: &Upstream,
     own: &Identity,
 ) -> Result<(), Error> {
-    if state.peers().agent_upstream().await.as_ref() != Some(upstream)
-        || state.settings().existing_peer_signer().await?.identity != *own
-    {
+    if state.settings().existing_peer_signer().await?.identity != *own {
         return Err(Error::Unauthorized);
     }
     state
@@ -274,7 +251,7 @@ async fn valid_upstream(
 
 async fn agent<S>(
     state: &AppState,
-    upstream: &AgentUpstream,
+    upstream: &Upstream,
     own: &Identity,
     session: Uuid,
     socket: &mut S,
@@ -300,7 +277,6 @@ where
                     ManagerFrame::Ping { session: received, id } if received == session && id > last_ping => {
                         last_ping = id;
                         seen_ping = Instant::now();
-                        state.peers().agent.local_seen();
                         wire::send(socket, &AgentFrame::Pong { session, id }).await?;
                     },
                     ManagerFrame::Call { session: received, id, call } if received == session && id > last_call => {
@@ -330,7 +306,7 @@ where
 
 async fn execute(
     state: &AppState,
-    upstream: &AgentUpstream,
+    upstream: &Upstream,
     own: &Identity,
     call: AgentCall,
 ) -> Result<AgentAnswer, Error> {

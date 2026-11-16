@@ -436,6 +436,16 @@ impl SingboxStore {
         Ok(())
     }
 
+    /// Retire boot inputs before a new Manager's binding can run the core.
+    pub(crate) fn retire_deployment(&self) -> Result<(), Error> {
+        fs::remove(
+            &self.config_dir,
+            &crate::config::config_name(SETTINGS_BASENAME),
+        )?;
+        fs::remove(&self.config_dir, "deployment.json")?;
+        Ok(())
+    }
+
     pub(crate) fn apply_deployment(
         &self,
         deployment: Deployment,
@@ -2663,7 +2673,10 @@ mod tests {
         })
         .await
         .unwrap();
-        let address = server.tcp.as_ref().unwrap().local_addr().unwrap();
+        let crate::Service::Manager(listener) = &server.service else {
+            panic!("the Manager must listen on HTTP");
+        };
+        let address = listener.local_addr().unwrap();
         let store = server.state.singbox();
         store.start(&Contributions::default()).unwrap();
         wait_for(&store, "started");

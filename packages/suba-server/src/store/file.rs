@@ -47,12 +47,8 @@ impl FileStore {
     pub(crate) fn open(root: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let root = root.into();
 
-        // Through the same trusted-directory check as every other write, so the
-        // data directory cannot be a place another user can put files.
-        disk::ensure_dir(&root)?;
+        let lock = lock_data(&root)?;
         disk::ensure_dir(root.join(OBSERVATIONS))?;
-
-        let lock = take_lock(&root.join(LOCK))?;
 
         Ok(Self { root, _lock: lock })
     }
@@ -111,6 +107,12 @@ impl ObservationStore for FileStore {
 
         Ok(())
     }
+}
+
+/// Hold the instance's data directory exclusively until the file is dropped.
+pub(crate) fn lock_data(root: &Path) -> Result<File, StoreError> {
+    disk::ensure_dir(root)?;
+    take_lock(&root.join(LOCK))
 }
 
 /// Take the lock, or say which process holds it.

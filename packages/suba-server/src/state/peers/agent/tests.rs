@@ -277,13 +277,8 @@ async fn disconnected_mutation_is_uncertain_but_is_never_requeued() {
         hub.exchange(host, call()).await,
         Err(Error::PeerUnavailable)
     ));
-    assert_eq!(hub.local_status().state, AgentState::Disabled);
-    let mut control = hub.control.subscribe();
-    hub.reconnect();
-    assert!(control.has_changed().unwrap());
-    control.borrow_and_update();
     hub.shutdown();
-    assert!(control.borrow().stopped);
+    assert!(*hub.stopped.borrow());
     let (replacement, _commands) = Session::new(Uuid::now_v7());
     assert!(hub.attach(host, replacement).is_err());
 }

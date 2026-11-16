@@ -159,49 +159,18 @@ async fn direct_pairing_rejects_an_invitation_relabeled_as_agent() {
 }
 
 #[tokio::test]
-async fn agent_control_route_pairs_and_persists_the_manager_binding() {
-    let manager = Server::start().await;
-    let node = Server::start().await;
-    let route = "/api/peers/agent";
-    assert_eq!(node.get(route).send().await.unwrap().status(), 401);
-    assert_eq!(get(&node, route).await["state"], "disabled");
-    let invitation = post(
-        &manager,
-        "/api/peers/invitations",
-        json!({"name": "Example Agent", "endpoint": manager.base, "mode": "agent"}),
-    )
-    .await;
-    assert_eq!(invitation.status(), 201);
-    let invitation = body(invitation).await;
-    assert_eq!(invitation["mode"], "agent");
-    let joined = post(&node, route, json!({"invitation": invitation})).await;
-    assert_eq!(joined.status(), 201);
-    assert_eq!(body(joined).await["manager"]["endpoint"], manager.base);
-    let environments = get(&manager, "/api/environments").await;
-    assert_eq!(environments[0]["mode"], "agent");
-    let agent_id = environments[0]["id"].as_str().unwrap();
-    let manager_identity = get(&manager, "/api/peers/identity").await;
-    let manager_id = manager_identity["id"].as_str().unwrap();
-    for (server, id) in [(&manager, agent_id), (&node, manager_id)] {
-        assert_eq!(get(server, "/api/peers").await, json!([]));
+async fn the_manager_web_server_has_no_agent_upstream_settings() {
+    let server = Server::start().await;
+    for method in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
         let response = server
-            .authed(Method::DELETE, &format!("/api/peers/{id}"))
+            .authed(method, "/api/peers/agent")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), 404);
+        assert!(response.status().is_client_error());
     }
-
-    let saved: Value =
-        crate::config::read_config(node.root.join("config").to_str().unwrap(), "peers").unwrap();
-    assert_eq!(saved["agent"]["endpoint"], manager.base);
-
-    let response = node.put_json(route, json!({"proxy": null})).await;
-    assert_eq!(response.status(), 200);
-    assert_eq!(body(response).await["proxy_configured"], false);
-    let response = node.authed(Method::DELETE, route).send().await.unwrap();
-    assert_eq!(response.status(), 204);
-    assert!(get(&node, route).await["manager"].is_null());
 }
 
 #[tokio::test]
@@ -493,7 +462,28 @@ async fn remote_config_writes_preserve_etags_and_do_not_touch_local_documents() 
 async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_and_survives_restart(
 ) {
     let manager = Server::start().await;
-    let manager_endpoint = manager.base.replacen("127.0.0.1", "localhost", 1);
+    // Only the forward proxy can reach the Manager at the address in the invitation.
+    let manager_endpoint = "http://127.0.0.1:1";
+    let target = url::Url::parse(&manager.base).unwrap().port().unwrap();
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let relay = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted = proxy.accept() => {
+                    let (mut node, _) = accepted.unwrap();
+                    connections.spawn(async move {
+                        let mut manager = tokio::net::TcpStream::connect(("127.0.0.1", target))
+                            .await
+                            .unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut node, &mut manager).await;
+                    });
+                }
+                _ = connections.join_next(), if !connections.is_empty() => {}
+            }
+        }
+    });
     let root = manager.root.join("agent");
     let config_dir = root.join("config");
     crate::fs::ensure_dir(&config_dir).unwrap();
@@ -516,6 +506,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         crate::AgentOptions {
             manager_api_url: format!("{manager_endpoint}/api"),
             token: None,
+            proxy: None,
         },
     )
     .await;
@@ -541,11 +532,12 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         crate::AgentOptions {
             manager_api_url: format!("{manager_endpoint}/api"),
             token: Some(token.clone()),
+            proxy: Some(proxy_url),
         },
     )
     .await
     .unwrap();
-    assert!(agent.tcp.is_none());
+    assert!(matches!(agent.service, crate::Service::Agent(_)));
     let identity = agent
         .state
         .settings()
@@ -553,6 +545,29 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         .await
         .unwrap()
         .identity;
+    let upstream = agent
+        .state
+        .peers()
+        .reusable_agent_binding(None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(agent.state.peers().direct_trusted().await.is_empty());
+    assert!(matches!(
+        agent.state.peers().revoke_direct(upstream.id).await,
+        Err(crate::Error::PeerNotFound)
+    ));
+    assert_eq!(get(&manager, "/api/peers").await, json!([]));
+    let revoke = manager
+        .authed(Method::DELETE, &format!("/api/peers/{}", identity.id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoke.status(), 404);
+    assert!(matches!(
+        crate::SubaServer::unbind_agent(&make_config()).await,
+        Err(crate::Error::Store(crate::store::StoreError::Locked { .. }))
+    ));
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(agent.serve_until(
         async {
@@ -601,16 +616,19 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         .unwrap()
         .unwrap()
         .unwrap();
+    relay.abort();
+    let _ = relay.await;
     let restarted = crate::SubaServer::agent(
         make_config(),
         crate::AgentOptions {
-            manager_api_url: format!("{manager_endpoint}/api"),
-            token: None,
+            manager_api_url: format!("{}/api", manager.base),
+            token: Some(token.clone()),
+            proxy: None,
         },
     )
     .await
     .unwrap();
-    assert!(restarted.tcp.is_none());
+    assert!(matches!(restarted.service, crate::Service::Agent(_)));
     assert_eq!(
         restarted
             .state
@@ -625,13 +643,5 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         std::fs::read_to_string(config_dir.join(crate::config::config_name("peers"))).unwrap();
     assert!(!saved.contains(&token));
     assert!(!saved.contains(invitation["secret"].as_str().unwrap()));
-    let changed = crate::SubaServer::agent(
-        make_config(),
-        crate::AgentOptions {
-            manager_api_url: "http://127.0.0.1:1/api".into(),
-            token: None,
-        },
-    )
-    .await;
-    assert!(matches!(changed, Err(crate::Error::PeerConflict { .. })));
+    assert!(!saved.contains(manager_endpoint));
 }

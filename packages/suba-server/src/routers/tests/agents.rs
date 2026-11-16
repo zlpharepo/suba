@@ -167,6 +167,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         AgentOptions {
             manager_api_url: format!("{}/api", manager.base),
             token: Some(token.clone()),
+            proxy: None,
         },
     )
     .await
@@ -180,7 +181,13 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         .identity
         .id;
     use tower::ServiceExt;
-    let manager_identity = node.state.peers().agent_upstream().await.unwrap().manager;
+    let manager_identity = node
+        .state
+        .peers()
+        .reusable_agent_binding(None)
+        .await
+        .unwrap()
+        .unwrap();
     use crate::state::peers::{ChallengeRequest, IdentitySigner, ResourceRequest};
     let manager_config: crate::config::AppConfig =
         crate::config::read_config(manager.root.join("config").to_str().unwrap(), "config")
@@ -197,7 +204,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         .challenge(
             &node_signer,
             ChallengeRequest {
-                actor: manager_identity,
+                actor: manager_identity.clone(),
                 invitation: None,
             },
         )
@@ -419,6 +426,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         AgentOptions {
             manager_api_url: format!("{}/api", manager.base),
             token: None,
+            proxy: None,
         },
     )
     .await
@@ -433,4 +441,121 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
     .unwrap();
     assert_eq!(restarted.state.singbox().product().unwrap(), last_success);
     restarted.stop().await;
+
+    let replacement = Server::start().await;
+    let invite = replacement
+        .authed(Method::POST, "/api/peers/invitations")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({"name": "Example Agent", "endpoint": replacement.base, "mode": "agent"})
+                .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invite.status(), 201);
+    let invite = body(invite).await;
+    let token = format!(
+        "{}.{}",
+        invite["id"].as_str().unwrap(),
+        invite["secret"].as_str().unwrap()
+    );
+    let deployment = root.join("data/agent/deployment.json");
+    let saved = std::fs::read(&deployment).unwrap();
+    let mut invalid_token = token.clone();
+    let last = invalid_token.pop().unwrap();
+    invalid_token.push(if last == '0' { '1' } else { '0' });
+    let rejected = SubaServer::agent(
+        server_config(),
+        AgentOptions {
+            manager_api_url: format!("{}/api", replacement.base),
+            token: Some(invalid_token),
+            proxy: None,
+        },
+    )
+    .await;
+    assert!(matches!(rejected, Err(crate::Error::PeerUncertain)));
+    assert_eq!(std::fs::read(&deployment).unwrap(), saved);
+    let current = SubaServer::agent(
+        server_config(),
+        AgentOptions {
+            manager_api_url: format!("{}/api", manager.base),
+            token: None,
+            proxy: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        current
+            .state
+            .peers()
+            .reusable_agent_binding(None)
+            .await
+            .unwrap()
+            .unwrap(),
+        manager_identity
+    );
+    drop(current);
+
+    // An interrupted retirement must resume on restart with the already-consumed token.
+    let backup = deployment.with_extension("saved");
+    std::fs::rename(&deployment, &backup).unwrap();
+    std::fs::create_dir(&deployment).unwrap();
+    let options = || AgentOptions {
+        manager_api_url: format!("{}/api", replacement.base),
+        token: Some(token.clone()),
+        proxy: None,
+    };
+    let blocked = SubaServer::agent(server_config(), options()).await;
+    assert!(matches!(blocked, Err(crate::Error::Io(_))));
+    std::fs::remove_dir(&deployment).unwrap();
+    std::fs::rename(&backup, &deployment).unwrap();
+
+    let rebound = SubaServer::agent(server_config(), options()).await.unwrap();
+    assert_ne!(
+        rebound
+            .state
+            .peers()
+            .reusable_agent_binding(None)
+            .await
+            .unwrap()
+            .unwrap(),
+        manager_identity
+    );
+    let store = rebound.state.singbox();
+    assert!(store.deployment().unwrap().is_none());
+    assert!(!store.settings().unwrap().autostart);
+    assert!(store.settings().unwrap().config.is_none());
+    let signer = rebound
+        .state
+        .settings()
+        .existing_peer_signer()
+        .await
+        .unwrap();
+    assert!(matches!(
+        rebound
+            .state
+            .peers()
+            .challenge(
+                &signer,
+                ChallengeRequest {
+                    actor: manager_identity,
+                    invitation: None,
+                },
+            )
+            .await,
+        Err(crate::Error::Unauthorized)
+    ));
+    assert_eq!(
+        rebound
+            .state
+            .settings()
+            .existing_peer_signer()
+            .await
+            .unwrap()
+            .identity
+            .id,
+        id
+    );
 }

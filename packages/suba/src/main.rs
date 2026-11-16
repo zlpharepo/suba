@@ -52,9 +52,17 @@ struct Cli {
     #[arg(long, env = "SUBA_MANAGER_API_URL", requires = "agent")]
     manager_api_url: Option<String>,
 
-    /// One-time invitation token for initial Agent pairing
+    /// One-time invitation token for Agent pairing or changing Managers
     #[arg(long, env = "SUBA_AGENT_TOKEN", requires = "agent")]
     agent_token: Option<String>,
+
+    /// Explicit HTTP or HTTPS proxy for Agent pairing and management traffic
+    #[arg(long, env = "SUBA_AGENT_PROXY", requires = "agent")]
+    agent_proxy: Option<String>,
+
+    /// Clear the local Manager binding after stopping the Agent, then exit
+    #[arg(long)]
+    unbind_agent: bool,
 }
 
 impl Cli {
@@ -75,12 +83,23 @@ impl Cli {
             },
         };
 
+        if self.unbind_agent {
+            SubaServer::unbind_agent(&config)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!("Failed to unbind Agent: {error}");
+                    std::process::exit(1);
+                });
+            return;
+        }
+
         let server = if self.agent {
             SubaServer::agent(
                 config,
                 AgentOptions {
                     manager_api_url: self.manager_api_url.clone().expect("required by clap"),
                     token: self.agent_token.clone(),
+                    proxy: self.agent_proxy.clone(),
                 },
             )
             .await
@@ -178,6 +197,22 @@ mod tests {
     }
 
     #[test]
+    fn agent_accepts_an_explicit_outbound_proxy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let proxy = "http://proxy.example.invalid:3128";
+        assert!(Cli::try_parse_from(["suba", "--agent-proxy", proxy]).is_err());
+        assert!(Cli::try_parse_from([
+            "suba",
+            "--agent",
+            "--manager-api-url",
+            "https://manager.example.invalid/api",
+            "--agent-proxy",
+            proxy,
+        ])
+        .is_ok());
+    }
+
+    #[test]
     fn container_environment_configures_agent_and_cli_overrides_it() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _restore = environment(&[
@@ -194,6 +229,7 @@ mod tests {
                 "https://manager.example.invalid/api",
             ),
             ("SUBA_AGENT_TOKEN", "fixture-token"),
+            ("SUBA_AGENT_PROXY", "http://proxy.example.invalid:3128"),
         ]);
         let cli = Cli::try_parse_from(["suba"]).unwrap();
         assert!(cli.agent);
@@ -209,6 +245,10 @@ mod tests {
             Some("https://manager.example.invalid/api")
         );
         assert_eq!(cli.agent_token.as_deref(), Some("fixture-token"));
+        assert_eq!(
+            cli.agent_proxy.as_deref(),
+            Some("http://proxy.example.invalid:3128")
+        );
         let override_cli = Cli::try_parse_from(["suba", "--host", "127.0.0.1"]).unwrap();
         assert_eq!(override_cli.host, "127.0.0.1");
     }

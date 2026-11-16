@@ -251,8 +251,10 @@ pub fn remove(dir: &Path, name: &str) -> io::Result<()> {
     };
 
     match unlinkat(&directory, name, AtFlags::empty()) {
-        Ok(()) => Ok(()),
-        Err(Errno::NOENT) => Ok(()),
+        Ok(()) | Err(Errno::NOENT) => {
+            let _ = rustix::fs::fsync(&directory);
+            Ok(())
+        }
         Err(error) => Err(io_error(error)),
     }
 }

@@ -50,6 +50,8 @@ struct AgentScope {
 
 struct Inner {
     agent: bool,
+    // Agent instances do not open the provider store that holds this lock in Manager mode.
+    _agent_lock: Option<std::fs::File>,
     #[cfg(feature = "singbox-core")]
     config_dir: PathBuf,
     #[cfg(feature = "singbox-core")]
@@ -101,6 +103,9 @@ impl AppState {
         let identity =
             Identity::discover(config.privileged, &[&config.data_dir, &config.config_dir])?;
         identity.settle_files(&[&config.data_dir, &config.config_dir]);
+        let agent_lock = agent
+            .then(|| crate::store::lock_data(&config.data_dir))
+            .transpose()?;
 
         // One client for the instance: subscriptions and releases both go out
         // through it, so connection reuse and timeouts are the same everywhere.
@@ -114,6 +119,7 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(Inner {
                 agent,
+                _agent_lock: agent_lock,
                 #[cfg(feature = "singbox-core")]
                 config_dir: config.config_dir.clone(),
                 #[cfg(feature = "singbox-core")]

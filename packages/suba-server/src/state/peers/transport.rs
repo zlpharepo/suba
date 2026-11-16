@@ -50,21 +50,20 @@ impl Peers {
                 Purpose::Pair,
             )
             .await?;
-        let receipt: Signed<PairReceipt> = self
-            .post(
-                &endpoint,
-                Mode::Direct,
-                "pairings",
-                &signer.sign(
-                    "pair",
-                    PairClaim {
-                        invitation_proof: invitation_proof(&invitation.secret, &challenge)?,
-                        challenge: challenge.clone(),
-                    },
-                )?,
-            )
-            .await
-            .map_err(|_| Error::PeerUncertain)?;
+        let receipt: Signed<PairReceipt> = post(
+            &self.http,
+            &endpoint,
+            "pairings",
+            &signer.sign(
+                "pair",
+                PairClaim {
+                    invitation_proof: invitation_proof(&invitation.secret, &challenge)?,
+                    challenge: challenge.clone(),
+                },
+            )?,
+        )
+        .await
+        .map_err(|_| Error::PeerUncertain)?;
         receipt
             .verify("paired", &invitation.identity)
             .map_err(|_| Error::PeerUncertain)?;
@@ -108,9 +107,12 @@ impl Peers {
         if !resource_allowed(&method, &path) {
             return Err(Error::PeerNotFound);
         }
-        let address = host.endpoint.as_deref().ok_or(Error::PeerUnavailable)?;
+        let address = endpoint(
+            host.endpoint.as_deref().ok_or(Error::PeerUnavailable)?,
+            Mode::Direct,
+        )?;
         let challenge = self
-            .remote_challenge(signer, address, &host.identity, None, Purpose::Request)
+            .remote_challenge(signer, &address, &host.identity, None, Purpose::Request)
             .await?;
         let proof = signer.sign(
             "request",
@@ -130,8 +132,7 @@ impl Peers {
                 Error::PeerUncertain
             }
         };
-        let reply: Signed<ResourceReply> = self
-            .post(address, Mode::Direct, "requests", &proof)
+        let reply: Signed<ResourceReply> = post(&self.http, &address, "requests", &proof)
             .await
             .map_err(|_| outcome())?;
         reply
@@ -146,7 +147,7 @@ impl Peers {
         Ok(reply.payload)
     }
 
-    pub(super) async fn remote_challenge(
+    async fn remote_challenge(
         &self,
         signer: &IdentitySigner,
         endpoint: &str,
@@ -154,22 +155,16 @@ impl Peers {
         invitation: Option<Uuid>,
         purpose: Purpose,
     ) -> Result<Challenge, Error> {
-        let mode = if purpose == Purpose::AgentPair {
-            Mode::Agent
-        } else {
-            Mode::Direct
-        };
-        let challenge: Signed<Challenge> = self
-            .post(
-                endpoint,
-                mode,
-                "challenges",
-                &ChallengeRequest {
-                    actor: signer.identity.clone(),
-                    invitation,
-                },
-            )
-            .await?;
+        let challenge: Signed<Challenge> = post(
+            &self.http,
+            endpoint,
+            "challenges",
+            &ChallengeRequest {
+                actor: signer.identity.clone(),
+                invitation,
+            },
+        )
+        .await?;
         challenge
             .verify("challenge", target)
             .map_err(|_| Error::PeerUnavailable)?;
@@ -181,39 +176,36 @@ impl Peers {
         }
         Ok(challenge.payload)
     }
+}
 
-    pub(super) async fn post<T: Serialize, R: DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        mode: Mode,
-        path: &str,
-        body: &T,
-    ) -> Result<R, Error> {
-        let endpoint = super::endpoint(endpoint, mode)?;
-        let mut response = self
-            .http
-            .post(format!("{endpoint}/api/peers/{path}"))
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(serde_json::to_vec(body).map_err(|_| Error::PeerUnavailable)?)
-            .send()
-            .await
-            .map_err(|_| Error::PeerUnavailable)?;
-        if !response.status().is_success()
-            || response
-                .content_length()
-                .is_some_and(|length| length > WIRE_LIMIT as u64)
-        {
+pub(super) async fn post<T: Serialize, R: DeserializeOwned>(
+    http: &reqwest::Client,
+    endpoint: &str,
+    path: &str,
+    body: &T,
+) -> Result<R, Error> {
+    let mut response = http
+        .post(format!("{endpoint}/api/peers/{path}"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(body).map_err(|_| Error::PeerUnavailable)?)
+        .send()
+        .await
+        .map_err(|_| Error::PeerUnavailable)?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|length| length > WIRE_LIMIT as u64)
+    {
+        return Err(Error::PeerUnavailable);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| Error::PeerUnavailable)? {
+        if bytes.len().saturating_add(chunk.len()) > WIRE_LIMIT {
             return Err(Error::PeerUnavailable);
         }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| Error::PeerUnavailable)? {
-            if bytes.len().saturating_add(chunk.len()) > WIRE_LIMIT {
-                return Err(Error::PeerUnavailable);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| Error::PeerUnavailable)
+        bytes.extend_from_slice(&chunk);
     }
+    serde_json::from_slice(&bytes).map_err(|_| Error::PeerUnavailable)
 }
 
 pub(crate) fn resource_allowed(method: &str, path: &str) -> bool {

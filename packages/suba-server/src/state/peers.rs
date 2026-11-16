@@ -1,6 +1,6 @@
 //! Machine trust is separate from administrator sessions and resource ownership.
 //!
-//! Only public identities and connection addresses persist. Invitations and
+//! Public identities and Direct connection addresses persist. Invitations and
 //! replay challenges expire in memory; restarting invalidates them. A peer
 //! proof authorizes a bounded resource router, never login or further delegation.
 //! Agent identities can establish sessions but cannot operate manager resources.
@@ -14,6 +14,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use suba_core::checksum::sha256_hex;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -52,10 +53,13 @@ pub(crate) enum Mode {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AgentUpstream {
-    pub manager: Identity,
-    pub endpoint: String,
-    pub proxy: Option<String>,
+struct AgentBinding {
+    manager: Identity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token_digest: Option<String>,
+    // The binding is committed first, so a refused invitation cannot retire a live deployment.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    retire_deployment: bool,
 }
 
 #[derive(Serialize)]
@@ -81,7 +85,7 @@ struct Configuration {
     #[serde(default)]
     trusted: BTreeMap<Uuid, TrustedPeer>,
     #[serde(default)]
-    agent: Option<AgentUpstream>,
+    agent: Option<AgentBinding>,
 }
 
 impl Configuration {
@@ -216,12 +220,14 @@ pub(crate) struct Peers {
 }
 
 impl Peers {
+    /// Verify the invitation before changing the pinned Manager or its trust.
     pub(crate) async fn pair_agent(
         &self,
+        client: &reqwest::Client,
         signer: &IdentitySigner,
         endpoint: &str,
         token: &str,
-    ) -> Result<AgentUpstream, Error> {
+    ) -> Result<Identity, Error> {
         let (id, secret) = token.split_once('.').ok_or(Error::PeerRequest {
             reason: "agent-token: expected an invitation identifier and secret",
         })?;
@@ -234,37 +240,77 @@ impl Peers {
             });
         }
         // The signed challenge supplies the identity pinned during pairing.
-        let challenge: Signed<Challenge> = self
-            .post(
-                endpoint,
-                Mode::Agent,
-                "challenges",
-                &ChallengeRequest {
-                    actor: signer.identity.clone(),
-                    invitation: Some(id),
-                },
-            )
-            .await?;
+        let challenge: Signed<Challenge> = transport::post(
+            client,
+            endpoint,
+            "challenges",
+            &ChallengeRequest {
+                actor: signer.identity.clone(),
+                invitation: Some(id),
+            },
+        )
+        .await?;
         challenge.verify("challenge", &challenge.payload.target)?;
         if challenge.payload.actor != signer.identity
             || challenge.payload.purpose != Purpose::AgentPair
+            || challenge.payload.target.id == signer.identity.id
+            || challenge.payload.target.fingerprint == signer.identity.fingerprint
         {
             return Err(Error::Unauthorized);
         }
-        self.join_agent(
-            signer,
-            Invitation {
-                version: 1,
-                id,
-                endpoint: endpoint.to_string(),
-                identity: challenge.payload.target,
-                secret: secret.to_string(),
-                expires_at: challenge.payload.expires_at,
-                mode: Mode::Agent,
-            },
-            None,
+        let challenge = challenge.payload;
+        let receipt: Signed<PairReceipt> = transport::post(
+            client,
+            endpoint,
+            "pairings",
+            &signer.sign(
+                "pair",
+                PairClaim {
+                    invitation_proof: invitation_proof(secret, &challenge)?,
+                    challenge: challenge.clone(),
+                },
+            )?,
         )
         .await
+        .map_err(|_| Error::PeerUncertain)?;
+        let manager = challenge.target;
+        receipt
+            .verify("paired", &manager)
+            .map_err(|_| Error::PeerUncertain)?;
+        if receipt.payload.nonce != challenge.nonce
+            || receipt.payload.actor != signer.identity.id
+            || receipt.payload.target != manager
+        {
+            return Err(Error::PeerUncertain);
+        }
+        let locked = self.file.lock().await;
+        let mut file = locked.get().clone();
+        let retire_deployment = file
+            .agent
+            .as_ref()
+            .is_none_or(|binding| binding.retire_deployment || binding.manager != manager);
+        if let Some(previous) = file.agent.take() {
+            file.trusted.remove(&previous.manager.id);
+        }
+        file.agent = Some(AgentBinding {
+            manager: manager.clone(),
+            token_digest: Some(sha256_hex(token.as_bytes())),
+            retire_deployment,
+        });
+        file.trusted.insert(
+            manager.id,
+            TrustedPeer {
+                id: manager.id,
+                name: "Manager".to_string(),
+                public_key: manager.public_key.clone(),
+                fingerprint: manager.fingerprint.clone(),
+            },
+        );
+        locked
+            .commit(file)
+            .await
+            .map_err(|_| Error::PeerUncertain)?;
+        Ok(manager)
     }
 
     pub(crate) fn load(config: &Path) -> Result<Self, Error> {
@@ -290,8 +336,57 @@ impl Peers {
         HostView { host, connection }
     }
 
-    pub(crate) async fn agent_upstream(&self) -> Option<AgentUpstream> {
-        self.file.read(|file| file.agent.clone()).await
+    pub(crate) async fn reusable_agent_binding(
+        &self,
+        token: Option<&str>,
+    ) -> Result<Option<Identity>, Error> {
+        let locked = self.file.lock().await;
+        let Some(binding) = locked.get().agent.as_ref() else {
+            return Ok(None);
+        };
+        let digest = sha256_hex(token.unwrap_or_default().as_bytes());
+        if binding
+            .token_digest
+            .as_ref()
+            .is_some_and(|previous| token.is_some() && previous != &digest)
+        {
+            return Ok(None);
+        }
+        if !locked.get().trusts(&binding.manager) {
+            return Err(Error::Unauthorized);
+        }
+        let manager = binding.manager.clone();
+        if binding.token_digest.is_none() {
+            // An older binding cannot tell a retained, consumed token from a new one.
+            // Record the existing deployment as the baseline on its first startup.
+            let mut file = locked.get().clone();
+            file.agent = Some(AgentBinding {
+                token_digest: Some(digest),
+                ..binding.clone()
+            });
+            locked.commit(file).await?;
+        }
+        Ok(Some(manager))
+    }
+
+    #[cfg(feature = "singbox-core")]
+    pub(crate) async fn agent_deployment_needs_retirement(&self) -> bool {
+        self.file
+            .read(|file| {
+                file.agent
+                    .as_ref()
+                    .is_some_and(|binding| binding.retire_deployment)
+            })
+            .await
+    }
+
+    #[cfg(feature = "singbox-core")]
+    pub(crate) async fn finish_agent_deployment_retirement(&self) -> Result<(), Error> {
+        let locked = self.file.lock().await;
+        let mut file = locked.get().clone();
+        let binding = file.agent.as_mut().ok_or(Error::Unauthorized)?;
+        binding.retire_deployment = false;
+        Ok(locked.commit(file).await?)
     }
 
     pub(crate) async fn agent_host(&self, id: Uuid) -> Result<Host, Error> {
@@ -609,136 +704,15 @@ impl Peers {
         Ok(host)
     }
 
-    /// The Agent side of pairing: prove the invitation, then remember the
-    /// manager this instance will dial. Only one upstream is kept, and pairing is
-    /// never retried automatically.
-    pub(crate) async fn join_agent(
-        &self,
-        signer: &IdentitySigner,
-        invitation: Invitation,
-        proxy: Option<String>,
-    ) -> Result<AgentUpstream, Error> {
-        if invitation.mode != Mode::Agent {
-            return Err(Error::PeerRequest {
-                reason: "invitation.mode: this invitation is for a Direct connection",
-            });
-        }
-        let endpoint = endpoint(&invitation.endpoint, Mode::Agent)?;
-        invitation.identity.key()?;
-        if invitation.version != 1
-            || invitation.identity.id == signer.identity.id
-            || invitation.identity.fingerprint == signer.identity.fingerprint
-            || invitation.secret.len() != 64
-            || !invitation
-                .secret
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(Error::PeerRequest {
-                reason: "invitation: invalid invitation or the local instance",
-            });
-        }
-        let proxy = proxy.map(|url| proxy_url(&url)).transpose()?.flatten();
-        if self.agent_upstream().await.is_some() {
-            return Err(Error::PeerConflict {
-                reason: "agent: this instance already has an upstream manager; disconnect first",
-            });
-        }
-        let challenge = self
-            .remote_challenge(
-                signer,
-                &endpoint,
-                &invitation.identity,
-                Some(invitation.id),
-                Purpose::AgentPair,
-            )
-            .await?;
-        let receipt: Signed<PairReceipt> = self
-            .post(
-                &endpoint,
-                Mode::Agent,
-                "pairings",
-                &signer.sign(
-                    "pair",
-                    PairClaim {
-                        invitation_proof: invitation_proof(&invitation.secret, &challenge)?,
-                        challenge: challenge.clone(),
-                    },
-                )?,
-            )
-            .await
-            .map_err(|_| Error::PeerUncertain)?;
-        receipt
-            .verify("paired", &invitation.identity)
-            .map_err(|_| Error::PeerUncertain)?;
-        if receipt.payload.nonce != challenge.nonce
-            || receipt.payload.actor != signer.identity.id
-            || receipt.payload.target != invitation.identity
-        {
-            return Err(Error::PeerUncertain);
-        }
-        let link = AgentUpstream {
-            manager: invitation.identity,
-            endpoint,
-            proxy,
+    /// Discard the pinned Manager when the operator explicitly unbinds.
+    pub(crate) async fn unbind_agent(&self) -> Result<(), Error> {
+        let locked = self.file.lock().await;
+        let mut file = locked.get().clone();
+        let Some(binding) = file.agent.take() else {
+            return Ok(());
         };
-        let locked = self.file.lock().await;
-        let mut file = locked.get().clone();
-        if file.agent.is_some() {
-            return Err(Error::PeerConflict {
-                reason: "agent: this instance already has an upstream manager; disconnect first",
-            });
-        }
-        file.agent = Some(link.clone());
-        // The manager that invited this instance is the one allowed to operate it.
-        file.trusted.insert(
-            link.manager.id,
-            TrustedPeer {
-                id: link.manager.id,
-                name: "Manager".to_string(),
-                public_key: link.manager.public_key.clone(),
-                fingerprint: link.manager.fingerprint.clone(),
-            },
-        );
-        locked
-            .commit(file)
-            .await
-            .map_err(|_| Error::PeerUncertain)?;
-        self.agent.reconnect();
-        Ok(link)
-    }
-
-    pub(crate) async fn leave_agent(&self) -> Result<(), Error> {
-        let locked = self.file.lock().await;
-        let mut file = locked.get().clone();
-        let link = file.agent.take().ok_or(Error::PeerNotFound)?;
-        // Leaving also revokes the manager's incoming resource grant.
-        file.trusted.remove(&link.manager.id);
-        locked.commit(file).await?;
-        // A configuration change, not a process shutdown: the loop stays alive to
-        // notice the upstream is gone and to accept a new one later.
-        self.agent.reconnect();
-        Ok(())
-    }
-
-    pub(crate) async fn edit_agent_upstream(
-        &self,
-        endpoint: Option<String>,
-        proxy: Option<Option<String>>,
-    ) -> Result<AgentUpstream, Error> {
-        let locked = self.file.lock().await;
-        let mut file = locked.get().clone();
-        let link = file.agent.as_mut().ok_or(Error::PeerNotFound)?;
-        if let Some(url) = endpoint {
-            link.endpoint = super::peers::endpoint(&url, Mode::Agent)?;
-        }
-        if let Some(proxy) = proxy {
-            link.proxy = proxy.map(|url| proxy_url(&url)).transpose()?.flatten();
-        }
-        let result = link.clone();
-        locked.commit(file).await?;
-        self.agent.reconnect();
-        Ok(result)
+        file.trusted.remove(&binding.manager.id);
+        Ok(locked.commit(file).await?)
     }
 
     async fn challenge_actor(
@@ -817,37 +791,27 @@ pub(crate) fn outbound_builder(proxy: Option<&str>) -> Result<reqwest::ClientBui
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5));
-    match proxy {
-        None => Ok(builder),
-        Some(url) => Ok(builder.proxy(
-            reqwest::Proxy::all(proxy_url(url)?.ok_or(Error::PeerRequest {
-                reason: "proxy: expected an HTTP or HTTPS proxy URL",
-            })?)
-            .map_err(|_| Error::PeerRequest {
-                reason: "proxy: expected an HTTP or HTTPS proxy URL",
-            })?,
-        )),
-    }
-}
-
-/// Validate an optional proxy URL: HTTP or HTTPS, a host and port, no path.
-fn proxy_url(value: &str) -> Result<Option<String>, Error> {
-    let invalid = || Error::PeerRequest {
-        reason: "proxy: use an HTTP or HTTPS proxy URL without a path, query or fragment",
+    let Some(value) = proxy else {
+        return Ok(builder);
     };
-    if value.trim().is_empty() {
-        return Ok(None);
-    }
+    let invalid = || Error::PeerRequest {
+        reason: "agent-proxy: use an HTTP or HTTPS proxy URL without a path, query or fragment",
+    };
     let url = url::Url::parse(value).map_err(|_| invalid())?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host().is_none()
-        || !matches!(url.path(), "" | "/")
+        || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || value.contains('\\')
     {
         return Err(invalid());
     }
-    Ok(Some(url.as_str().trim_end_matches('/').to_string()))
+    let proxy = reqwest::Proxy::all(url).map_err(|_| invalid())?;
+    Ok(builder.proxy(proxy))
 }
 
 pub(crate) fn manager_endpoint(value: &str) -> Result<String, Error> {

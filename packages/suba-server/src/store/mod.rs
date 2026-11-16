@@ -23,7 +23,7 @@ mod file;
 #[cfg(test)]
 mod memory;
 
-pub(crate) use file::FileStore;
+pub(crate) use file::{lock_data, FileStore};
 #[cfg(test)]
 pub(crate) use memory::MemoryStore;
 

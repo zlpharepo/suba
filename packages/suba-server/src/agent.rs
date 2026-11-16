@@ -1,29 +1,47 @@
-use crate::{state::peers, AppState, Error};
+use std::time::Duration;
 
-/// Startup inputs are separate from the persisted machine identity: the token
-/// is consumed only while establishing the first manager binding.
+use crate::{
+    state::peers::{self, Identity},
+    AppState, Error,
+};
+
+/// Startup inputs are separate from machine identity and the active Manager binding.
 pub struct AgentOptions {
     pub manager_api_url: String,
     pub token: Option<String>,
+    pub proxy: Option<String>,
 }
 
-pub(crate) async fn pair(state: &AppState, options: AgentOptions) -> Result<(), Error> {
+pub(crate) struct Upstream {
+    pub(crate) endpoint: String,
+    pub(crate) manager: Identity,
+    pub(crate) client: reqwest::Client,
+}
+
+pub(crate) async fn upstream(state: &AppState, options: AgentOptions) -> Result<Upstream, Error> {
     let endpoint = peers::manager_endpoint(&options.manager_api_url)?;
-    if let Some(upstream) = state.peers().agent_upstream().await {
-        if upstream.endpoint != endpoint {
-            return Err(Error::PeerConflict {
-                reason: "manager-api-url: does not match the paired manager",
-            });
+    let client = peers::outbound_builder(options.proxy.as_deref())?
+        .http1_only()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| Error::PeerUnavailable)?;
+    let token = options.token.as_deref().filter(|token| !token.is_empty());
+    let manager = match state.peers().reusable_agent_binding(token).await? {
+        Some(manager) => manager,
+        None => {
+            let token = token.ok_or(Error::PeerRequest {
+                reason: "agent-token: required for initial pairing",
+            })?;
+            let signer = state.settings().peer_signer().await?;
+            state
+                .peers()
+                .pair_agent(&client, &signer, &endpoint, token)
+                .await?
         }
-        return state
-            .peers()
-            .agent_manager_authorized(&upstream.manager)
-            .await;
-    }
-    let token = options.token.ok_or(Error::PeerRequest {
-        reason: "agent-token: required for initial pairing",
-    })?;
-    let signer = state.settings().peer_signer().await?;
-    state.peers().pair_agent(&signer, &endpoint, &token).await?;
-    Ok(())
+    };
+    Ok(Upstream {
+        endpoint,
+        manager,
+        client,
+    })
 }

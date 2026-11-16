@@ -21,7 +21,12 @@ pub use state::AppState;
 
 pub struct SubaServer {
     state: AppState,
-    tcp: Option<tokio::net::TcpListener>,
+    service: Service,
+}
+
+enum Service {
+    Manager(tokio::net::TcpListener),
+    Agent(agent::Upstream),
 }
 
 impl SubaServer {
@@ -31,19 +36,33 @@ impl SubaServer {
 
         Ok(Self {
             state,
-            tcp: Some(tcp),
+            service: Service::Manager(tcp),
         })
     }
 
     pub async fn agent(config: ServerConfig, options: AgentOptions) -> Result<Self, Error> {
         let state = AppState::build_agent(&config).await?;
-        agent::pair(&state, options).await?;
+        let upstream = agent::upstream(&state, options).await?;
         #[cfg(feature = "singbox-core")]
         {
+            if state.peers().agent_deployment_needs_retirement().await {
+                let store = state.singbox();
+                tokio::task::spawn_blocking(move || store.retire_deployment()).await??;
+                state.peers().finish_agent_deployment_retirement().await?;
+            }
             let store = state.singbox();
             tokio::task::spawn_blocking(move || store.restore_deployment()).await??;
         }
-        Ok(Self { state, tcp: None })
+        Ok(Self {
+            state,
+            service: Service::Agent(upstream),
+        })
+    }
+
+    /// Clear the Agent's local Manager binding while the instance is stopped.
+    pub async fn unbind_agent(config: &ServerConfig) -> Result<(), Error> {
+        let state = AppState::build_agent(config).await?;
+        state.peers().unbind_agent().await
     }
 
     pub async fn serve(self) -> Result<(), Error> {
@@ -68,10 +87,12 @@ impl SubaServer {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
         drain_timeout: std::time::Duration,
     ) -> Result<(), Error> {
-        if self.state.is_agent() {
-            return self.serve_agent_until(shutdown).await;
-        }
-        let tcp = self.tcp.expect("manager listener");
+        let tcp = match self.service {
+            Service::Agent(upstream) => {
+                return Self::serve_agent_until(self.state, upstream, shutdown).await;
+            }
+            Service::Manager(tcp) => tcp,
+        };
         let router = routers::AppRouter::route(self.state.web_dir()).with_state(self.state.clone());
 
         // Providers start refreshing as soon as the server does, so a
@@ -154,25 +175,26 @@ impl SubaServer {
     }
 
     async fn serve_agent_until(
-        self,
+        state: AppState,
+        upstream: agent::Upstream,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), Error> {
-        let agent_session = tokio::spawn(state::peers::agent::run(self.state.clone()));
+        let agent_session = tokio::spawn(state::peers::agent::run(state.clone(), upstream));
         #[cfg(feature = "singbox-core")]
-        let observing = tokio::spawn(self.state.observation().run(self.state.singbox()));
+        let observing = tokio::spawn(state.observation().run(state.singbox()));
         #[cfg(feature = "singbox-core")]
-        let starting = tokio::spawn(handlers::singbox::autostart(self.state.clone()));
+        let starting = tokio::spawn(handlers::singbox::autostart(state.clone()));
         shutdown.await;
-        self.state.peers().agent.shutdown();
+        state.peers().agent.shutdown();
         agent_session.abort();
         let _ = agent_session.await;
         #[cfg(feature = "singbox-core")]
         {
-            self.state.singbox().begin_shutdown();
+            state.singbox().begin_shutdown();
             observing.abort();
             let _ = observing.await;
             let _ = starting.await;
-            let store = self.state.singbox();
+            let store = state.singbox();
             tokio::task::spawn_blocking(move || store.shutdown(std::time::Duration::from_secs(10)))
                 .await??;
         }
