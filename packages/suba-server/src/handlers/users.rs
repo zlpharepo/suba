@@ -453,7 +453,7 @@ pub async fn put(
             let host = state.peers().host(id).await?;
             if host.mode != crate::state::peers::Mode::Edge {
                 return Err(Error::Document(
-                    "inbounds.host: expected an Edge Agent".to_string(),
+                    "inbounds.host: expected an Agent".to_string(),
                 ));
             }
             let scoped = state.for_agent(id).await?;

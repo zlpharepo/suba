@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long, env = "SUBA_GROUP")]
     group: Option<u32>,
 
-    /// Run as an Edge Agent controlled by one manager
+    /// Run as an Agent controlled by one manager
     #[arg(long, env = "SUBA_AGENT", requires = "manager_api_url")]
     agent: bool,
 

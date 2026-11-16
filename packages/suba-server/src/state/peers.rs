@@ -3,7 +3,7 @@
 //! Only public identities and connection addresses persist. Invitations and
 //! replay challenges expire in memory; restarting invalidates them. A peer
 //! proof authorizes a bounded resource router, never login or further delegation.
-//! Edge identities can establish sessions but cannot operate manager resources.
+//! Agent identities can establish sessions but cannot operate manager resources.
 
 pub(crate) mod edge;
 mod identity;
@@ -582,7 +582,7 @@ impl Peers {
         Ok(host)
     }
 
-    /// The node side of an Edge pairing: prove the invitation, then remember the
+    /// The Agent side of pairing: prove the invitation, then remember the
     /// manager this instance will dial. Only one upstream is kept, and pairing is
     /// never retried automatically.
     pub(crate) async fn join_edge(

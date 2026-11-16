@@ -169,7 +169,7 @@ pub async fn execute(
 }
 
 /// Run one signed resource request against the local resource router and sign the
-/// result. Shared by Direct forwarding and the agent side of an Edge session, so
+/// result. Shared by Direct forwarding and the Agent side of a managed session, so
 /// both paths enforce the same scope, size and header rules.
 pub(crate) async fn execute_resource(
     state: AppState,
@@ -362,7 +362,7 @@ fn reply_header(name: &str) -> bool {
     )
 }
 
-/// One resource exchange over a live Edge session: the challenge is asked first,
+/// One resource exchange over a live Agent session: the challenge is asked first,
 /// then the resource itself, both as manager-initiated calls.
 async fn edge_forward(
     state: &AppState,

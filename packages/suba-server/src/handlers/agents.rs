@@ -1,4 +1,4 @@
-//! Edge resources keep desired documents on the manager and runtime facts on
+//! Agent resources keep desired documents on the manager and runtime facts on
 //! the node. Direct requests retain their independent-instance ownership.
 
 use axum::{
