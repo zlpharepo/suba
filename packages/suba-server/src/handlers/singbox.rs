@@ -19,12 +19,13 @@ use serde_json::Value;
 use suba_singbox::assemble;
 use suba_singbox::core::{Release, Version};
 use suba_singbox::install::{Generate, Needs};
-use suba_singbox::run::{self, Exit, Status};
+use suba_singbox::run::{self, Exit};
 
 use crate::{
     dto::{Operator, ResponseResult},
     error::Error,
     handlers::collections::outbounds_of,
+    state::metrics::ProcessUsage,
     state::singbox::{
         Changes, Contributions, ConversionSkip, Document, InstallationTask, Privilege,
         RuntimePhase, Saved, SingboxStore, Tag,
@@ -137,10 +138,23 @@ pub struct Running {
     pub running: bool,
     pub pid: Option<u32>,
     pub started_at: Option<i64>,
+    pub process: Option<ProcessUsage>,
     /// The last ways it ended, oldest first.
     pub exits: Vec<Exit>,
     /// The end of the core's own output, oldest first.
     pub log: Vec<String>,
+}
+
+fn running_view(store: &SingboxStore, tail: usize) -> Running {
+    let (status, process) = store.status_with_usage();
+    Running {
+        running: status.running,
+        pid: status.pid,
+        started_at: status.started_at,
+        process,
+        exits: status.exits,
+        log: store.log(tail),
+    }
 }
 
 /// How much of the log a caller asked for.
@@ -300,18 +314,7 @@ pub async fn status(
     let tail = query.tail.unwrap_or(run::LOG_LINES).min(run::LOG_LINES);
 
     Ok(Json(
-        tokio::task::spawn_blocking(move || {
-            let status = store.status();
-
-            Running {
-                running: status.running,
-                pid: status.pid,
-                started_at: status.started_at,
-                exits: status.exits,
-                log: store.log(tail),
-            }
-        })
-        .await?,
+        tokio::task::spawn_blocking(move || running_view(&store, tail)).await?,
     ))
 }
 
@@ -357,15 +360,7 @@ pub async fn act(
                     }
                 }
             }
-            let status: Status = store.status();
-
-            Ok(Running {
-                running: status.running,
-                pid: status.pid,
-                started_at: status.started_at,
-                exits: status.exits,
-                log: store.log(tail),
-            })
+            Ok(running_view(&store, tail))
         })
         .await??,
     ))

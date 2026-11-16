@@ -41,7 +41,10 @@ use suba_singbox::run::{self, Runner, Status};
 use suba_singbox::schema::{Schema, Skipped, Verdict};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::observation::Run as ObservedRun;
+use super::{
+    metrics::{ProcessSampler, ProcessUsage},
+    observation::Run as ObservedRun,
+};
 use crate::{error::Error, fs, identity::Identity};
 
 mod bindings;
@@ -313,6 +316,7 @@ pub(crate) struct SingboxStore {
     releases: AsyncMutex<Option<ReleasesCache>>,
     /// The process, which outlives any request that touched it.
     runner: Arc<Runner>,
+    process_sampler: Mutex<Option<ProcessSampler>>,
     /// Which version was started, while that process is the one in the runner.
     started: Mutex<Option<Version>>,
     /// Observation follows the launched product even after selection or authored edits change.
@@ -351,6 +355,7 @@ impl SingboxStore {
             identity,
             releases: AsyncMutex::new(None),
             runner: Arc::new(Runner::new()),
+            process_sampler: Mutex::new(None),
             started: Mutex::new(None),
             observed_run: Mutex::new(None),
             applied: Mutex::new(None),
@@ -1461,6 +1466,26 @@ impl SingboxStore {
     /// What the process is doing.
     pub(crate) fn status(&self) -> Status {
         self.runner.status()
+    }
+
+    /// Sample only the managed child and discard the reading if that run ends during sampling.
+    pub(crate) fn status_with_usage(&self) -> (Status, Option<ProcessUsage>) {
+        let mut sampler = self.process_sampler.lock().expect("core process sampler");
+        let status = self.runner.status();
+        let Some(pid) = status.pid else {
+            sampler.take();
+            return (status, None);
+        };
+        let usage = sampler.get_or_insert_with(ProcessSampler::default).sample(
+            sysinfo::Pid::from_u32(pid),
+            Some(sysinfo::Pid::from_u32(std::process::id())),
+        );
+        let current = self.runner.status();
+        if current.pid != status.pid || current.started_at != status.started_at {
+            sampler.take();
+            return (current, None);
+        }
+        (current, usage)
     }
 
     /// The last `tail` lines the core printed.

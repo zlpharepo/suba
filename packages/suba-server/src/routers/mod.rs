@@ -315,6 +315,16 @@ mod tests {
         assert!(metrics["memory"]["total"].as_u64().unwrap() > 0);
         assert!(metrics["network"]["received"].is_u64());
         assert!(metrics["host"]["arch"].is_string());
+        assert!(metrics["process"]["memory_bytes"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(metrics["process"]["cpu_usage"], serde_json::Value::Null);
+
+        tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+        let next = server
+            .authed(reqwest::Method::GET, "/api/system/metrics")
+            .send()
+            .await
+            .unwrap();
+        assert!(body(next).await["process"]["cpu_usage"].is_number());
     }
 
     /// A token listed later is the one minted, with a path that serves it.

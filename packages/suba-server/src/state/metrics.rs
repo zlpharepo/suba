@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use serde::Serialize;
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// The machine, as one request sees it.
 #[derive(Debug, Serialize)]
@@ -19,6 +19,7 @@ pub struct Metrics {
     pub memory: Memory,
     pub disk: Option<Disk>,
     pub network: Network,
+    pub process: Option<ProcessUsage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -65,8 +66,61 @@ pub struct Network {
     pub transmit_rate: Option<f64>,
 }
 
+/// CPU and resident memory for a single process.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ProcessUsage {
+    /// Percent of one logical CPU, available after two samples.
+    pub cpu_usage: Option<f32>,
+    pub memory_bytes: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct ProcessSampler {
+    system: System,
+    previous: Option<(Pid, Instant, ProcessUsage)>,
+}
+
+impl ProcessSampler {
+    pub(crate) fn sample(&mut self, pid: Pid, parent: Option<Pid>) -> Option<ProcessUsage> {
+        if let Some((previous_pid, sampled_at, usage)) = self.previous.take() {
+            if previous_pid != pid {
+                self.system = System::new();
+            } else if sampled_at.elapsed() < sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
+                // Overlapping polls must not consume the CPU baseline.
+                self.previous = Some((pid, sampled_at, usage));
+                return Some(usage);
+            }
+        }
+
+        let start_time = self.system.process(pid).map(sysinfo::Process::start_time);
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing()
+                .with_cpu()
+                .with_memory()
+                .without_tasks(),
+        );
+        let process = self.system.process(pid)?;
+        let memory_bytes = process.memory();
+        if memory_bytes == 0 || parent.is_some_and(|parent| process.parent() != Some(parent)) {
+            self.system = System::new();
+            return None;
+        }
+        let usage = ProcessUsage {
+            cpu_usage: (start_time == Some(process.start_time()))
+                .then(|| process.cpu_usage())
+                .filter(|value| value.is_finite()),
+            memory_bytes,
+        };
+        self.previous = Some((pid, Instant::now(), usage));
+        Some(usage)
+    }
+}
+
 struct Sampler {
     system: System,
+    process: ProcessSampler,
     networks: Networks,
     disks: Disks,
     /// When the previous sample was taken, which makes the counters a rate.
@@ -85,6 +139,7 @@ impl MetricsStore {
         Self {
             sampler: Mutex::new(Sampler {
                 system: System::new(),
+                process: ProcessSampler::default(),
                 networks: Networks::new_with_refreshed_list(),
                 disks: Disks::new_with_refreshed_list(),
                 previous: None,
@@ -148,6 +203,9 @@ impl MetricsStore {
                 receive_rate: elapsed.map(|seconds| delta_in as f64 / seconds),
                 transmit_rate: elapsed.map(|seconds| delta_out as f64 / seconds),
             },
+            process: sampler
+                .process
+                .sample(Pid::from_u32(std::process::id()), None),
         };
 
         sampler.previous = Some(now);

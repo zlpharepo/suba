@@ -306,10 +306,17 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
     assert_eq!(users[0]["grants"][0]["host"], id.to_string());
 
     let status = format!("{module}/status");
-    assert_eq!(
-        put(&manager, &status, json!({"action": "start"})).await["running"],
-        true
-    );
+    let stopped = get(&manager, &status).await;
+    let started = put(&manager, &status, json!({"action": "start"})).await;
+    assert_eq!(started["running"], true);
+    assert!(started["process"]["memory_bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(started["process"]["cpu_usage"], Value::Null);
+    assert_eq!(stopped.get("process"), Some(&Value::Null));
+
+    tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+    let running = get(&manager, &status).await;
+    assert_eq!(running["pid"], started["pid"]);
+    assert!(running["process"]["cpu_usage"].is_number());
     let product = agent.state.singbox().product().unwrap();
     let credential = product["inbounds"][0]["users"][0]["uuid"].as_str().unwrap();
     let users = get(&manager, "/api/inbounds/users").await;
@@ -351,10 +358,10 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         get(&manager, "/api/inbounds/users").await[0]["grants"][0]["state"],
         "pending"
     );
-    assert_eq!(
-        put(&manager, &status, json!({"action": "restart"})).await["running"],
-        true
-    );
+    let restarted = put(&manager, &status, json!({"action": "restart"})).await;
+    assert_eq!(restarted["running"], true);
+    assert!(restarted["process"]["memory_bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(restarted["process"]["cpu_usage"], Value::Null);
     assert_eq!(
         agent.state.singbox().product().unwrap()["inbounds"][0]["listen_port"],
         19100
