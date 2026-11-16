@@ -64,7 +64,7 @@ The Docker examples use host networking on Linux so sing-box can listen directly
 
 ```sh
 docker run -d --name suba --restart unless-stopped --network host \
-  -e SUBA_HOST=127.0.0.1 \
+  -e SUBA_HOST=0.0.0.0 \
   -v suba-config:/app/config \
   -v suba-data:/app/data \
   ghcr.io/zlpharepo/suba:latest
@@ -81,7 +81,7 @@ services:
     network_mode: host
     restart: unless-stopped
     environment:
-      SUBA_HOST: 127.0.0.1
+      SUBA_HOST: 0.0.0.0
     volumes:
       - suba-config:/app/config
       - suba-data:/app/data
