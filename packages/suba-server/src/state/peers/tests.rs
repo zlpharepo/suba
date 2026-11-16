@@ -259,7 +259,7 @@ async fn an_invitation_mac_cannot_be_transplanted_to_another_identity_or_challen
 }
 
 #[tokio::test]
-async fn an_edge_agent_is_trusted_for_sessions_but_not_manager_resources() {
+async fn an_agent_is_trusted_for_sessions_but_not_manager_resources() {
     let scratch = Scratch::new();
     let store = scratch.store();
     let manager = signer();

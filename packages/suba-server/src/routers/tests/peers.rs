@@ -430,7 +430,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         data_dir: root.join("data"),
         privileged: Default::default(),
     };
-    let missing = crate::SubaServer::edge_agent(
+    let missing = crate::SubaServer::agent(
         make_config(),
         crate::AgentOptions {
             manager_api_url: format!("{manager_endpoint}/api"),
@@ -455,7 +455,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         invitation["id"].as_str().unwrap(),
         invitation["secret"].as_str().unwrap()
     );
-    let agent = crate::SubaServer::edge_agent(
+    let agent = crate::SubaServer::agent(
         make_config(),
         crate::AgentOptions {
             manager_api_url: format!("{manager_endpoint}/api"),
@@ -520,7 +520,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         .unwrap()
         .unwrap()
         .unwrap();
-    let restarted = crate::SubaServer::edge_agent(
+    let restarted = crate::SubaServer::agent(
         make_config(),
         crate::AgentOptions {
             manager_api_url: format!("{manager_endpoint}/api"),
@@ -544,7 +544,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
         std::fs::read_to_string(config_dir.join(crate::config::config_name("peers"))).unwrap();
     assert!(!saved.contains(&token));
     assert!(!saved.contains(invitation["secret"].as_str().unwrap()));
-    let changed = crate::SubaServer::edge_agent(
+    let changed = crate::SubaServer::agent(
         make_config(),
         crate::AgentOptions {
             manager_api_url: "http://127.0.0.1:1/api".into(),

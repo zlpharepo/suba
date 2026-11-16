@@ -12,7 +12,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && mkdir -p /app/config /app/data && chown -R 10001:10001 /app
 COPY --from=build /source/target/release/suba /usr/local/bin/suba
 COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-ENV HOST=0.0.0.0 PORT=8090 CONFIG=/app/config DATA=/app/data PUID=10001 PGID=10001 TZ=Etc/UTC
+ENV SUBA_HOST=0.0.0.0 SUBA_PORT=8090 SUBA_CONFIG=/app/config SUBA_DATA=/app/data PUID=10001 PGID=10001 TZ=Etc/UTC
 WORKDIR /app
 EXPOSE 8090
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

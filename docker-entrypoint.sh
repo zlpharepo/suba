@@ -12,7 +12,7 @@ esac
 
 if [ "$(id -u)" -eq 0 ]; then
   # Docker may create bind-mount directories as root before this script runs.
-  for dir in "${CONFIG:-/app/config}" "${DATA:-/app/data}"; do
+  for dir in "${SUBA_CONFIG:-/app/config}" "${SUBA_DATA:-/app/data}"; do
     mkdir -p "$dir"
     if [ "$PUID" -ne 0 ]; then
       chown -R "$PUID:$PGID" "$dir"

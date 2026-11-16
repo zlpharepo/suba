@@ -10,19 +10,19 @@ use suba_server::{tracing, AgentOptions, Privileged, ServerConfig, SubaServer};
 #[command(propagate_version = true)]
 struct Cli {
     /// Specify hostname
-    #[arg(long, env = "HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = "SUBA_HOST", default_value = "127.0.0.1")]
     host: String,
 
     /// Specify port
-    #[arg(short, long, env = "PORT", default_value_t = 8090)]
+    #[arg(short, long, env = "SUBA_PORT", default_value_t = 8090)]
     port: u16,
 
     /// Path to use for configurations
-    #[arg(short, long, env = "CONFIG", default_value = "config")]
+    #[arg(short, long, env = "SUBA_CONFIG", default_value = "config")]
     config: String,
 
     /// Path to use for the working directory
-    #[arg(short, long, env = "DATA", default_value = "data")]
+    #[arg(short, long, env = "SUBA_DATA", default_value = "data")]
     data: String,
 
     /// Run as a service
@@ -31,7 +31,7 @@ struct Cli {
 
     /// Allow this instance to run as root, which a core that creates an
     /// interface needs (a `tun` inbound, or `tproxy`/`redirect` on Linux)
-    #[arg(long, env = "RUN_AS_ROOT", default_value = "false")]
+    #[arg(long, env = "SUBA_RUN_AS_ROOT", default_value = "false")]
     run_as_root: bool,
 
     /// The user whose files this instance is holding, for a run that is root:
@@ -45,15 +45,15 @@ struct Cli {
     group: Option<u32>,
 
     /// Run as an Edge Agent controlled by one manager
-    #[arg(long, env = "EDGE_AGENT", requires = "manager_api_url")]
-    edge_agent: bool,
+    #[arg(long, env = "SUBA_AGENT", requires = "manager_api_url")]
+    agent: bool,
 
     /// Manager API base URL, including any reverse-proxy prefix and /api
-    #[arg(long, env = "MANAGER_API_URL", requires = "edge_agent")]
+    #[arg(long, env = "SUBA_MANAGER_API_URL", requires = "agent")]
     manager_api_url: Option<String>,
 
     /// One-time invitation token for initial Agent pairing
-    #[arg(long, env = "AGENT_TOKEN", requires = "edge_agent")]
+    #[arg(long, env = "SUBA_AGENT_TOKEN", requires = "agent")]
     agent_token: Option<String>,
 }
 
@@ -75,8 +75,8 @@ impl Cli {
             },
         };
 
-        let server = if self.edge_agent {
-            SubaServer::edge_agent(
+        let server = if self.agent {
+            SubaServer::agent(
                 config,
                 AgentOptions {
                     manager_api_url: self.manager_api_url.clone().expect("required by clap"),
@@ -157,8 +157,8 @@ mod tests {
     fn agent_mode_is_explicit_and_requires_its_manager() {
         let _lock = ENV_LOCK.lock().unwrap();
         let cli = Cli::try_parse_from(["suba"]).unwrap_or_else(|_| panic!("default CLI"));
-        assert!(!cli.edge_agent);
-        assert!(Cli::try_parse_from(["suba", "--edge-agent"]).is_err());
+        assert!(!cli.agent);
+        assert!(Cli::try_parse_from(["suba", "--agent"]).is_err());
         assert!(Cli::try_parse_from([
             "suba",
             "--manager-api-url",
@@ -167,12 +167,12 @@ mod tests {
         .is_err());
         let cli = Cli::try_parse_from([
             "suba",
-            "--edge-agent",
+            "--agent",
             "--manager-api-url",
             "https://manager.example.invalid/api",
         ])
         .unwrap_or_else(|_| panic!("agent CLI"));
-        assert!(cli.edge_agent);
+        assert!(cli.agent);
         assert!(cli.agent_token.is_none());
         assert!(Cli::try_parse_from(["suba", "--agent-token", "fixture"]).is_err());
     }
@@ -181,20 +181,29 @@ mod tests {
     fn container_environment_configures_agent_and_cli_overrides_it() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _restore = environment(&[
-            ("HOST", "0.0.0.0"),
-            ("PORT", "18090"),
-            ("CONFIG", "/app/config"),
-            ("DATA", "/app/data"),
-            ("EDGE_AGENT", "true"),
-            ("MANAGER_API_URL", "https://manager.example.invalid/api"),
-            ("AGENT_TOKEN", "fixture-token"),
+            ("SUBA_HOST", "0.0.0.0"),
+            ("SUBA_PORT", "18090"),
+            ("SUBA_CONFIG", "/app/config"),
+            ("SUBA_DATA", "/app/data"),
+            ("SUBA_RUN_AS_ROOT", "true"),
+            ("SUBA_USER", "10001"),
+            ("SUBA_GROUP", "10002"),
+            ("SUBA_AGENT", "true"),
+            (
+                "SUBA_MANAGER_API_URL",
+                "https://manager.example.invalid/api",
+            ),
+            ("SUBA_AGENT_TOKEN", "fixture-token"),
         ]);
         let cli = Cli::try_parse_from(["suba"]).unwrap();
-        assert!(cli.edge_agent);
+        assert!(cli.agent);
         assert_eq!(cli.host, "0.0.0.0");
         assert_eq!(cli.port, 18090);
         assert_eq!(cli.config, "/app/config");
         assert_eq!(cli.data, "/app/data");
+        assert!(cli.run_as_root);
+        assert_eq!(cli.user, Some(10001));
+        assert_eq!(cli.group, Some(10002));
         assert_eq!(
             cli.manager_api_url.as_deref(),
             Some("https://manager.example.invalid/api")

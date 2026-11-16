@@ -162,7 +162,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         invitation["id"].as_str().unwrap(),
         invitation["secret"].as_str().unwrap()
     );
-    let node = SubaServer::edge_agent(
+    let node = SubaServer::agent(
         server_config(),
         AgentOptions {
             manager_api_url: format!("{}/api", manager.base),
@@ -414,7 +414,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
     );
     manager.task.abort();
 
-    let node = SubaServer::edge_agent(
+    let node = SubaServer::agent(
         server_config(),
         AgentOptions {
             manager_api_url: format!("{}/api", manager.base),

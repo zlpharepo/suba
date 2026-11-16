@@ -35,7 +35,7 @@ impl SubaServer {
         })
     }
 
-    pub async fn edge_agent(config: ServerConfig, options: AgentOptions) -> Result<Self, Error> {
+    pub async fn agent(config: ServerConfig, options: AgentOptions) -> Result<Self, Error> {
         let state = AppState::build_agent(&config).await?;
         agent::pair(&state, options).await?;
         #[cfg(feature = "singbox-core")]

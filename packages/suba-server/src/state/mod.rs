@@ -88,7 +88,7 @@ impl AppState {
     pub(crate) async fn build_agent(config: &ServerConfig) -> Result<Self, Error> {
         if !cfg!(feature = "singbox-core") {
             return Err(Error::PeerRequest {
-                reason: "edge-agent: this build cannot run a core",
+                reason: "agent: this build cannot run a core",
             });
         }
         Self::build_for(config, true).await
