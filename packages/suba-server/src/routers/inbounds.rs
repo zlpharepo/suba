@@ -10,7 +10,7 @@
 //! configuration's document is what names the inbounds each answer is about.
 
 use axum::{
-    routing::{delete, get, put},
+    routing::{get, post, put},
     Router,
 };
 
@@ -20,7 +20,7 @@ pub fn route() -> Router<AppState> {
     Router::new()
         .route("/users", get(users::index))
         .route("/users/{name}", put(users::put).delete(users::delete))
-        .route("/users/{name}/credentials", delete(users::renew))
+        .route("/users/{name}/credentials/rotate", post(users::renew))
         .route("/users/{name}/content", get(users::content))
         .route(
             "/users/{name}/tokens/{token}",

@@ -469,6 +469,40 @@ async fn changed_endpoints_cannot_change_the_pinned_remote_identity() {
 
 #[cfg(feature = "singbox-core")]
 #[tokio::test]
+async fn rotating_credentials_through_direct_only_changes_the_remote_user() {
+    fn user_secret(server: &Server) -> String {
+        let users: crate::state::access::UsersConfig =
+            crate::config::read_config(server.root.join("config").to_str().unwrap(), "users")
+                .unwrap();
+        users.users["example"].secret.clone()
+    }
+
+    let local = Server::start().await;
+    let remote = Server::start().await;
+    for server in [&local, &remote] {
+        let added = server
+            .put_json("/api/inbounds/users/example", json!({"inbounds": []}))
+            .await;
+        assert_eq!(added.status(), 204);
+    }
+    let local_secret = user_secret(&local);
+    let remote_secret = user_secret(&remote);
+    let host = pair(&local, &remote).await;
+    let response = local
+        .authed(
+            Method::POST,
+            &format!("/api/environments/{host}/inbounds/users/example/credentials/rotate"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert!(user_secret(&local) == local_secret);
+    assert!(user_secret(&remote) != remote_secret);
+}
+
+#[cfg(feature = "singbox-core")]
+#[tokio::test]
 async fn remote_config_writes_preserve_etags_and_do_not_touch_local_documents() {
     let local = Server::start().await;
     let remote = Server::start().await;

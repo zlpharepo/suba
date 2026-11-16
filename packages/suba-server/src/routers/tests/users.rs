@@ -148,13 +148,20 @@ async fn a_user_gets_a_node_per_inbound_and_a_subscription_of_their_own() {
     }
 
     let renewed = server
-        .authed(Method::DELETE, &format!("{USERS}/alice/credentials"))
+        .authed(Method::POST, &format!("{USERS}/alice/credentials/rotate"))
         .send()
         .await
         .unwrap();
     assert_eq!(renewed.status(), 204);
     let after = alice(&server).await["grants"][0]["link"].clone();
     assert_ne!(after, json!(link), "a new secret is a new credential");
+    let obsolete = server
+        .authed(Method::DELETE, &format!("{USERS}/alice/credentials"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(obsolete.status(), 405);
+    assert_eq!(alice(&server).await["grants"][0]["link"], after);
     assert_eq!(
         server
             .get(&format!("/s/{token}"))
