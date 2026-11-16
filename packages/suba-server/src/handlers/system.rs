@@ -67,6 +67,19 @@ pub struct SystemInfo {
     pub targets: Vec<TargetView>,
 }
 
+#[derive(Serialize)]
+pub struct SystemSummary {
+    version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    counts: Option<ResourceCounts>,
+}
+
+#[derive(Serialize)]
+struct ResourceCounts {
+    providers: usize,
+    collections: usize,
+}
+
 /// One target, as the API describes it.
 ///
 /// Written, never read: the names are the ones the model spells, so this is a
@@ -126,6 +139,24 @@ pub async fn info(_auth: Operator, State(state): State<AppState>) -> Json<System
         } else {
             targets()
         },
+    })
+}
+
+/// Use configuration counts so the overview can load even when an observation is unreadable.
+pub async fn summary(_auth: Operator, State(state): State<AppState>) -> Json<SystemSummary> {
+    let counts = if state.is_agent() {
+        None
+    } else {
+        let (providers, collections) =
+            tokio::join!(state.providers().count(), state.collections().count());
+        Some(ResourceCounts {
+            providers,
+            collections,
+        })
+    };
+    Json(SystemSummary {
+        version: VERSION,
+        counts,
     })
 }
 

@@ -148,6 +148,10 @@ impl ProviderStore {
         self.file.read(|config| config.providers.clone()).await
     }
 
+    pub(crate) async fn count(&self) -> usize {
+        self.file.read(|config| config.providers.len()).await
+    }
+
     pub(crate) async fn get(&self, name: &str) -> Option<Provider> {
         self.file
             .read(|config| config.providers.get(name).cloned())

@@ -221,7 +221,7 @@ pub(crate) fn resource_allowed(method: &str, path: &str) -> bool {
     let path = uri.path();
     if matches!(
         path,
-        "/system/status" | "/system/info" | "/system/metrics" | "/system/ping"
+        "/system/status" | "/system/info" | "/system/summary" | "/system/metrics" | "/system/ping"
     ) {
         return method == "GET";
     }

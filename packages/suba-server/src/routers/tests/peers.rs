@@ -174,6 +174,75 @@ async fn the_manager_web_server_has_no_agent_upstream_settings() {
 }
 
 #[tokio::test]
+async fn system_summary_counts_configured_resources_without_loading_observations() {
+    let manager = Server::start().await;
+    let remote = Server::start().await;
+    let path = "/api/system/summary";
+    assert_eq!(manager.get(path).send().await.unwrap().status(), 401);
+    let local = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "counts": {"providers": 0, "collections": 0}
+    });
+    assert_eq!(get(&manager, path).await, local);
+
+    for (name, disabled) in [("source", false), ("paused", true)] {
+        let response = remote
+            .put_json(
+                &format!("/api/providers/{name}"),
+                json!({
+                    "type": "inline",
+                    "payload": "trojan://fixture-password@proxy.example.invalid:443#example",
+                    "disabled": disabled
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 201);
+    }
+    let collection = remote
+        .put_json(
+            "/api/collections/example",
+            json!({"providers": ["source", "missing"]}),
+        )
+        .await;
+    assert_eq!(collection.status(), 201);
+    std::fs::write(remote.root.join("data/providers/source.json"), "{").unwrap();
+    let collections = remote
+        .authed(Method::GET, "/api/collections")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(collections.status(), 500);
+
+    let host = pair(&manager, &remote).await;
+    let forwarded = format!("/api/environments/{host}/system/summary");
+    let expected = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "counts": {"providers": 2, "collections": 1}
+    });
+    assert_eq!(get(&remote, path).await, expected);
+    assert_eq!(get(&manager, &forwarded).await, expected);
+    assert_eq!(get(&manager, path).await, local);
+
+    let identity = get(&manager, "/api/peers/identity").await;
+    let revoked = remote
+        .authed(
+            Method::DELETE,
+            &format!("/api/peers/{}", identity["id"].as_str().unwrap()),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), 204);
+    let failed = manager
+        .authed(Method::GET, &forwarded)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 502);
+    assert_eq!(get(&manager, path).await, local);
+}
+
+#[tokio::test]
 async fn direct_management_preserves_remote_ownership_and_local_authentication() {
     let local = Server::start().await;
     let remote = Server::start().await;
@@ -594,6 +663,10 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
     })
     .await
     .unwrap();
+    assert_eq!(
+        get(&manager, &format!("{prefix}/system/summary")).await,
+        json!({"version": env!("CARGO_PKG_VERSION")})
+    );
     for path in ["providers", "collections", "inbounds/users"] {
         assert_eq!(
             manager

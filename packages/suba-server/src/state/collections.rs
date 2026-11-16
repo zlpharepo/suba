@@ -60,6 +60,10 @@ impl CollectionStore {
         self.file.read(|config| config.collections.clone()).await
     }
 
+    pub(crate) async fn count(&self) -> usize {
+        self.file.read(|config| config.collections.len()).await
+    }
+
     pub(crate) async fn get(&self, name: &str) -> Option<Collection> {
         self.file
             .read(|config| config.collections.get(name).cloned())
