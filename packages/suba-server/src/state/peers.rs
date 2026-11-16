@@ -74,16 +74,6 @@ pub(crate) struct TrustedPeer {
     pub fingerprint: String,
 }
 
-impl TrustedPeer {
-    fn identity(&self) -> Identity {
-        Identity {
-            id: self.id,
-            public_key: self.public_key.clone(),
-            fingerprint: self.fingerprint.clone(),
-        }
-    }
-}
-
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Configuration {
     #[serde(default)]
@@ -92,6 +82,30 @@ struct Configuration {
     trusted: BTreeMap<Uuid, TrustedPeer>,
     #[serde(default)]
     agent: Option<AgentUpstream>,
+}
+
+impl Configuration {
+    fn is_agent_host(&self, id: &Uuid) -> bool {
+        self.hosts
+            .get(id)
+            .is_some_and(|host| host.mode == Mode::Agent)
+    }
+
+    fn is_direct_trust(&self, id: &Uuid) -> bool {
+        !self.is_agent_host(id)
+            && self
+                .agent
+                .as_ref()
+                .is_none_or(|upstream| &upstream.manager.id != id)
+    }
+
+    fn trusts(&self, actor: &Identity) -> bool {
+        self.trusted.get(&actor.id).is_some_and(|peer| {
+            peer.id == actor.id
+                && peer.public_key == actor.public_key
+                && peer.fingerprint == actor.fingerprint
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -281,29 +295,43 @@ impl Peers {
     }
 
     pub(crate) async fn agent_host(&self, id: Uuid) -> Result<Host, Error> {
-        let host = self.host(id).await?;
-        if host.mode != Mode::Agent {
-            return Err(Error::Unauthorized);
-        }
-        Ok(host)
+        self.file
+            .read(|file| {
+                let host = file.hosts.get(&id).ok_or(Error::PeerNotFound)?;
+                if host.mode != Mode::Agent || !file.trusts(&host.identity) {
+                    return Err(Error::Unauthorized);
+                }
+                Ok(host.clone())
+            })
+            .await
     }
 
     pub(crate) async fn agent_manager_authorized(&self, manager: &Identity) -> Result<(), Error> {
         if self
-            .agent_upstream()
+            .file
+            .read(|file| {
+                file.agent
+                    .as_ref()
+                    .is_some_and(|link| &link.manager == manager)
+                    && file.trusts(manager)
+            })
             .await
-            .as_ref()
-            .map(|link| &link.manager)
-            != Some(manager)
         {
-            return Err(Error::Unauthorized);
+            Ok(())
+        } else {
+            Err(Error::Unauthorized)
         }
-        self.require_trusted(manager).await
     }
 
-    pub(crate) async fn trusted(&self) -> Vec<TrustedPeer> {
+    pub(crate) async fn direct_trusted(&self) -> Vec<TrustedPeer> {
         self.file
-            .read(|file| file.trusted.values().cloned().collect())
+            .read(|file| {
+                file.trusted
+                    .iter()
+                    .filter(|(id, _)| file.is_direct_trust(id))
+                    .map(|(_, peer)| peer.clone())
+                    .collect()
+            })
             .await
     }
 
@@ -352,8 +380,11 @@ impl Peers {
         Ok(())
     }
 
-    pub(crate) async fn revoke(&self, id: Uuid) -> Result<(), Error> {
+    pub(crate) async fn revoke_direct(&self, id: Uuid) -> Result<(), Error> {
         let locked = self.file.lock().await;
+        if !locked.get().is_direct_trust(&id) {
+            return Err(Error::PeerNotFound);
+        }
         let mut file = locked.get().clone();
         file.trusted.remove(&id).ok_or(Error::PeerNotFound)?;
         Ok(locked.commit(file).await?)
@@ -533,16 +564,13 @@ impl Peers {
     async fn require_resource_operator(&self, actor: &Identity) -> Result<(), Error> {
         if self
             .file
-            .read(|file| {
-                file.hosts
-                    .get(&actor.id)
-                    .is_some_and(|host| host.mode == Mode::Agent)
-            })
+            .read(|file| !file.is_agent_host(&actor.id) && file.trusts(actor))
             .await
         {
-            return Err(Error::Unauthorized);
+            Ok(())
+        } else {
+            Err(Error::Unauthorized)
         }
-        self.require_trusted(actor).await
     }
 
     /// A manager's own inbound side: prove an agent is the one this instance invited,
@@ -578,7 +606,6 @@ impl Peers {
         if host.identity != challenge.actor {
             return Err(Error::Unauthorized);
         }
-        self.require_trusted(&challenge.actor).await?;
         Ok(host)
     }
 
@@ -745,14 +772,11 @@ impl Peers {
     }
 
     async fn require_trusted(&self, actor: &Identity) -> Result<(), Error> {
-        let trusted = self
-            .file
-            .read(|file| file.trusted.get(&actor.id).map(TrustedPeer::identity))
-            .await;
-        if trusted.as_ref() != Some(actor) {
-            return Err(Error::Unauthorized);
+        if self.file.read(|file| file.trusts(actor)).await {
+            Ok(())
+        } else {
+            Err(Error::Unauthorized)
         }
-        Ok(())
     }
 }
 

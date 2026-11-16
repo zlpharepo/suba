@@ -1,6 +1,7 @@
 mod account;
 mod auth;
 mod collections;
+mod environments;
 #[cfg(feature = "singbox-core")]
 mod inbounds;
 mod peers;
@@ -15,11 +16,12 @@ use axum::{
     body::Body,
     extract::{Request, State},
     handler::HandlerWithoutStateExt,
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
 };
-use http::StatusCode;
+use http::{header, HeaderValue, StatusCode};
 use tower_http::services::ServeDir;
 
 use crate::{error::Error, handlers, tracing, AppState};
@@ -32,6 +34,14 @@ async fn not_found() -> (StatusCode, &'static str) {
 
 async fn no_such_delivery() -> Response {
     Error::NoSuchDelivery.into_response()
+}
+
+async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn home(State(state): State<AppState>, request: Request) -> Response {
@@ -83,11 +93,14 @@ impl AppRouter {
     }
 
     pub fn route(web_path: impl AsRef<Path>) -> Router<AppState> {
+        let environment_routes = environments::route()
+            .merge(peers::route())
+            .layer(middleware::from_fn(no_store));
         let api_router = Self::resources()
             .nest("/auth", auth::route())
             .merge(account::route())
             .merge(system::local_route())
-            .merge(peers::route());
+            .merge(environment_routes);
 
         let not_found_service = not_found.into_service();
         let web_service = web_files(web_path).not_found_service(not_found_service);

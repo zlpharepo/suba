@@ -5,6 +5,7 @@ pub(crate) mod agents;
 pub mod auth;
 pub mod collections;
 pub mod delivery;
+pub mod environments;
 #[cfg(feature = "singbox-core")]
 pub mod observation;
 pub mod peers;

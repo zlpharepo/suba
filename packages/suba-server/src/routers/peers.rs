@@ -1,34 +1,15 @@
-use axum::{
-    extract::{DefaultBodyLimit, Request},
-    middleware::{self, Next},
-    response::Response,
-    routing::{delete, get, post},
-    Router,
-};
-use http::{header, HeaderValue};
-
 use crate::{
     handlers::{agent, peers},
     AppState,
 };
+use axum::{
+    extract::DefaultBodyLimit,
+    routing::{delete, get, post},
+    Router,
+};
 
 pub fn route() -> Router<AppState> {
     Router::new()
-        .route(
-            "/environments",
-            get(peers::environments).post(peers::add_environment),
-        )
-        .route(
-            "/environments/{id}",
-            delete(peers::remove_environment).put(peers::update_environment),
-        )
-        .route(
-            "/environments/{id}/{*path}",
-            get(peers::forward)
-                .post(peers::forward)
-                .put(peers::forward)
-                .delete(peers::forward),
-        )
         .route("/peers", get(peers::trusted))
         .route("/peers/identity", get(peers::identity))
         .route("/peers/{id}", delete(peers::revoke))
@@ -50,13 +31,4 @@ pub fn route() -> Router<AppState> {
                 crate::state::peers::BODY_LIMIT * 6 + 64 * 1024,
             )),
         )
-        .layer(middleware::from_fn(no_store))
-}
-
-async fn no_store(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response
 }

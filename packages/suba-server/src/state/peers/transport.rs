@@ -5,12 +5,17 @@ use super::*;
 const WIRE_LIMIT: usize = REPLY_LIMIT * 4 / 3 + 64 * 1024;
 
 impl Peers {
-    pub(crate) async fn pair(
+    pub(crate) async fn pair_direct(
         &self,
         signer: &IdentitySigner,
         name: String,
         invitation: Invitation,
     ) -> Result<Host, Error> {
+        if invitation.mode != Mode::Direct {
+            return Err(Error::PeerRequest {
+                reason: "invitation.mode: expected a Direct invitation",
+            });
+        }
         valid_name(&name)?;
         let endpoint = endpoint(&invitation.endpoint, Mode::Direct)?;
         invitation.identity.key()?;
@@ -74,7 +79,7 @@ impl Peers {
             name,
             endpoint: Some(endpoint),
             identity: invitation.identity,
-            mode: invitation.mode,
+            mode: Mode::Direct,
         };
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();

@@ -124,6 +124,41 @@ async fn machine_handshakes_do_not_initialize_an_unpaired_instance() {
 }
 
 #[tokio::test]
+async fn direct_pairing_rejects_an_invitation_relabeled_as_agent() {
+    let local = Server::start().await;
+    let remote = Server::start().await;
+    let invitation = body(
+        post(
+            &remote,
+            "/api/peers/invitations",
+            json!({"name": "Example caller", "endpoint": remote.base, "mode": "direct"}),
+        )
+        .await,
+    )
+    .await;
+    let mut relabeled = invitation.clone();
+    relabeled["mode"] = json!("agent");
+    let rejected = post(
+        &local,
+        "/api/environments",
+        json!({"name": "Example server", "invitation": relabeled}),
+    )
+    .await;
+    assert_eq!(rejected.status(), 422);
+    assert_eq!(get(&local, "/api/environments").await, json!([]));
+    assert_eq!(get(&remote, "/api/peers").await, json!([]));
+
+    let added = post(
+        &local,
+        "/api/environments",
+        json!({"name": "Example server", "invitation": invitation}),
+    )
+    .await;
+    assert_eq!(added.status(), 201);
+    assert_eq!(body(added).await["mode"], "direct");
+}
+
+#[tokio::test]
 async fn agent_control_route_pairs_and_persists_the_manager_binding() {
     let manager = Server::start().await;
     let node = Server::start().await;
@@ -142,7 +177,20 @@ async fn agent_control_route_pairs_and_persists_the_manager_binding() {
     let joined = post(&node, route, json!({"invitation": invitation})).await;
     assert_eq!(joined.status(), 201);
     assert_eq!(body(joined).await["manager"]["endpoint"], manager.base);
-    assert_eq!(get(&manager, "/api/environments").await[0]["mode"], "agent");
+    let environments = get(&manager, "/api/environments").await;
+    assert_eq!(environments[0]["mode"], "agent");
+    let agent_id = environments[0]["id"].as_str().unwrap();
+    let manager_identity = get(&manager, "/api/peers/identity").await;
+    let manager_id = manager_identity["id"].as_str().unwrap();
+    for (server, id) in [(&manager, agent_id), (&node, manager_id)] {
+        assert_eq!(get(server, "/api/peers").await, json!([]));
+        let response = server
+            .authed(Method::DELETE, &format!("/api/peers/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+    }
 
     let saved: Value =
         crate::config::read_config(node.root.join("config").to_str().unwrap(), "peers").unwrap();

@@ -2,7 +2,7 @@
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{OriginalUri, Path, Request, State},
+    extract::{Path, Request, State},
     response::{IntoResponse, Response},
     Json,
 };
@@ -16,7 +16,7 @@ use crate::{
     dto::{Authenticated, ResponseResult},
     error::Error,
     state::peers::{
-        self, ChallengeRequest, Host, Identity, Invitation, PairClaim, PairReceipt, ResourceReply,
+        self, ChallengeRequest, Host, Identity, PairClaim, PairReceipt, ResourceReply,
         ResourceRequest, Signed, TrustedPeer,
     },
     AppState,
@@ -30,12 +30,6 @@ pub struct PendingInvite {
     mode: peers::Mode,
 }
 
-#[derive(Deserialize)]
-pub struct AddEnvironment {
-    name: String,
-    invitation: Invitation,
-}
-
 pub async fn identity(
     State(state): State<AppState>,
     _auth: Authenticated,
@@ -47,7 +41,7 @@ pub async fn trusted(
     State(state): State<AppState>,
     _auth: Authenticated,
 ) -> Json<Vec<TrustedPeer>> {
-    Json(state.peers().trusted().await)
+    Json(state.peers().direct_trusted().await)
 }
 
 pub async fn revoke(
@@ -55,7 +49,7 @@ pub async fn revoke(
     _auth: Authenticated,
     Path(id): Path<Uuid>,
 ) -> ResponseResult<StatusCode> {
-    state.peers().revoke(id).await?;
+    state.peers().revoke_direct(id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -99,63 +93,6 @@ pub async fn accept(
 ) -> ResponseResult<Json<Signed<PairReceipt>>> {
     let signer = state.settings().existing_peer_signer().await?;
     Ok(Json(state.peers().accept(&signer, proof).await?))
-}
-
-pub async fn environments(
-    State(state): State<AppState>,
-    _auth: Authenticated,
-) -> Json<Vec<peers::HostView>> {
-    Json(
-        state
-            .peers()
-            .hosts()
-            .await
-            .into_iter()
-            .map(|host| state.peers().host_view(host))
-            .collect(),
-    )
-}
-
-pub async fn add_environment(
-    State(state): State<AppState>,
-    _auth: Authenticated,
-    Json(body): Json<AddEnvironment>,
-) -> ResponseResult<impl IntoResponse> {
-    let signer = state.settings().peer_signer().await?;
-    let host = state
-        .peers()
-        .pair(&signer, body.name, body.invitation)
-        .await?;
-    Ok((StatusCode::CREATED, Json(state.peers().host_view(host))))
-}
-
-pub async fn update_environment(
-    State(state): State<AppState>,
-    _auth: Authenticated,
-    Path(id): Path<Uuid>,
-    Json(body): Json<EditEnvironment>,
-) -> ResponseResult<Json<peers::HostView>> {
-    let host = state
-        .peers()
-        .update_host(id, body.name, body.endpoint)
-        .await?;
-    Ok(Json(state.peers().host_view(host)))
-}
-
-#[derive(Deserialize)]
-pub struct EditEnvironment {
-    name: String,
-    #[serde(default)]
-    endpoint: Option<String>,
-}
-
-pub async fn remove_environment(
-    State(state): State<AppState>,
-    _auth: Authenticated,
-    Path(id): Path<Uuid>,
-) -> ResponseResult<StatusCode> {
-    state.peers().remove_host(id).await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn execute(
@@ -251,59 +188,6 @@ async fn run_resource(
             body: URL_SAFE_NO_PAD.encode(body),
         },
     )
-}
-
-pub async fn forward(
-    State(state): State<AppState>,
-    _auth: Authenticated,
-    Path((id, _)): Path<(Uuid, String)>,
-    OriginalUri(uri): OriginalUri,
-    request: Request,
-) -> ResponseResult<Response> {
-    let host = state.peers().host(id).await?;
-    let tail = uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .and_then(|path| path.splitn(5, '/').nth(4))
-        .ok_or(Error::PeerNotFound)?;
-    let path = format!("/{tail}");
-    let method = request.method().to_string();
-    if !peers::resource_allowed(&method, &path) {
-        return Err(Error::PeerNotFound);
-    }
-    #[cfg(not(feature = "singbox-core"))]
-    if host.mode == peers::Mode::Agent && !path.starts_with("/system/") {
-        return Err(Error::PeerNotFound);
-    }
-    #[cfg(feature = "singbox-core")]
-    let headers = request.headers().clone();
-    let if_match = request
-        .headers()
-        .get(header::IF_MATCH)
-        .map(|value| value.to_str().map(str::to_string))
-        .transpose()
-        .map_err(|_| Error::PeerRequest {
-            reason: "if-match: invalid header",
-        })?;
-    let bytes = to_bytes(request.into_body(), peers::BODY_LIMIT)
-        .await
-        .map_err(|_| Error::PeerRequest {
-            reason: "body: the resource request is too large",
-        })?;
-    let body = if bytes.is_empty() {
-        None
-    } else {
-        Some(
-            String::from_utf8(bytes.to_vec()).map_err(|_| Error::PeerRequest {
-                reason: "body: UTF-8 JSON is required",
-            })?,
-        )
-    };
-    #[cfg(feature = "singbox-core")]
-    if host.mode == peers::Mode::Agent {
-        return crate::handlers::agents::forward(state, host, method, path, headers, body).await;
-    }
-    call(&state, &host, method, path, if_match, body).await
 }
 
 pub(crate) async fn call(

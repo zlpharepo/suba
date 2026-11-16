@@ -208,7 +208,7 @@ async fn invitations_bind_both_identities_and_are_consumed_once_without_persisti
         )
         .await
         .is_err());
-    let trusted = scratch.store().trusted().await;
+    let trusted = scratch.store().direct_trusted().await;
     assert_eq!(trusted.len(), 1);
     assert_eq!(trusted[0].id, caller.identity.id);
     let saved =
@@ -255,7 +255,7 @@ async fn an_invitation_mac_cannot_be_transplanted_to_another_identity_or_challen
         )
         .unwrap();
     assert!(store.accept(&receiver, substituted).await.is_err());
-    assert!(store.trusted().await.is_empty());
+    assert!(store.direct_trusted().await.is_empty());
 }
 
 #[tokio::test]
@@ -294,6 +294,17 @@ async fn an_agent_is_trusted_for_sessions_but_not_manager_resources() {
     let resource = request_proof(&store, &manager, &node).await;
     assert!(matches!(
         store.authorize(&manager, &resource).await,
+        Err(Error::Unauthorized)
+    ));
+    {
+        let locked = store.file.lock().await;
+        let mut file = locked.get().clone();
+        file.trusted.remove(&node.identity.id).unwrap();
+        locked.commit(file).await.unwrap();
+    }
+    assert!(store.host(node.identity.id).await.is_ok());
+    assert!(matches!(
+        store.agent_host(node.identity.id).await,
         Err(Error::Unauthorized)
     ));
     store.remove_host(node.identity.id).await.unwrap();
@@ -400,7 +411,7 @@ async fn revocation_invalidates_outstanding_challenges_and_internal_grants() {
     let used = request_proof(&store, &receiver, &caller).await;
     let grant = store.authorize(&receiver, &used).await.unwrap();
     let pending = request_proof(&store, &receiver, &caller).await;
-    store.revoke(caller.identity.id).await.unwrap();
+    store.revoke_direct(caller.identity.id).await.unwrap();
     assert!(store.allows(&grant).await.is_err());
     assert!(store.authorize(&receiver, &pending).await.is_err());
     assert!(store
@@ -487,12 +498,12 @@ async fn direct_https_checks_certificate_hostnames_and_the_pinned_instance() {
     let mut local = local_dir.store();
     assert!(
         local
-            .pair(&caller, "Example remote".into(), invitation.clone())
+            .pair_direct(&caller, "Example remote".into(), invitation.clone())
             .await
             .is_err(),
         "an untrusted TLS issuer must fail before pairing"
     );
-    assert!(state.peers().trusted().await.is_empty());
+    assert!(state.peers().direct_trusted().await.is_empty());
     local.http = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -501,7 +512,7 @@ async fn direct_https_checks_certificate_hostnames_and_the_pinned_instance() {
         .build()
         .unwrap();
     let host = local
-        .pair(&caller, "Example remote".into(), invitation)
+        .pair_direct(&caller, "Example remote".into(), invitation)
         .await
         .unwrap();
     let reply = local
