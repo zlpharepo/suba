@@ -269,25 +269,28 @@ async fn an_agent_is_trusted_for_sessions_but_not_manager_resources() {
             &manager,
             "Example Agent".into(),
             "https://manager.example.invalid".into(),
-            Mode::Edge,
+            Mode::Agent,
         )
         .await
         .unwrap();
     let proof = pair_proof(&store, &manager, &node, &invitation).await;
     store.accept(&manager, proof).await.unwrap();
     let challenge = store
-        .edge_challenge(&manager, node.identity.id)
+        .agent_challenge(&manager, node.identity.id)
         .await
         .unwrap();
     let proof = node
         .sign(
-            "edge-session",
-            EdgeSessionProof {
+            "agent-session",
+            AgentSessionProof {
                 challenge: challenge.payload,
             },
         )
         .unwrap();
-    assert!(store.authorize_edge_session(&manager, &proof).await.is_ok());
+    assert!(store
+        .authorize_agent_session(&manager, &proof)
+        .await
+        .is_ok());
     let resource = request_proof(&store, &manager, &node).await;
     assert!(matches!(
         store.authorize(&manager, &resource).await,
@@ -296,7 +299,7 @@ async fn an_agent_is_trusted_for_sessions_but_not_manager_resources() {
     store.remove_host(node.identity.id).await.unwrap();
     assert!(store.require_trusted(&node.identity).await.is_err());
     assert!(store
-        .edge_challenge(&manager, node.identity.id)
+        .agent_challenge(&manager, node.identity.id)
         .await
         .is_err());
 }

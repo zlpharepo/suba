@@ -272,7 +272,7 @@ pub async fn forward(
         return Err(Error::PeerNotFound);
     }
     #[cfg(not(feature = "singbox-core"))]
-    if host.mode == peers::Mode::Edge && !path.starts_with("/system/") {
+    if host.mode == peers::Mode::Agent && !path.starts_with("/system/") {
         return Err(Error::PeerNotFound);
     }
     #[cfg(feature = "singbox-core")]
@@ -300,7 +300,7 @@ pub async fn forward(
         )
     };
     #[cfg(feature = "singbox-core")]
-    if host.mode == peers::Mode::Edge {
+    if host.mode == peers::Mode::Agent {
         return crate::handlers::agents::forward(state, host, method, path, headers, body).await;
     }
     call(&state, &host, method, path, if_match, body).await
@@ -322,8 +322,8 @@ pub(crate) async fn call(
                 .forward(&signer, host, method, path, if_match, body)
                 .await?
         }
-        peers::Mode::Edge => {
-            edge_forward(state, &signer, host, method, path, if_match, body).await?
+        peers::Mode::Agent => {
+            agent_forward(state, &signer, host, method, path, if_match, body).await?
         }
     };
     let status = StatusCode::from_u16(reply.status).map_err(|_| Error::PeerUnavailable)?;
@@ -364,7 +364,7 @@ fn reply_header(name: &str) -> bool {
 
 /// One resource exchange over a live Agent session: the challenge is asked first,
 /// then the resource itself, both as manager-initiated calls.
-async fn edge_forward(
+async fn agent_forward(
     state: &AppState,
     signer: &crate::state::peers::IdentitySigner,
     host: &Host,
@@ -375,18 +375,18 @@ async fn edge_forward(
 ) -> Result<ResourceReply, Error> {
     let challenge = match state
         .peers()
-        .edge
+        .agent
         .exchange(
             host.id,
-            peers::edge::EdgeCall::Challenge(ChallengeRequest {
+            peers::agent::AgentCall::Challenge(ChallengeRequest {
                 actor: signer.identity.clone(),
                 invitation: None,
             }),
         )
         .await?
     {
-        peers::edge::EdgeAnswer::Challenge(proof) => proof,
-        peers::edge::EdgeAnswer::Resource(_) => return Err(Error::PeerUnavailable),
+        peers::agent::AgentAnswer::Challenge(proof) => proof,
+        peers::agent::AgentAnswer::Resource(_) => return Err(Error::PeerUnavailable),
     };
     let challenge = challenge.payload;
     if challenge.actor != signer.identity || challenge.target != host.identity {
@@ -404,11 +404,11 @@ async fn edge_forward(
     )?;
     match state
         .peers()
-        .edge
-        .exchange(host.id, peers::edge::EdgeCall::Resource(proof))
+        .agent
+        .exchange(host.id, peers::agent::AgentCall::Resource(proof))
         .await?
     {
-        peers::edge::EdgeAnswer::Resource(reply) => Ok(reply.payload),
-        peers::edge::EdgeAnswer::Challenge(_) => Err(Error::PeerUnavailable),
+        peers::agent::AgentAnswer::Resource(reply) => Ok(reply.payload),
+        peers::agent::AgentAnswer::Challenge(_) => Err(Error::PeerUnavailable),
     }
 }

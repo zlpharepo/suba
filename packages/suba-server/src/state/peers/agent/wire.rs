@@ -3,8 +3,8 @@ use reqwest_websocket::{Message, Upgrade};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{EdgeAnswer, EdgeCall, Error, FRAME_LIMIT, REQUEST_LIMIT, WRITE_TIMEOUT};
-use crate::state::peers::{Challenge, EdgeSessionProof, Identity, Purpose, Signed};
+use super::{AgentAnswer, AgentCall, Error, FRAME_LIMIT, REQUEST_LIMIT, WRITE_TIMEOUT};
+use crate::state::peers::{AgentSessionProof, Challenge, Identity, Purpose, Signed};
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
@@ -18,7 +18,7 @@ pub(super) enum ManagerFrame {
     Call {
         session: Uuid,
         id: u64,
-        call: Box<EdgeCall>,
+        call: Box<AgentCall>,
     },
     Ping {
         session: Uuid,
@@ -30,12 +30,12 @@ pub(super) enum ManagerFrame {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) enum AgentFrame {
     Proof {
-        proof: Signed<EdgeSessionProof>,
+        proof: Signed<AgentSessionProof>,
     },
     Answer {
         session: Uuid,
         id: u64,
-        answer: Result<EdgeAnswer, Failure>,
+        answer: Result<AgentAnswer, Failure>,
     },
     Pong {
         session: Uuid,
@@ -45,7 +45,7 @@ pub(super) enum AgentFrame {
 
 pub(super) struct Command {
     pub id: u64,
-    pub call: EdgeCall,
+    pub call: AgentCall,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,8 +90,8 @@ impl Failure {
 }
 
 pub(super) fn address(endpoint: &str, host: Uuid) -> Result<url::Url, Error> {
-    let base = crate::state::peers::endpoint(endpoint, crate::state::peers::Mode::Edge)?;
-    let mut url = url::Url::parse(&format!("{base}/api/peers/edge/connect"))
+    let base = crate::state::peers::endpoint(endpoint, crate::state::peers::Mode::Agent)?;
+    let mut url = url::Url::parse(&format!("{base}/api/peers/agent/connect"))
         .map_err(|_| Error::PeerUnavailable)?;
     let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
     url.set_scheme(scheme).map_err(|_| Error::PeerUnavailable)?;
@@ -134,7 +134,7 @@ pub(super) fn verify_challenge(
     proof.verify("challenge", manager)?;
     if proof.payload.actor != *agent
         || proof.payload.target != *manager
-        || proof.payload.purpose != Purpose::EdgeSession
+        || proof.payload.purpose != Purpose::AgentSession
     {
         return Err(Error::Unauthorized);
     }
@@ -146,7 +146,7 @@ pub(super) fn verify_ready(
     challenge: &Challenge,
     manager: &Identity,
 ) -> Result<Uuid, Error> {
-    proof.verify("edge-ready", manager)?;
+    proof.verify("agent-ready", manager)?;
     if proof.payload.nonce != challenge.nonce
         || proof.payload.agent != challenge.actor.id
         || proof.payload.manager != manager.id

@@ -36,26 +36,26 @@ pub(crate) const FRAME_LIMIT: usize = super::REPLY_LIMIT * 4 / 3 + 64 * 1024;
 const REQUEST_LIMIT: usize = super::BODY_LIMIT * 6 + 64 * 1024;
 
 #[derive(Serialize, Deserialize)]
-pub(crate) enum EdgeCall {
+pub(crate) enum AgentCall {
     Challenge(ChallengeRequest),
     Resource(Signed<ResourceRequest>),
 }
 
-impl EdgeCall {
+impl AgentCall {
     fn mutation(&self) -> bool {
         matches!(self, Self::Resource(proof) if proof.payload.method != "GET")
     }
 }
 
 #[derive(Serialize, Deserialize)]
-pub(crate) enum EdgeAnswer {
+pub(crate) enum AgentAnswer {
     Challenge(Signed<Challenge>),
     Resource(Signed<ResourceReply>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum EdgeState {
+pub(crate) enum AgentState {
     Disabled,
     Connecting,
     Online,
@@ -64,8 +64,8 @@ pub(crate) enum EdgeState {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct EdgeStatus {
-    pub state: EdgeState,
+pub(crate) struct AgentStatus {
+    pub state: AgentState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,8 +74,8 @@ pub(crate) struct EdgeStatus {
     pub last_seen: Option<i64>,
 }
 
-impl EdgeStatus {
-    fn new(state: EdgeState, reason: Option<&'static str>) -> Self {
+impl AgentStatus {
+    fn new(state: AgentState, reason: Option<&'static str>) -> Self {
         Self {
             state,
             reason,
@@ -87,7 +87,7 @@ impl EdgeStatus {
     fn online() -> Self {
         let now = chrono::Utc::now().timestamp_millis();
         Self {
-            state: EdgeState::Online,
+            state: AgentState::Online,
             reason: None,
             connected_at: Some(now),
             last_seen: Some(now),
@@ -103,33 +103,33 @@ struct Control {
 
 struct HubState {
     hosts: HashMap<Uuid, Arc<Session>>,
-    local: EdgeStatus,
+    local: AgentStatus,
 }
 
-pub(crate) struct EdgeHub {
+pub(crate) struct AgentHub {
     inner: Mutex<HubState>,
     control: watch::Sender<Control>,
 }
 
-impl EdgeHub {
+impl AgentHub {
     pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(HubState {
                 hosts: HashMap::new(),
-                local: EdgeStatus::new(EdgeState::Disabled, None),
+                local: AgentStatus::new(AgentState::Disabled, None),
             }),
             control: watch::channel(Control::default()).0,
         }
     }
 
-    pub(crate) fn host_status(&self, id: Uuid) -> EdgeStatus {
+    pub(crate) fn host_status(&self, id: Uuid) -> AgentStatus {
         self.inner.lock().unwrap().hosts.get(&id).map_or_else(
-            || EdgeStatus::new(EdgeState::Offline, Some("edge.disconnected")),
+            || AgentStatus::new(AgentState::Offline, Some("agent.disconnected")),
             |session| session.inner.lock().unwrap().status.clone(),
         )
     }
 
-    pub(crate) fn local_status(&self) -> EdgeStatus {
+    pub(crate) fn local_status(&self) -> AgentStatus {
         self.inner.lock().unwrap().local.clone()
     }
 
@@ -150,10 +150,10 @@ impl EdgeHub {
         for (_, session) in inner.hosts.drain() {
             session.close();
         }
-        inner.local = EdgeStatus::new(EdgeState::Offline, Some("edge.shutdown"));
+        inner.local = AgentStatus::new(AgentState::Offline, Some("agent.shutdown"));
     }
 
-    pub(crate) async fn exchange(&self, id: Uuid, call: EdgeCall) -> Result<EdgeAnswer, Error> {
+    pub(crate) async fn exchange(&self, id: Uuid, call: AgentCall) -> Result<AgentAnswer, Error> {
         let session = self
             .inner
             .lock()
@@ -200,7 +200,7 @@ impl EdgeHub {
         }
     }
 
-    fn local(&self, status: EdgeStatus) {
+    fn local(&self, status: AgentStatus) {
         self.inner.lock().unwrap().local = status;
     }
 
@@ -209,7 +209,7 @@ impl EdgeHub {
     }
 }
 
-type Answer = Result<EdgeAnswer, wire::Failure>;
+type Answer = Result<AgentAnswer, wire::Failure>;
 
 struct Pending {
     reply: oneshot::Sender<Answer>,
@@ -220,7 +220,7 @@ struct SessionState {
     active: bool,
     pending: HashMap<u64, Pending>,
     sequence: u64,
-    status: EdgeStatus,
+    status: AgentStatus,
 }
 
 struct Session {
@@ -240,7 +240,7 @@ impl Session {
                     active: true,
                     pending: HashMap::new(),
                     sequence: 0,
-                    status: EdgeStatus::online(),
+                    status: AgentStatus::online(),
                 }),
                 commands,
                 closed: watch::channel(false).0,
@@ -249,7 +249,7 @@ impl Session {
         )
     }
 
-    fn enqueue(&self, call: EdgeCall) -> Result<(u64, oneshot::Receiver<Answer>), Error> {
+    fn enqueue(&self, call: AgentCall) -> Result<(u64, oneshot::Receiver<Answer>), Error> {
         let mut inner = self.inner.lock().unwrap();
         if !inner.active || inner.pending.len() >= CALL_LIMIT {
             return Err(Error::PeerUnavailable);
@@ -259,7 +259,7 @@ impl Session {
             .checked_add(1)
             .ok_or(Error::PeerUnavailable)?;
         inner.sequence = id;
-        let resource = matches!(call, EdgeCall::Resource(_));
+        let resource = matches!(call, AgentCall::Resource(_));
         let (reply, receiver) = oneshot::channel();
         self.commands
             .try_send(wire::Command { id, call })
@@ -281,7 +281,7 @@ impl Session {
         // Timed-out calls may still complete remotely; their replies cannot satisfy another call.
         if let Some(pending) = inner.pending.remove(&id) {
             if let Ok(answer) = &answer {
-                if pending.resource != matches!(answer, EdgeAnswer::Resource(_)) {
+                if pending.resource != matches!(answer, AgentAnswer::Resource(_)) {
                     return Err(Error::PeerUnavailable);
                 }
             }
@@ -299,8 +299,8 @@ impl Session {
         let mut inner = self.inner.lock().unwrap();
         inner.active = false;
         inner.pending.clear();
-        inner.status.state = EdgeState::Offline;
-        inner.status.reason = Some("edge.disconnected");
+        inner.status.state = AgentState::Offline;
+        inner.status.reason = Some("agent.disconnected");
         self.closed.send_replace(true);
     }
 }

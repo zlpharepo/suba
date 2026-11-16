@@ -150,7 +150,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         .authed(Method::POST, "/api/peers/invitations")
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(
-            json!({"name": "Example Agent", "endpoint": manager.base, "mode": "edge"}).to_string(),
+            json!({"name": "Example Agent", "endpoint": manager.base, "mode": "agent"}).to_string(),
         )
         .send()
         .await
@@ -180,7 +180,7 @@ async fn manager_saves_and_publishes_native_agent_snapshots_and_offline_boot_use
         .identity
         .id;
     use tower::ServiceExt;
-    let manager_identity = node.state.peers().edge_upstream().await.unwrap().manager;
+    let manager_identity = node.state.peers().agent_upstream().await.unwrap().manager;
     use crate::state::peers::{ChallengeRequest, IdentitySigner, ResourceRequest};
     let manager_config: crate::config::AppConfig =
         crate::config::read_config(manager.root.join("config").to_str().unwrap(), "config")

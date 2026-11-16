@@ -8,7 +8,7 @@ use axum::{
 use http::{header, HeaderValue};
 
 use crate::{
-    handlers::{edge, peers},
+    handlers::{agent, peers},
     AppState,
 };
 
@@ -35,13 +35,13 @@ pub fn route() -> Router<AppState> {
         .route("/peers/invitations", post(peers::invite))
         .route("/peers/invitations/{id}", delete(peers::revoke_invitation))
         .route(
-            "/peers/edge",
-            get(edge::edge_view)
-                .post(edge::join_edge)
-                .put(edge::edit_edge)
-                .delete(edge::leave_edge),
+            "/peers/agent",
+            get(agent::agent_view)
+                .post(agent::join_agent)
+                .put(agent::edit_agent)
+                .delete(agent::leave_agent),
         )
-        .route("/peers/edge/connect", get(edge::connect))
+        .route("/peers/agent/connect", get(agent::connect))
         .route("/peers/challenges", post(peers::challenge))
         .route("/peers/pairings", post(peers::accept))
         .route(

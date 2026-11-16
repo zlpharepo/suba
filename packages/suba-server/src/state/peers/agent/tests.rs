@@ -10,8 +10,8 @@ fn signer() -> IdentitySigner {
     IdentitySigner::new(Uuid::now_v7(), &KeyPair::generate().unwrap()).unwrap()
 }
 
-fn call() -> EdgeCall {
-    EdgeCall::Challenge(ChallengeRequest {
+fn call() -> AgentCall {
+    AgentCall::Challenge(ChallengeRequest {
         actor: signer().identity,
         invitation: None,
     })
@@ -22,7 +22,7 @@ fn challenge(agent: &IdentitySigner, manager: &IdentitySigner) -> Challenge {
         nonce: "example-session-nonce".into(),
         actor: agent.identity.clone(),
         target: manager.identity.clone(),
-        purpose: Purpose::EdgeSession,
+        purpose: Purpose::AgentSession,
         expires_at: chrono::Utc::now().timestamp_millis() + 60_000,
     }
 }
@@ -34,7 +34,7 @@ fn websocket_addresses_preserve_prefix_for_http_and_https() {
         wire::address("https://manager.example.com/prefix/", id)
             .unwrap()
             .as_str(),
-        format!("wss://manager.example.com/prefix/api/peers/edge/connect?host={id}")
+        format!("wss://manager.example.com/prefix/api/peers/agent/connect?host={id}")
     );
     assert_eq!(
         wire::address("http://127.0.0.1:4321", id).unwrap().scheme(),
@@ -52,7 +52,7 @@ fn websocket_addresses_preserve_prefix_for_http_and_https() {
     ] {
         let address = wire::address(&format!("{endpoint}/prefix/"), id).unwrap();
         assert_eq!(address.scheme(), "ws");
-        assert_eq!(address.path(), "/prefix/api/peers/edge/connect");
+        assert_eq!(address.path(), "/prefix/api/peers/agent/connect");
         assert_eq!(address.query(), Some(format!("host={id}").as_str()));
     }
     for endpoint in [
@@ -102,7 +102,14 @@ fn session_handshake_binds_signer_direction_purpose_nonce_and_instances() {
             _ => {}
         }
         let proof = manager
-            .sign(if field == 5 { "response" } else { "edge-ready" }, ready)
+            .sign(
+                if field == 5 {
+                    "response"
+                } else {
+                    "agent-ready"
+                },
+                ready,
+            )
             .unwrap();
         assert_eq!(
             wire::verify_ready(&proof, &original, &manager.identity).is_ok(),
@@ -139,7 +146,7 @@ fn wire_directions_and_frame_limits_are_enforced() {
 
 #[tokio::test]
 async fn session_replacement_fences_old_replies_and_closes_pending_calls() {
-    let hub = EdgeHub::new();
+    let hub = AgentHub::new();
     let host = Uuid::now_v7();
     let (old, _old_commands) = Session::new(Uuid::now_v7());
     hub.attach(host, old.clone()).unwrap();
@@ -151,7 +158,7 @@ async fn session_replacement_fences_old_replies_and_closes_pending_calls() {
         .answer(old.id, id, Err(wire::Failure::Unavailable))
         .is_err());
     hub.detach(host, &old);
-    assert_eq!(hub.host_status(host).state, EdgeState::Online);
+    assert_eq!(hub.host_status(host).state, AgentState::Online);
     let (id, pending) = new.enqueue(call()).unwrap();
     assert!(new
         .answer(old.id, id, Err(wire::Failure::Unavailable))
@@ -163,19 +170,19 @@ async fn session_replacement_fences_old_replies_and_closes_pending_calls() {
         Err(wire::Failure::NotFound)
     ));
     hub.disconnect(host);
-    assert_eq!(hub.host_status(host).state, EdgeState::Offline);
+    assert_eq!(hub.host_status(host).state, AgentState::Offline);
 }
 
 /// Detaching a session closes it: it stops accepting calls and reports no
 /// connection, whether or not it was the host's current one.
 #[tokio::test]
 async fn detaching_a_session_closes_it() {
-    let hub = EdgeHub::new();
+    let hub = AgentHub::new();
     let host = Uuid::now_v7();
     let (session, _commands) = Session::new(Uuid::now_v7());
     hub.attach(host, session.clone()).unwrap();
     hub.detach(host, &session);
-    assert_eq!(hub.host_status(host).state, EdgeState::Offline);
+    assert_eq!(hub.host_status(host).state, AgentState::Offline);
     assert!(
         session.enqueue(call()).is_err(),
         "a detached session takes no calls"
@@ -190,7 +197,7 @@ async fn detaching_a_session_closes_it() {
     hub.detach(host, &session);
     assert_eq!(
         hub.host_status(host).state,
-        EdgeState::Online,
+        AgentState::Online,
         "detaching a replaced session must not disturb the current one"
     );
     assert!(current.enqueue(call()).is_ok());
@@ -240,7 +247,7 @@ async fn pending_calls_are_bounded_correlated_and_removed_on_cancellation() {
 
 #[tokio::test]
 async fn disconnected_mutation_is_uncertain_but_is_never_requeued() {
-    let hub = EdgeHub::new();
+    let hub = AgentHub::new();
     let host = Uuid::now_v7();
     let (session, mut commands) = Session::new(Uuid::now_v7());
     hub.attach(host, session.clone()).unwrap();
@@ -258,7 +265,7 @@ async fn disconnected_mutation_is_uncertain_but_is_never_requeued() {
             },
         )
         .unwrap();
-    let request = hub.exchange(host, EdgeCall::Resource(proof));
+    let request = hub.exchange(host, AgentCall::Resource(proof));
     let close = async {
         commands.recv().await.unwrap();
         hub.disconnect(host);
@@ -270,7 +277,7 @@ async fn disconnected_mutation_is_uncertain_but_is_never_requeued() {
         hub.exchange(host, call()).await,
         Err(Error::PeerUnavailable)
     ));
-    assert_eq!(hub.local_status().state, EdgeState::Disabled);
+    assert_eq!(hub.local_status().state, AgentState::Disabled);
     let mut control = hub.control.subscribe();
     hub.reconnect();
     assert!(control.has_changed().unwrap());
@@ -303,7 +310,7 @@ impl TlsServer {
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let router = axum::Router::new().route(
-            "/prefix/api/peers/edge/connect",
+            "/prefix/api/peers/agent/connect",
             axum::routing::get(|ws: axum::extract::WebSocketUpgrade| async {
                 ws.on_upgrade(|mut socket| async move {
                     if let Some(Ok(message)) = socket.recv().await {

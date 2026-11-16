@@ -5,7 +5,7 @@
 //! proof authorizes a bounded resource router, never login or further delegation.
 //! Agent identities can establish sessions but cannot operate manager resources.
 
-pub(crate) mod edge;
+pub(crate) mod agent;
 mod identity;
 mod transport;
 
@@ -48,11 +48,11 @@ pub(crate) struct Host {
 pub(crate) enum Mode {
     #[default]
     Direct,
-    Edge,
+    Agent,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EdgeUpstream {
+pub(crate) struct AgentUpstream {
     pub manager: Identity,
     pub endpoint: String,
     pub proxy: Option<String>,
@@ -63,7 +63,7 @@ pub(crate) struct HostView {
     #[serde(flatten)]
     pub host: Host,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub connection: Option<edge::EdgeStatus>,
+    pub connection: Option<agent::AgentStatus>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -91,7 +91,7 @@ struct Configuration {
     #[serde(default)]
     trusted: BTreeMap<Uuid, TrustedPeer>,
     #[serde(default)]
-    edge: Option<EdgeUpstream>,
+    agent: Option<AgentUpstream>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -117,13 +117,13 @@ struct PendingInvitation {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Purpose {
     Pair,
-    EdgePair,
-    EdgeSession,
+    AgentPair,
+    AgentSession,
     Request,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct EdgeSessionProof {
+pub(crate) struct AgentSessionProof {
     pub challenge: Challenge,
 }
 
@@ -198,7 +198,7 @@ pub(crate) struct Peers {
     file: Persisted<Configuration>,
     pending: Mutex<Pending>,
     http: reqwest::Client,
-    pub(crate) edge: edge::EdgeHub,
+    pub(crate) agent: agent::AgentHub,
 }
 
 impl Peers {
@@ -207,7 +207,7 @@ impl Peers {
         signer: &IdentitySigner,
         endpoint: &str,
         token: &str,
-    ) -> Result<EdgeUpstream, Error> {
+    ) -> Result<AgentUpstream, Error> {
         let (id, secret) = token.split_once('.').ok_or(Error::PeerRequest {
             reason: "agent-token: expected an invitation identifier and secret",
         })?;
@@ -223,7 +223,7 @@ impl Peers {
         let challenge: Signed<Challenge> = self
             .post(
                 endpoint,
-                Mode::Edge,
+                Mode::Agent,
                 "challenges",
                 &ChallengeRequest {
                     actor: signer.identity.clone(),
@@ -233,11 +233,11 @@ impl Peers {
             .await?;
         challenge.verify("challenge", &challenge.payload.target)?;
         if challenge.payload.actor != signer.identity
-            || challenge.payload.purpose != Purpose::EdgePair
+            || challenge.payload.purpose != Purpose::AgentPair
         {
             return Err(Error::Unauthorized);
         }
-        self.join_edge(
+        self.join_agent(
             signer,
             Invitation {
                 version: 1,
@@ -246,7 +246,7 @@ impl Peers {
                 identity: challenge.payload.target,
                 secret: secret.to_string(),
                 expires_at: challenge.payload.expires_at,
-                mode: Mode::Edge,
+                mode: Mode::Agent,
             },
             None,
         )
@@ -261,7 +261,7 @@ impl Peers {
             http: outbound_builder(None)?
                 .timeout(Duration::from_secs(30))
                 .build()?,
-            edge: edge::EdgeHub::new(),
+            agent: agent::AgentHub::new(),
         })
     }
 
@@ -272,25 +272,25 @@ impl Peers {
     }
 
     pub(crate) fn host_view(&self, host: Host) -> HostView {
-        let connection = (host.mode == Mode::Edge).then(|| self.edge.host_status(host.id));
+        let connection = (host.mode == Mode::Agent).then(|| self.agent.host_status(host.id));
         HostView { host, connection }
     }
 
-    pub(crate) async fn edge_upstream(&self) -> Option<EdgeUpstream> {
-        self.file.read(|file| file.edge.clone()).await
+    pub(crate) async fn agent_upstream(&self) -> Option<AgentUpstream> {
+        self.file.read(|file| file.agent.clone()).await
     }
 
-    pub(crate) async fn edge_host(&self, id: Uuid) -> Result<Host, Error> {
+    pub(crate) async fn agent_host(&self, id: Uuid) -> Result<Host, Error> {
         let host = self.host(id).await?;
-        if host.mode != Mode::Edge {
+        if host.mode != Mode::Agent {
             return Err(Error::Unauthorized);
         }
         Ok(host)
     }
 
-    pub(crate) async fn edge_manager_authorized(&self, manager: &Identity) -> Result<(), Error> {
+    pub(crate) async fn agent_manager_authorized(&self, manager: &Identity) -> Result<(), Error> {
         if self
-            .edge_upstream()
+            .agent_upstream()
             .await
             .as_ref()
             .map(|link| &link.manager)
@@ -344,11 +344,11 @@ impl Peers {
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
         let host = file.hosts.remove(&id).ok_or(Error::PeerNotFound)?;
-        if host.mode == Mode::Edge {
+        if host.mode == Mode::Agent {
             file.trusted.remove(&id);
         }
         locked.commit(file).await?;
-        self.edge.disconnect(id);
+        self.agent.disconnect(id);
         Ok(())
     }
 
@@ -419,7 +419,7 @@ impl Peers {
                 .get(&invitation)
                 .ok_or(Error::Unauthorized)?;
             let purpose = match held.mode {
-                Mode::Edge => Purpose::EdgePair,
+                Mode::Agent => Purpose::AgentPair,
                 Mode::Direct => Purpose::Pair,
             };
             (purpose, Some(invitation))
@@ -442,7 +442,7 @@ impl Peers {
     ) -> Result<Signed<PairReceipt>, Error> {
         proof.verify("pair", &proof.payload.challenge.actor)?;
         let challenge = proof.payload.challenge;
-        if !matches!(challenge.purpose, Purpose::Pair | Purpose::EdgePair) {
+        if !matches!(challenge.purpose, Purpose::Pair | Purpose::AgentPair) {
             return Err(Error::Unauthorized);
         }
         let mut pending = self.pending.lock().await;
@@ -483,7 +483,7 @@ impl Peers {
             });
         }
         file.trusted.insert(actor.id, trusted);
-        if mode == Mode::Edge {
+        if mode == Mode::Agent {
             // The manager keeps the node it invited so it can dial it back over
             // the session the node opens. It has no address of its own to reach.
             file.hosts.entry(actor.id).or_insert(Host {
@@ -491,7 +491,7 @@ impl Peers {
                 name: label,
                 endpoint: None,
                 identity: actor.clone(),
-                mode: Mode::Edge,
+                mode: Mode::Agent,
             });
         }
         locked.commit(file).await?;
@@ -536,7 +536,7 @@ impl Peers {
             .read(|file| {
                 file.hosts
                     .get(&actor.id)
-                    .is_some_and(|host| host.mode == Mode::Edge)
+                    .is_some_and(|host| host.mode == Mode::Agent)
             })
             .await
         {
@@ -547,34 +547,34 @@ impl Peers {
 
     /// A manager's own inbound side: prove an agent is the one this instance invited,
     /// without granting it any authority over this instance's resources.
-    pub(crate) async fn edge_challenge(
+    pub(crate) async fn agent_challenge(
         &self,
         signer: &IdentitySigner,
         id: Uuid,
     ) -> Result<Signed<Challenge>, Error> {
-        let host = self.edge_host(id).await?;
+        let host = self.agent_host(id).await?;
         if host.identity.id == signer.identity.id {
             return Err(Error::Unauthorized);
         }
-        self.challenge_actor(signer, host.identity, Purpose::EdgeSession, None)
+        self.challenge_actor(signer, host.identity, Purpose::AgentSession, None)
             .await
     }
 
-    pub(crate) async fn authorize_edge_session(
+    pub(crate) async fn authorize_agent_session(
         &self,
         signer: &IdentitySigner,
-        proof: &Signed<EdgeSessionProof>,
+        proof: &Signed<AgentSessionProof>,
     ) -> Result<Host, Error> {
-        proof.verify("edge-session", &proof.payload.challenge.actor)?;
+        proof.verify("agent-session", &proof.payload.challenge.actor)?;
         let challenge = proof.payload.challenge.clone();
         let mut pending = self.pending.lock().await;
         consume(
             &mut pending,
             &challenge,
             &signer.identity,
-            Purpose::EdgeSession,
+            Purpose::AgentSession,
         )?;
-        let host = self.edge_host(challenge.actor.id).await?;
+        let host = self.agent_host(challenge.actor.id).await?;
         if host.identity != challenge.actor {
             return Err(Error::Unauthorized);
         }
@@ -585,18 +585,18 @@ impl Peers {
     /// The Agent side of pairing: prove the invitation, then remember the
     /// manager this instance will dial. Only one upstream is kept, and pairing is
     /// never retried automatically.
-    pub(crate) async fn join_edge(
+    pub(crate) async fn join_agent(
         &self,
         signer: &IdentitySigner,
         invitation: Invitation,
         proxy: Option<String>,
-    ) -> Result<EdgeUpstream, Error> {
-        if invitation.mode != Mode::Edge {
+    ) -> Result<AgentUpstream, Error> {
+        if invitation.mode != Mode::Agent {
             return Err(Error::PeerRequest {
                 reason: "invitation.mode: this invitation is for a Direct connection",
             });
         }
-        let endpoint = endpoint(&invitation.endpoint, Mode::Edge)?;
+        let endpoint = endpoint(&invitation.endpoint, Mode::Agent)?;
         invitation.identity.key()?;
         if invitation.version != 1
             || invitation.identity.id == signer.identity.id
@@ -612,9 +612,9 @@ impl Peers {
             });
         }
         let proxy = proxy.map(|url| proxy_url(&url)).transpose()?.flatten();
-        if self.edge_upstream().await.is_some() {
+        if self.agent_upstream().await.is_some() {
             return Err(Error::PeerConflict {
-                reason: "edge: this instance already has an upstream manager; disconnect first",
+                reason: "agent: this instance already has an upstream manager; disconnect first",
             });
         }
         let challenge = self
@@ -623,13 +623,13 @@ impl Peers {
                 &endpoint,
                 &invitation.identity,
                 Some(invitation.id),
-                Purpose::EdgePair,
+                Purpose::AgentPair,
             )
             .await?;
         let receipt: Signed<PairReceipt> = self
             .post(
                 &endpoint,
-                Mode::Edge,
+                Mode::Agent,
                 "pairings",
                 &signer.sign(
                     "pair",
@@ -650,19 +650,19 @@ impl Peers {
         {
             return Err(Error::PeerUncertain);
         }
-        let link = EdgeUpstream {
+        let link = AgentUpstream {
             manager: invitation.identity,
             endpoint,
             proxy,
         };
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
-        if file.edge.is_some() {
+        if file.agent.is_some() {
             return Err(Error::PeerConflict {
-                reason: "edge: this instance already has an upstream manager; disconnect first",
+                reason: "agent: this instance already has an upstream manager; disconnect first",
             });
         }
-        file.edge = Some(link.clone());
+        file.agent = Some(link.clone());
         // The manager that invited this instance is the one allowed to operate it.
         file.trusted.insert(
             link.manager.id,
@@ -677,40 +677,40 @@ impl Peers {
             .commit(file)
             .await
             .map_err(|_| Error::PeerUncertain)?;
-        self.edge.reconnect();
+        self.agent.reconnect();
         Ok(link)
     }
 
-    pub(crate) async fn leave_edge(&self) -> Result<(), Error> {
+    pub(crate) async fn leave_agent(&self) -> Result<(), Error> {
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
-        let link = file.edge.take().ok_or(Error::PeerNotFound)?;
+        let link = file.agent.take().ok_or(Error::PeerNotFound)?;
         // Leaving also revokes the manager's incoming resource grant.
         file.trusted.remove(&link.manager.id);
         locked.commit(file).await?;
         // A configuration change, not a process shutdown: the loop stays alive to
         // notice the upstream is gone and to accept a new one later.
-        self.edge.reconnect();
+        self.agent.reconnect();
         Ok(())
     }
 
-    pub(crate) async fn edit_edge_upstream(
+    pub(crate) async fn edit_agent_upstream(
         &self,
         endpoint: Option<String>,
         proxy: Option<Option<String>>,
-    ) -> Result<EdgeUpstream, Error> {
+    ) -> Result<AgentUpstream, Error> {
         let locked = self.file.lock().await;
         let mut file = locked.get().clone();
-        let link = file.edge.as_mut().ok_or(Error::PeerNotFound)?;
+        let link = file.agent.as_mut().ok_or(Error::PeerNotFound)?;
         if let Some(url) = endpoint {
-            link.endpoint = super::peers::endpoint(&url, Mode::Edge)?;
+            link.endpoint = super::peers::endpoint(&url, Mode::Agent)?;
         }
         if let Some(proxy) = proxy {
             link.proxy = proxy.map(|url| proxy_url(&url)).transpose()?.flatten();
         }
         let result = link.clone();
         locked.commit(file).await?;
-        self.edge.reconnect();
+        self.agent.reconnect();
         Ok(result)
     }
 
@@ -831,13 +831,13 @@ pub(crate) fn manager_endpoint(value: &str) -> Result<String, Error> {
     let base = value.strip_suffix("/api").ok_or(Error::PeerRequest {
         reason: "manager-api-url: expected an API base URL ending in /api",
     })?;
-    endpoint(base, Mode::Edge)
+    endpoint(base, Mode::Agent)
 }
 
 pub(crate) fn endpoint(value: &str, mode: Mode) -> Result<String, Error> {
     let invalid = || {
         Error::PeerRequest { reason: match mode {
-            Mode::Edge => "endpoint: use HTTP or HTTPS, without credentials, query or fragment",
+            Mode::Agent => "endpoint: use HTTP or HTTPS, without credentials, query or fragment",
             Mode::Direct => "endpoint: use HTTPS, without credentials, query or fragment; HTTP is only allowed for a loopback IP",
         } }
     };
@@ -847,7 +847,7 @@ pub(crate) fn endpoint(value: &str, mode: Mode) -> Result<String, Error> {
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
         _ => false,
     };
-    if !(url.scheme() == "https" || url.scheme() == "http" && (mode == Mode::Edge || loopback))
+    if !(url.scheme() == "https" || url.scheme() == "http" && (mode == Mode::Agent || loopback))
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()

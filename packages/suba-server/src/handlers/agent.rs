@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     dto::Authenticated,
     error::Error,
-    state::peers::{edge, EdgeUpstream, Identity, Invitation},
+    state::peers::{agent, AgentUpstream, Identity, Invitation},
     AppState,
 };
 
@@ -29,13 +29,13 @@ pub(crate) async fn connect(
     Query(query): Query<ConnectQuery>,
     upgrade: WebSocketUpgrade,
 ) -> Result<Response, Error> {
-    state.peers().edge_host(query.host).await?;
+    state.peers().agent_host(query.host).await?;
     state.settings().existing_peer_signer().await?;
     Ok(upgrade
-        .max_message_size(edge::FRAME_LIMIT)
-        .max_frame_size(edge::FRAME_LIMIT)
-        .max_write_buffer_size(edge::FRAME_LIMIT + 128 * 1024)
-        .on_upgrade(move |socket| edge::accept(state, query.host, socket)))
+        .max_message_size(agent::FRAME_LIMIT)
+        .max_frame_size(agent::FRAME_LIMIT)
+        .max_write_buffer_size(agent::FRAME_LIMIT + 128 * 1024)
+        .on_upgrade(move |socket| agent::accept(state, query.host, socket)))
 }
 
 /// What this node knows about its own upstream manager.
@@ -43,8 +43,8 @@ pub(crate) async fn connect(
 /// The proxy is reported as configured or not: its credentials are never echoed
 /// back, so a redacted value cannot be saved over the real one.
 #[derive(Serialize)]
-pub struct EdgeView {
-    pub state: edge::EdgeState,
+pub struct AgentView {
+    pub state: agent::AgentState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,20 +52,20 @@ pub struct EdgeView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub manager: Option<EdgeManager>,
+    pub manager: Option<AgentManager>,
     pub proxy_configured: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_endpoint: Option<String>,
 }
 
 #[derive(Serialize)]
-pub struct EdgeManager {
+pub struct AgentManager {
     pub identity: Identity,
     pub endpoint: String,
 }
 
 #[derive(Deserialize)]
-pub struct JoinEdge {
+pub struct JoinAgent {
     pub invitation: Invitation,
     #[serde(default)]
     pub proxy: Option<String>,
@@ -73,7 +73,7 @@ pub struct JoinEdge {
 
 /// A connection edit. Omitting `proxy` leaves it as it is; `null` clears it.
 #[derive(Deserialize)]
-pub struct EditEdge {
+pub struct EditAgent {
     #[serde(default)]
     pub endpoint: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
@@ -88,14 +88,14 @@ where
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
-fn view(status: edge::EdgeStatus, upstream: Option<&EdgeUpstream>) -> EdgeView {
+fn view(status: agent::AgentStatus, upstream: Option<&AgentUpstream>) -> AgentView {
     let configured = upstream.and_then(|link| link.proxy.as_deref());
-    EdgeView {
+    AgentView {
         state: status.state,
         reason: status.reason,
         connected_at: status.connected_at,
         last_seen: status.last_seen,
-        manager: upstream.map(|link| EdgeManager {
+        manager: upstream.map(|link| AgentManager {
             identity: link.manager.clone(),
             endpoint: link.endpoint.clone(),
         }),
@@ -113,43 +113,43 @@ fn sanitized_proxy(url: &str) -> Option<String> {
     Some(parsed.as_str().trim_end_matches('/').to_string())
 }
 
-pub async fn edge_view(State(state): State<AppState>, _auth: Authenticated) -> Json<EdgeView> {
-    let upstream = state.peers().edge_upstream().await;
-    Json(view(state.peers().edge.local_status(), upstream.as_ref()))
+pub async fn agent_view(State(state): State<AppState>, _auth: Authenticated) -> Json<AgentView> {
+    let upstream = state.peers().agent_upstream().await;
+    Json(view(state.peers().agent.local_status(), upstream.as_ref()))
 }
 
-pub async fn join_edge(
+pub async fn join_agent(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Json(body): Json<JoinEdge>,
-) -> Result<(StatusCode, Json<EdgeView>), Error> {
+    Json(body): Json<JoinAgent>,
+) -> Result<(StatusCode, Json<AgentView>), Error> {
     let signer = state.settings().peer_signer().await?;
     let link = state
         .peers()
-        .join_edge(&signer, body.invitation, body.proxy)
+        .join_agent(&signer, body.invitation, body.proxy)
         .await?;
     Ok((
         StatusCode::CREATED,
-        Json(view(state.peers().edge.local_status(), Some(&link))),
+        Json(view(state.peers().agent.local_status(), Some(&link))),
     ))
 }
 
-pub async fn edit_edge(
+pub async fn edit_agent(
     State(state): State<AppState>,
     _auth: Authenticated,
-    Json(body): Json<EditEdge>,
-) -> Result<Json<EdgeView>, Error> {
+    Json(body): Json<EditAgent>,
+) -> Result<Json<AgentView>, Error> {
     let link = state
         .peers()
-        .edit_edge_upstream(body.endpoint, body.proxy)
+        .edit_agent_upstream(body.endpoint, body.proxy)
         .await?;
-    Ok(Json(view(state.peers().edge.local_status(), Some(&link))))
+    Ok(Json(view(state.peers().agent.local_status(), Some(&link))))
 }
 
-pub async fn leave_edge(
+pub async fn leave_agent(
     State(state): State<AppState>,
     _auth: Authenticated,
 ) -> Result<StatusCode, Error> {
-    state.peers().leave_edge().await?;
+    state.peers().leave_agent().await?;
     Ok(StatusCode::NO_CONTENT)
 }

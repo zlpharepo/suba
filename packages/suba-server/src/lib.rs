@@ -106,7 +106,7 @@ impl SubaServer {
         };
         refresher.abort();
         let _ = refresher.await;
-        self.state.peers().edge.shutdown();
+        self.state.peers().agent.shutdown();
         #[cfg(feature = "singbox-core")]
         {
             observing.abort();
@@ -157,15 +157,15 @@ impl SubaServer {
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     ) -> Result<(), Error> {
-        let edging = tokio::spawn(state::peers::edge::run(self.state.clone()));
+        let agent_session = tokio::spawn(state::peers::agent::run(self.state.clone()));
         #[cfg(feature = "singbox-core")]
         let observing = tokio::spawn(self.state.observation().run(self.state.singbox()));
         #[cfg(feature = "singbox-core")]
         let starting = tokio::spawn(handlers::singbox::autostart(self.state.clone()));
         shutdown.await;
-        self.state.peers().edge.shutdown();
-        edging.abort();
-        let _ = edging.await;
+        self.state.peers().agent.shutdown();
+        agent_session.abort();
+        let _ = agent_session.await;
         #[cfg(feature = "singbox-core")]
         {
             self.state.singbox().begin_shutdown();

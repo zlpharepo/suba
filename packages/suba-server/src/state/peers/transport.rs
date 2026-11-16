@@ -149,8 +149,8 @@ impl Peers {
         invitation: Option<Uuid>,
         purpose: Purpose,
     ) -> Result<Challenge, Error> {
-        let mode = if purpose == Purpose::EdgePair {
-            Mode::Edge
+        let mode = if purpose == Purpose::AgentPair {
+            Mode::Agent
         } else {
             Mode::Direct
         };

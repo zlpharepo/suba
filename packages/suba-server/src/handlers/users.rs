@@ -228,7 +228,7 @@ pub async fn index(
         view.inbounds = access.users[&view.name].inbounds.clone();
     }
     for node in state.peers().hosts().await {
-        if node.mode != crate::state::peers::Mode::Edge {
+        if node.mode != crate::state::peers::Mode::Agent {
             continue;
         }
         let scoped = state.for_agent(node.id).await?;
@@ -451,7 +451,7 @@ pub async fn put(
     for entry in &body.inbounds {
         if let Some(id) = entry.host {
             let host = state.peers().host(id).await?;
-            if host.mode != crate::state::peers::Mode::Edge {
+            if host.mode != crate::state::peers::Mode::Agent {
                 return Err(Error::Document(
                     "inbounds.host: expected an Agent".to_string(),
                 ));
@@ -598,12 +598,12 @@ pub(crate) async fn user_artifact(
             entry.host.is_some_and(|id| {
                 !hosts
                     .iter()
-                    .any(|host| host.id == id && host.mode == crate::state::peers::Mode::Edge)
+                    .any(|host| host.id == id && host.mode == crate::state::peers::Mode::Agent)
             })
         })
         .count();
     for node in hosts {
-        if node.mode != crate::state::peers::Mode::Edge {
+        if node.mode != crate::state::peers::Mode::Agent {
             continue;
         }
         let scoped = state.for_agent(node.id).await?;
@@ -686,7 +686,7 @@ pub async fn endpoints(
     let mut view = endpoint_view(&state).await?;
     if state.target_host().is_none() {
         for host in state.peers().hosts().await {
-            if host.mode != crate::state::peers::Mode::Edge {
+            if host.mode != crate::state::peers::Mode::Agent {
                 continue;
             }
             let scoped = state.for_agent(host.id).await?;

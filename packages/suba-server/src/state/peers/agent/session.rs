@@ -12,12 +12,12 @@ use super::{
     *,
 };
 use crate::{
-    state::peers::{EdgeSessionProof, EdgeUpstream, Host, Identity, IdentitySigner},
+    state::peers::{AgentSessionProof, AgentUpstream, Host, Identity, IdentitySigner},
     AppState,
 };
 
 pub(crate) async fn accept(state: AppState, id: Uuid, socket: axum::extract::ws::WebSocket) {
-    let mut control = state.peers().edge.control.subscribe();
+    let mut control = state.peers().agent.control.subscribe();
     let mut socket = wire::server_socket(socket);
     tokio::select! {
         _ = stopped(&mut control) => {},
@@ -41,7 +41,7 @@ struct Attached {
 
 impl Drop for Attached {
     fn drop(&mut self) {
-        self.state.peers().edge.detach(self.host, &self.session);
+        self.state.peers().agent.detach(self.host, &self.session);
     }
 }
 
@@ -51,8 +51,8 @@ where
 {
     let (host, signer, session_id) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         let signer = state.settings().existing_peer_signer().await?;
-        let expected = state.peers().edge_host(id).await?;
-        let challenge = state.peers().edge_challenge(&signer, id).await?;
+        let expected = state.peers().agent_host(id).await?;
+        let challenge = state.peers().agent_challenge(&signer, id).await?;
         let nonce = challenge.payload.nonce.clone();
         wire::send(socket, &ManagerFrame::Challenge { proof: challenge }).await?;
         let AgentFrame::Proof { proof } = wire::receive(socket, 16 * 1024).await? else {
@@ -63,7 +63,7 @@ where
         }
         let host = state
             .peers()
-            .authorize_edge_session(&signer, &proof)
+            .authorize_agent_session(&signer, &proof)
             .await?;
         if host.id != id || host.identity != expected.identity {
             return Err(Error::Unauthorized);
@@ -73,7 +73,7 @@ where
             socket,
             &ManagerFrame::Ready {
                 proof: signer.sign(
-                    "edge-ready",
+                    "agent-ready",
                     Ready {
                         nonce,
                         session: session_id,
@@ -90,7 +90,7 @@ where
     .await
     .map_err(|_| Error::PeerUnavailable)??;
     let (session, mut commands) = Session::new(session_id);
-    state.peers().edge.attach(id, session.clone())?;
+    state.peers().agent.attach(id, session.clone())?;
     let _attached = Attached {
         state: state.clone(),
         host: id,
@@ -135,7 +135,7 @@ where
 }
 
 async fn valid_host(state: &AppState, host: &Host, own: &Identity) -> Result<(), Error> {
-    let current = state.peers().edge_host(host.id).await?;
+    let current = state.peers().agent_host(host.id).await?;
     if current.identity != host.identity
         || state.settings().existing_peer_signer().await?.identity != *own
     {
@@ -145,15 +145,15 @@ async fn valid_host(state: &AppState, host: &Host, own: &Identity) -> Result<(),
 }
 
 pub(crate) async fn run(state: AppState) {
-    let hub = &state.peers().edge;
+    let hub = &state.peers().agent;
     let mut control = hub.control.subscribe();
     let mut failures = 0_u32;
     loop {
         if control.borrow_and_update().stopped {
             return;
         }
-        let Some(upstream) = state.peers().edge_upstream().await else {
-            hub.local(EdgeStatus::new(EdgeState::Disabled, None));
+        let Some(upstream) = state.peers().agent_upstream().await else {
+            hub.local(AgentStatus::new(AgentState::Disabled, None));
             tokio::select! {
                 _ = control.changed() => {},
                 _ = tokio::time::sleep(VALIDATE_INTERVAL) => {},
@@ -161,7 +161,7 @@ pub(crate) async fn run(state: AppState) {
             failures = 0;
             continue;
         };
-        hub.local(EdgeStatus::new(EdgeState::Connecting, None));
+        hub.local(AgentStatus::new(AgentState::Connecting, None));
         let (result, healthy) = tokio::select! {
             _ = control.changed() => { failures = 0; continue; },
             result = agent_connect(&state, &upstream) => result,
@@ -169,17 +169,17 @@ pub(crate) async fn run(state: AppState) {
         if healthy {
             failures = 0;
         }
-        hub.local(EdgeStatus::new(
+        hub.local(AgentStatus::new(
             if matches!(result, Err(Error::Unauthorized | Error::PeerIdentity)) {
-                EdgeState::Unauthorized
+                AgentState::Unauthorized
             } else {
-                EdgeState::Offline
+                AgentState::Offline
             },
             Some(
                 if matches!(result, Err(Error::Unauthorized | Error::PeerIdentity)) {
-                    "edge.unauthorized"
+                    "agent.unauthorized"
                 } else {
-                    "edge.disconnected"
+                    "agent.disconnected"
                 },
             ),
         ));
@@ -192,11 +192,11 @@ pub(crate) async fn run(state: AppState) {
     }
 }
 
-async fn agent_connect(state: &AppState, upstream: &EdgeUpstream) -> (Result<(), Error>, bool) {
+async fn agent_connect(state: &AppState, upstream: &AgentUpstream) -> (Result<(), Error>, bool) {
     let handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
         state
             .peers()
-            .edge_manager_authorized(&upstream.manager)
+            .agent_manager_authorized(&upstream.manager)
             .await?;
         let signer = state.settings().existing_peer_signer().await?;
         let client = crate::state::peers::outbound_builder(upstream.proxy.as_deref())?
@@ -219,7 +219,7 @@ async fn agent_connect(state: &AppState, upstream: &EdgeUpstream) -> (Result<(),
         Ok(Err(error)) => return (Err(error), false),
         Err(_) => return (Err(Error::PeerUnavailable), false),
     };
-    state.peers().edge.local(EdgeStatus::online());
+    state.peers().agent.local(AgentStatus::online());
     let started = Instant::now();
     let result = agent(state, upstream, &signer.identity, session, &mut socket).await;
     (result, started.elapsed() >= STALE_TIMEOUT)
@@ -242,8 +242,8 @@ where
         socket,
         &AgentFrame::Proof {
             proof: signer.sign(
-                "edge-session",
-                EdgeSessionProof {
+                "agent-session",
+                AgentSessionProof {
                     challenge: challenge.clone(),
                 },
             )?,
@@ -258,23 +258,23 @@ where
 
 async fn valid_upstream(
     state: &AppState,
-    upstream: &EdgeUpstream,
+    upstream: &AgentUpstream,
     own: &Identity,
 ) -> Result<(), Error> {
-    if state.peers().edge_upstream().await.as_ref() != Some(upstream)
+    if state.peers().agent_upstream().await.as_ref() != Some(upstream)
         || state.settings().existing_peer_signer().await?.identity != *own
     {
         return Err(Error::Unauthorized);
     }
     state
         .peers()
-        .edge_manager_authorized(&upstream.manager)
+        .agent_manager_authorized(&upstream.manager)
         .await
 }
 
 async fn agent<S>(
     state: &AppState,
-    upstream: &EdgeUpstream,
+    upstream: &AgentUpstream,
     own: &Identity,
     session: Uuid,
     socket: &mut S,
@@ -300,7 +300,7 @@ where
                     ManagerFrame::Ping { session: received, id } if received == session && id > last_ping => {
                         last_ping = id;
                         seen_ping = Instant::now();
-                        state.peers().edge.local_seen();
+                        state.peers().agent.local_seen();
                         wire::send(socket, &AgentFrame::Pong { session, id }).await?;
                     },
                     ManagerFrame::Call { session: received, id, call } if received == session && id > last_call => {
@@ -330,28 +330,28 @@ where
 
 async fn execute(
     state: &AppState,
-    upstream: &EdgeUpstream,
+    upstream: &AgentUpstream,
     own: &Identity,
-    call: EdgeCall,
-) -> Result<EdgeAnswer, Error> {
+    call: AgentCall,
+) -> Result<AgentAnswer, Error> {
     valid_upstream(state, upstream, own).await?;
     match call {
-        EdgeCall::Challenge(request) => {
+        AgentCall::Challenge(request) => {
             if request.actor != upstream.manager || request.invitation.is_some() {
                 return Err(Error::Unauthorized);
             }
             let signer = state.settings().existing_peer_signer().await?;
-            Ok(EdgeAnswer::Challenge(
+            Ok(AgentAnswer::Challenge(
                 state.peers().challenge(&signer, request).await?,
             ))
         }
-        EdgeCall::Resource(proof) => {
+        AgentCall::Resource(proof) => {
             if proof.payload.challenge.actor != upstream.manager
                 || proof.payload.challenge.target != *own
             {
                 return Err(Error::Unauthorized);
             }
-            Ok(EdgeAnswer::Resource(
+            Ok(AgentAnswer::Resource(
                 crate::handlers::peers::execute_resource(state.clone(), proof).await?,
             ))
         }

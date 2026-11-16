@@ -124,6 +124,39 @@ async fn machine_handshakes_do_not_initialize_an_unpaired_instance() {
 }
 
 #[tokio::test]
+async fn agent_control_route_pairs_and_persists_the_manager_binding() {
+    let manager = Server::start().await;
+    let node = Server::start().await;
+    let route = "/api/peers/agent";
+    assert_eq!(node.get(route).send().await.unwrap().status(), 401);
+    assert_eq!(get(&node, route).await["state"], "disabled");
+    let invitation = post(
+        &manager,
+        "/api/peers/invitations",
+        json!({"name": "Example Agent", "endpoint": manager.base, "mode": "agent"}),
+    )
+    .await;
+    assert_eq!(invitation.status(), 201);
+    let invitation = body(invitation).await;
+    assert_eq!(invitation["mode"], "agent");
+    let joined = post(&node, route, json!({"invitation": invitation})).await;
+    assert_eq!(joined.status(), 201);
+    assert_eq!(body(joined).await["manager"]["endpoint"], manager.base);
+    assert_eq!(get(&manager, "/api/environments").await[0]["mode"], "agent");
+
+    let saved: Value =
+        crate::config::read_config(node.root.join("config").to_str().unwrap(), "peers").unwrap();
+    assert_eq!(saved["agent"]["endpoint"], manager.base);
+
+    let response = node.put_json(route, json!({"proxy": null})).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(body(response).await["proxy_configured"], false);
+    let response = node.authed(Method::DELETE, route).send().await.unwrap();
+    assert_eq!(response.status(), 204);
+    assert!(get(&node, route).await["manager"].is_null());
+}
+
+#[tokio::test]
 async fn direct_management_preserves_remote_ownership_and_local_authentication() {
     let local = Server::start().await;
     let remote = Server::start().await;
@@ -444,7 +477,7 @@ async fn explicit_agent_pairing_uses_no_listener_or_local_management_resources_a
             &manager,
             "/api/peers/invitations",
             json!({
-                "name": "Example Agent", "endpoint": manager_endpoint, "mode": "edge",
+                "name": "Example Agent", "endpoint": manager_endpoint, "mode": "agent",
             }),
         )
         .await,
