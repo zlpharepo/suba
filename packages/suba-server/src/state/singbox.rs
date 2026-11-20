@@ -12,8 +12,8 @@
 //! Provider refreshes and selection changes never reload the runtime product.
 //!
 //! File and process operations run on the blocking pool. Release fetching is
-//! asynchronous; one in-memory cache shared by the releases route and install
-//! preflight keeps concurrent requests from hitting the upstream separately.
+//! asynchronous. The releases route and install preflight share a compact
+//! snapshot so concurrent requests make a single upstream call.
 //! The process itself outlives any single request.
 //!
 //! **Preflight precedes interruption.** Schema and native validation use the
@@ -28,7 +28,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{borrow::Borrow, collections::HashMap, future::Future};
 
 use serde::{Deserialize, Serialize};
@@ -206,10 +206,18 @@ const RELEASES_TTL: Duration = Duration::from_secs(5 * 60);
 /// An expired listing remains useful while the release API refuses requests.
 const RELEASES_RETRY: Duration = Duration::from_secs(60);
 
+const RELEASES_FILE: &str = "releases.json";
+
+#[derive(Serialize, Deserialize)]
+struct ReleaseFile<T> {
+    fetched_at: SystemTime,
+    platform: Option<String>,
+    values: T,
+}
+
 struct ReleasesCache {
-    fetched_at: Instant,
-    retry_after: Instant,
-    values: Vec<Release>,
+    next_fetch: Instant,
+    values: Arc<[Release]>,
 }
 
 /// A schema, as it was read: which version's, which bytes, and their hash.
@@ -980,42 +988,91 @@ impl SingboxStore {
     }
 
     /// What the release server lists.
-    pub(crate) async fn releases(&self, settings: &SettingsStore) -> Result<Vec<Release>, Error> {
+    pub(crate) async fn releases(&self, settings: &SettingsStore) -> Result<Arc<[Release]>, Error> {
         self.releases_from(settings.github_request(&self.http, RELEASES))
             .await
     }
 
-    pub(crate) async fn clear_release_cache(&self) {
-        self.releases.lock().await.take();
+    /// Pick up new GitHub credentials while retaining the last good listing.
+    pub(crate) async fn expire_release_cache(&self) {
+        let mut cached = self.releases.lock().await;
+        if cached.is_none() {
+            *cached = self.read_release_cache(core::platform().ok()).await;
+        }
+        if let Some(cache) = cached.as_mut() {
+            cache.next_fetch = Instant::now();
+        }
     }
 
     async fn releases_from(
         &self,
         request: impl Future<Output = reqwest::RequestBuilder>,
-    ) -> Result<Vec<Release>, Error> {
+    ) -> Result<Arc<[Release]>, Error> {
         let mut cached = self.releases.lock().await;
+        let platform = core::platform().ok();
+        if cached.is_none() {
+            *cached = self.read_release_cache(platform).await;
+        }
         if let Some(cache) = cached.as_ref() {
-            if cache.fetched_at.elapsed() < RELEASES_TTL || Instant::now() < cache.retry_after {
-                return Ok(cache.values.clone());
+            if Instant::now() < cache.next_fetch {
+                return Ok(Arc::clone(&cache.values));
             }
         }
 
-        match install::releases(request.await).await {
+        match install::releases(request.await, platform).await {
             Ok(releases) => {
+                let values: Arc<[Release]> = releases.into();
                 *cached = Some(ReleasesCache {
-                    fetched_at: Instant::now(),
-                    retry_after: Instant::now(),
-                    values: releases.clone(),
+                    next_fetch: Instant::now() + RELEASES_TTL,
+                    values: Arc::clone(&values),
                 });
-                Ok(releases)
+                self.write_release_cache(platform, Arc::clone(&values))
+                    .await;
+                Ok(values)
             }
             Err(error) => match cached.as_mut() {
                 Some(cache) => {
-                    cache.retry_after = Instant::now() + RELEASES_RETRY;
-                    Ok(cache.values.clone())
+                    cache.next_fetch = Instant::now() + RELEASES_RETRY;
+                    Ok(Arc::clone(&cache.values))
                 }
                 None => Err(error.into()),
             },
+        }
+    }
+
+    async fn read_release_cache(&self, platform: Option<&'static str>) -> Option<ReleasesCache> {
+        let root = self.dirs.root.clone();
+        tokio::task::spawn_blocking(move || {
+            let contents = fs::read_to_string(&root, RELEASES_FILE).ok()??;
+            let saved: ReleaseFile<Vec<Release>> = serde_json::from_str(&contents).ok()?;
+            if saved.platform.as_deref() != platform {
+                return None;
+            }
+            let age = saved.fetched_at.elapsed().unwrap_or(RELEASES_TTL);
+            Some(ReleasesCache {
+                next_fetch: Instant::now() + RELEASES_TTL.saturating_sub(age),
+                values: saved.values.into(),
+            })
+        })
+        .await
+        .ok()?
+    }
+
+    async fn write_release_cache(&self, platform: Option<&'static str>, values: Arc<[Release]>) {
+        let root = self.dirs.root.clone();
+        let saved = tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            let body = serde_json::to_vec(&ReleaseFile {
+                fetched_at: SystemTime::now(),
+                platform: platform.map(str::to_owned),
+                values: values.as_ref(),
+            })?;
+            fs::ensure_dir(&root)?;
+            fs::write_atomic(&root, RELEASES_FILE, body)?;
+            Ok(())
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
+            crate::tracing::warn!("could not persist the sing-box release listing");
         }
     }
 
@@ -1569,7 +1626,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    async fn release_server() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    async fn release_server(fail_at: usize) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1584,10 +1641,35 @@ mod tests {
                     continue;
                 }
                 let call = observed.fetch_add(1, Ordering::SeqCst);
-                let body = r#"[{"tag_name":"v1.14.2","assets":[]}]"#;
+                let platform = core::platform().unwrap();
+                let body = serde_json::json!([
+                    {"tag_name": "v1.13.9"},
+                    {"tag_name": "v1.15.0", "draft": true},
+                    {
+                        "tag_name": "v1.14.2",
+                        "body": "release-notes-fixture",
+                        "assets": [
+                            {
+                                "name": format!("sing-box-1.14.2-{platform}.tar.gz"),
+                                "size": "malformed-asset-fixture",
+                            },
+                            {
+                                "name": "unrelated-platform-fixture",
+                                "browser_download_url": "https://example.invalid/unrelated",
+                                "size": 1,
+                            },
+                            {
+                                "name": format!("sing-box-1.14.2-{platform}.tar.gz"),
+                                "browser_download_url": "https://example.invalid/selected",
+                                "size": 2,
+                                "digest": concat!("sha256:", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                            },
+                        ],
+                    },
+                ]).to_string();
                 // Each connection is answered once and dropped, so the client
                 // must not pool it: a reused dead connection is a failed fetch.
-                let response = if call == 2 {
+                let response = if call == fail_at {
                     "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         .to_string()
                 } else {
@@ -1613,12 +1695,14 @@ mod tests {
             reqwest::Client::new(),
             identity(),
         );
-        let (url, calls) = release_server().await;
+        let (url, calls) = release_server(2).await;
         let fetch = || store.releases_from(async { store.http.get(&url) });
 
         let (first, second) = tokio::join!(fetch(), fetch());
-        assert_eq!(first.unwrap()[0].version.as_str(), "1.14.2");
-        assert_eq!(second.unwrap()[0].version.as_str(), "1.14.2");
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first[0].version.as_str(), "1.14.2");
+        assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1631,11 +1715,11 @@ mod tests {
             "a fresh hit does not call upstream"
         );
 
-        store.releases.lock().await.as_mut().unwrap().fetched_at = Instant::now() - RELEASES_TTL;
+        store.releases.lock().await.as_mut().unwrap().next_fetch = Instant::now();
         assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "expiry fetches again");
 
-        store.releases.lock().await.as_mut().unwrap().fetched_at = Instant::now() - RELEASES_TTL;
+        store.releases.lock().await.as_mut().unwrap().next_fetch = Instant::now();
         assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -1648,13 +1732,73 @@ mod tests {
             3,
             "a failed refresh backs off"
         );
-        store.releases.lock().await.as_mut().unwrap().retry_after = Instant::now();
+        store.releases.lock().await.as_mut().unwrap().next_fetch = Instant::now();
         assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             4,
             "refresh resumes after backoff"
         );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_store_uses_its_saved_release_listing() {
+        use std::sync::atomic::Ordering;
+
+        let scratch = Scratch::new();
+        let open = || {
+            SingboxStore::new(
+                &scratch.0.join("config"),
+                &scratch.0.join("data"),
+                reqwest::Client::new(),
+                identity(),
+            )
+        };
+        let (url, calls) = release_server(1).await;
+        let store = open();
+        let listed = store
+            .releases_from(async { store.http.get(&url) })
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].assets.len(), 1);
+        assert_eq!(listed[0].assets[0].size, 2);
+        assert!(listed[0].assets[0].sha256.is_some());
+        let file = store.dirs.root.join(RELEASES_FILE);
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert!(!contents.contains("release-notes-fixture"));
+        assert!(!contents.contains("unrelated-platform-fixture"));
+        drop(store);
+
+        let restarted = open();
+        let restored = restarted
+            .releases_from(async { restarted.http.get(&url) })
+            .await
+            .unwrap();
+        assert_eq!(restored, listed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(restarted);
+
+        let mut expired: ReleaseFile<Vec<Release>> = serde_json::from_str(&contents).unwrap();
+        expired.fetched_at = SystemTime::now() - RELEASES_TTL;
+        let old_contents = serde_json::to_vec(&expired).unwrap();
+        fs::write_atomic(file.parent().unwrap(), RELEASES_FILE, &old_contents).unwrap();
+
+        let offline = open();
+        let restored = offline
+            .releases_from(async { offline.http.get(&url) })
+            .await
+            .unwrap();
+        assert_eq!(restored, listed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(std::fs::read(&file).unwrap(), old_contents);
+        offline.expire_release_cache().await;
+        offline
+            .releases_from(async { offline.http.get(&url) })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_ne!(std::fs::read(&file).unwrap(), old_contents);
     }
 
     #[tokio::test]
@@ -1668,24 +1812,13 @@ mod tests {
             reqwest::Client::new(),
             identity(),
         );
-        let (url, calls) = release_server().await;
+        let (url, calls) = release_server(0).await;
         let fetch = || store.releases_from(async { store.http.get(&url) });
-        let failed = format!("{url}/missing");
-
-        // A malformed path is still answered by this local server, so explicitly
-        // test a fresh upstream refusal by letting its third response be the
-        // first response for another store.
-        fetch().await.unwrap();
-        store.releases.lock().await.take();
-        fetch().await.unwrap();
-        assert!(store.releases.lock().await.take().is_some());
-        assert!(store
-            .releases_from(async { store.http.get(&failed) })
-            .await
-            .is_err());
+        assert!(fetch().await.is_err());
         assert!(store.releases.lock().await.is_none());
+        assert!(!store.dirs.root.join(RELEASES_FILE).exists());
         assert_eq!(fetch().await.unwrap().len(), 1);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     /// The schema accepts drafts that native validation or startup can reject,

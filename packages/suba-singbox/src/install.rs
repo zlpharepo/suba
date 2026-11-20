@@ -24,7 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::core::{extract, sha256_hex, Dirs, Error, Metadata, Release, Version};
+use crate::core::{extract, release_listing, sha256_hex, Dirs, Error, Metadata, Release, Version};
 use crate::spawn;
 
 /// The name the binary has inside a release archive, and the name it keeps.
@@ -239,8 +239,12 @@ pub fn uninstall(dirs: &Dirs, version: &Version, current: Option<&Version>) -> R
 /// What a release server lists.
 ///
 /// The caller owns the request so release credentials stay outside this crate.
-pub async fn releases(request: reqwest::RequestBuilder) -> Result<Vec<Release>, Error> {
-    let answer = request.send().await.map_err(|_| Error::Network {
+pub async fn releases(
+    request: reqwest::RequestBuilder,
+    platform: Option<&str>,
+) -> Result<Vec<Release>, Error> {
+    const MAX_LISTING_BYTES: u64 = 32 * 1024 * 1024;
+    let mut answer = request.send().await.map_err(|_| Error::Network {
         reason: "the release server could not be reached",
     })?;
 
@@ -249,18 +253,23 @@ pub async fn releases(request: reqwest::RequestBuilder) -> Result<Vec<Release>, 
         return Err(refused(status.as_u16()));
     }
 
-    let body = answer.bytes().await.map_err(|_| Error::Network {
+    let too_large = Error::Network {
+        reason: "the release listing exceeds the size limit",
+    };
+    let length = answer.content_length().unwrap_or_default();
+    if length > MAX_LISTING_BYTES {
+        return Err(too_large);
+    }
+    let mut body = Vec::with_capacity(length as usize);
+    while let Some(chunk) = answer.chunk().await.map_err(|_| Error::Network {
         reason: "the release listing stopped part way",
-    })?;
-
-    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| Error::Release {
-        field: "the listing",
-    })?;
-    let listed = value.as_array().ok_or(Error::Release {
-        field: "the listing",
-    })?;
-
-    listed.iter().map(Release::from_json).collect()
+    })? {
+        if body.len() as u64 + chunk.len() as u64 > MAX_LISTING_BYTES {
+            return Err(too_large);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    release_listing(&body, platform)
 }
 
 /// The bytes of one release asset.

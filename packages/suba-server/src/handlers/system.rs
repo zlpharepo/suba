@@ -49,7 +49,7 @@ pub(crate) async fn save_settings(
     if token_changed {
         state.web_release().lock().await.take();
         #[cfg(feature = "singbox-core")]
-        state.singbox().clear_release_cache().await;
+        state.singbox().expire_release_cache().await;
     }
     Ok(Json(settings))
 }

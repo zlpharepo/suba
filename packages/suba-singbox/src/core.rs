@@ -12,12 +12,13 @@
 //! caller's side of the same conversation — which is what keeps this testable
 //! with a twenty-line fixture instead of a release.
 
-use std::cmp::Ordering;
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
+use std::{borrow::Cow, cmp::Ordering};
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 
 /// The largest binary this will take out of an archive (128 MiB).
 ///
@@ -291,7 +292,7 @@ fn prerelease_order(mine: &str, theirs: &str) -> Ordering {
 }
 
 /// One downloadable file of a release.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Asset {
     /// Its file name, which is `<binary>-<version>-<platform>.<archive>`.
     pub name: String,
@@ -304,7 +305,7 @@ pub struct Asset {
 }
 
 /// One published release, as the release list describes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Release {
     /// The version it is.
     pub version: Version,
@@ -321,46 +322,11 @@ pub struct Release {
 impl Release {
     /// Read one release from the document the release API answers with.
     pub fn from_json(value: &serde_json::Value) -> Result<Self, Error> {
-        let tag = value
-            .get("tag_name")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(Error::Release { field: "tag_name" })?;
-
-        let assets = match value.get("assets").and_then(serde_json::Value::as_array) {
-            Some(assets) => assets
-                .iter()
-                .filter_map(|asset| {
-                    Some(Asset {
-                        name: asset.get("name")?.as_str()?.to_string(),
-                        url: asset.get("browser_download_url")?.as_str()?.to_string(),
-                        size: asset.get("size").and_then(serde_json::Value::as_u64)?,
-                        sha256: asset
-                            .get("digest")
-                            .and_then(serde_json::Value::as_str)
-                            .and_then(|digest| digest.strip_prefix("sha256:"))
-                            .map(str::to_string),
-                    })
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-
-        Ok(Self {
-            version: Version::from_tag(tag),
-            prerelease: value
-                .get("prerelease")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or_else(|| Version::from_tag(tag).is_prerelease()),
-            draft: value
-                .get("draft")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
-            html_url: value
-                .get("html_url")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
-            assets,
-        })
+        let payload = serde_json::value::to_raw_value(value)
+            .map_err(|_| Error::Release { field: "tag_name" })?;
+        let (wire, version) = WireRelease::read(&payload)?;
+        let assets = wire.assets().map(Asset::from).collect();
+        Ok(wire.into_release(version, assets))
     }
 
     /// The releases this build will install, newest first.
@@ -384,13 +350,113 @@ impl Release {
 
     /// The asset this platform runs, by the name sing-box gives it.
     pub fn asset_for(&self, platform: &str) -> Result<&Asset, Error> {
-        let name = format!("sing-box-{}-{platform}.tar.gz", self.version);
+        let name = asset_name(&self.version, platform);
 
         self.assets
             .iter()
             .find(|asset| asset.name == name)
             .ok_or(Error::NoAsset { name })
     }
+}
+
+fn asset_name(version: &Version, platform: &str) -> String {
+    format!("sing-box-{version}-{platform}.tar.gz")
+}
+
+/// Borrow large fields until the release and its platform asset have been selected.
+pub(super) fn release_listing(body: &[u8], platform: Option<&str>) -> Result<Vec<Release>, Error> {
+    let listed: Vec<&RawValue> = serde_json::from_slice(body).map_err(|_| Error::Release {
+        field: "the listing",
+    })?;
+    let floor = Version::from_tag(MIN_VERSION);
+    let mut releases = Vec::new();
+    for entry in listed {
+        let (wire, version) = WireRelease::read(entry)?;
+        if wire.is_draft() || version < floor {
+            continue;
+        }
+        let assets = platform
+            .and_then(|platform| {
+                let name = asset_name(&version, platform);
+                wire.assets().find(|asset| asset.name == name)
+            })
+            .map(Asset::from)
+            .into_iter()
+            .collect();
+        releases.push(wire.into_release(version, assets));
+    }
+    Ok(releases)
+}
+
+#[derive(Deserialize)]
+struct WireRelease<'a> {
+    tag_name: Option<&'a RawValue>,
+    prerelease: Option<&'a RawValue>,
+    draft: Option<&'a RawValue>,
+    html_url: Option<&'a RawValue>,
+    #[serde(borrow)]
+    assets: Option<&'a RawValue>,
+}
+
+impl<'a> WireRelease<'a> {
+    fn read(raw: &'a RawValue) -> Result<(Self, Version), Error> {
+        let missing = || Error::Release { field: "tag_name" };
+        if !raw.get().starts_with('{') {
+            return Err(missing());
+        }
+        let wire: Self = serde_json::from_str(raw.get()).map_err(|_| missing())?;
+        let tag: String = wire_field(wire.tag_name).ok_or_else(missing)?;
+        Ok((wire, Version::from_tag(&tag)))
+    }
+
+    fn is_draft(&self) -> bool {
+        wire_field(self.draft).unwrap_or(false)
+    }
+
+    fn assets(&self) -> impl Iterator<Item = WireAsset<'a>> {
+        wire_field::<Vec<&RawValue>>(self.assets)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|raw| raw.get().starts_with('{'))
+            .filter_map(|raw| serde_json::from_str(raw.get()).ok())
+    }
+
+    fn into_release(self, version: Version, assets: Vec<Asset>) -> Release {
+        Release {
+            prerelease: wire_field(self.prerelease).unwrap_or_else(|| version.is_prerelease()),
+            draft: self.is_draft(),
+            html_url: wire_field(self.html_url),
+            version,
+            assets,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WireAsset<'a> {
+    #[serde(borrow)]
+    name: Cow<'a, str>,
+    #[serde(borrow)]
+    browser_download_url: Cow<'a, str>,
+    size: u64,
+    #[serde(borrow)]
+    digest: Option<&'a RawValue>,
+}
+
+impl From<WireAsset<'_>> for Asset {
+    fn from(wire: WireAsset<'_>) -> Self {
+        Self {
+            name: wire.name.into_owned(),
+            url: wire.browser_download_url.into_owned(),
+            size: wire.size,
+            sha256: wire_field::<String>(wire.digest)
+                .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_owned)),
+        }
+    }
+}
+
+fn wire_field<'a, T: Deserialize<'a>>(value: Option<&'a RawValue>) -> Option<T> {
+    serde_json::from_str(value?.get()).ok()
 }
 
 /// The platform sing-box names its builds for, as `<os>-<arch>`.
