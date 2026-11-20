@@ -2,15 +2,30 @@
 
 [简体中文](README.zh-CN.md)
 
-SubA is a self-hosted service for collecting, converting, and distributing proxy subscriptions, with optional sing-box management.
+SubA is a lightweight, self-hosted proxy subscription service with optional sing-box management.
 
 SubA is in beta and was developed primarily with AI.
 
-## Deployment
+## Features
 
-After startup, open `http://localhost:8090` on the host and select **Install Web**. The first account you create becomes the administrator.
+- Proxy Subscription Import, Filtering, Conversion, and Distribution
+- Full JSON Schema-Driven sing-box Configuration
+- Per-User Inbound Access
+- Collection Bindings for sing-box Outbounds
+- Centralized sing-box Management Across Hosts via Agents
+- Single Rust Binary with File-Based Storage and No Database
 
-### CLI
+## sing-box
+
+Requires sing-box **1.14.0** or later.
+
+![The sing-box configuration page showing the DNS form and a running core](docs/images/sing-box.webp)
+
+## Getting Started
+
+### Installation
+
+#### Linux Binary
 
 Download the Linux amd64 or arm64 archive from [GitHub Releases](https://github.com/zlpharepo/suba/releases). Replace `amd64` with `arm64` on ARM64.
 
@@ -58,7 +73,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now suba.service
 ```
 
-### Docker CLI
+#### Docker CLI
 
 The Docker examples use host networking on Linux so sing-box can listen directly on the host's ports. The web UI listens on loopback. TUN requires additional device access and permissions.
 
@@ -70,7 +85,7 @@ docker run -d --name suba --restart unless-stopped --network host \
   ghcr.io/zlpharepo/suba:latest
 ```
 
-### Docker Compose
+#### Docker Compose
 
 Save as `compose.yaml` and run `docker compose up -d`.
 
@@ -90,6 +105,13 @@ volumes:
   suba-config:
   suba-data:
 ```
+
+### First Use
+
+After starting SubA, open `http://localhost:8090` on the host, select **Install Web**, and create the administrator account.
+
+- Add sources in **Providers** and publish subscription links from **Collections**.
+- Open **sing-box** to install a core, edit its native configuration, and start it.
 
 ## License
 

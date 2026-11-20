@@ -2,15 +2,30 @@
 
 [English](README.md)
 
-SubA 是一个自托管服务，可接收、转换和分发代理订阅，也可用于管理 sing-box。
+SubA 是轻量的自托管代理订阅服务，可选管理 sing-box。
 
 SubA 主要由 AI 编写，目前处于 Beta 阶段。
 
-## 部署
+## 功能特性
 
-启动后，在宿主机打开 `http://localhost:8090`，点击 **Install Web** 安装 Web 界面。首次创建的账户即为管理员。
+- 代理订阅导入、筛选、转换与分发
+- 基于 JSON Schema 驱动的完整 sing-box 配置
+- 按用户独立控制入站访问权限
+- 支持将订阅集合绑定至 sing-box 出站
+- 通过代理程序（Agent）实现跨主机的 sing-box 集中化管理
+- 单一 Rust 二进制文件，基于文件的存储，无数据库
 
-### CLI
+## sing-box
+
+要求 sing-box **1.14.0** 或更高版本。
+
+![sing-box 配置页面，展示 DNS 表单和内核运行状态](docs/images/sing-box.webp)
+
+## 快速开始
+
+### 安装
+
+#### Linux 二进制包
 
 从 [GitHub Releases](https://github.com/zlpharepo/suba/releases) 下载对应架构的 Linux 归档。在 ARM64 上将 `amd64` 改为 `arm64`。
 
@@ -58,7 +73,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now suba.service
 ```
 
-### Docker CLI
+#### Docker CLI
 
 以下 Docker 示例在 Linux 上使用 host 网络，sing-box 可直接监听宿主机端口。Web 界面监听在回环地址。TUN 需要额外的设备访问和权限。
 
@@ -70,7 +85,7 @@ docker run -d --name suba --restart unless-stopped --network host \
   ghcr.io/zlpharepo/suba:latest
 ```
 
-### Docker Compose
+#### Docker Compose
 
 保存为 `compose.yaml`，然后运行 `docker compose up -d`。
 
@@ -90,6 +105,13 @@ volumes:
   suba-config:
   suba-data:
 ```
+
+### 首次使用
+
+启动 SubA 后，在宿主机打开 `http://localhost:8090`，点击 **Install Web**，然后创建管理员账号。
+
+- 在**订阅源**中添加来源，在**集合**中创建分发链接。
+- 打开 **sing-box** 页面，安装内核、编辑原生配置并启动内核。
 
 ## 许可证
 
