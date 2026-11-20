@@ -353,10 +353,7 @@ async fn render_collection(
             .iter()
             .map(|(name, settings)| Ok((name.clone(), settings.filter.filter()?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()?;
-        let nodes = collection
-            .resolve(&index, &filters, &collection.filter()?)
-            .nodes;
-        drop(index);
+        let nodes = collection.resolve_owned(index, &filters, &collection.filter()?);
 
         let rendered = target.render(&nodes.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
         let artifact = Artifact {

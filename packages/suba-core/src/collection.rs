@@ -100,6 +100,41 @@ impl Collection {
         }
     }
 
+    /// Resolve render input in place when the caller owns the index.
+    pub fn resolve_owned(
+        &self,
+        index: NodeIndex,
+        providers: &BTreeMap<String, NodeFilter>,
+        filter: &NodeFilter,
+    ) -> Vec<IndexEntry> {
+        let mut members = BTreeMap::new();
+        for (position, name) in self.providers.iter().enumerate() {
+            if let Some(provider) = providers.get(name) {
+                members.entry(name.as_str()).or_insert((position, provider));
+            }
+        }
+
+        let mut nodes = index.into_entries();
+        nodes.retain(|entry| {
+            members
+                .get(entry.source.provider.as_str())
+                .is_some_and(|(_, provider)| admits_entry(entry, provider, filter))
+        });
+
+        if !members.values().map(|(position, _)| position).is_sorted() {
+            // Payload positions are unique within a provider, so these keys
+            // preserve its order without allocating a second entry buffer.
+            nodes.sort_unstable_by_key(|entry| {
+                (
+                    members[entry.source.provider.as_str()].0,
+                    entry.source.position,
+                )
+            });
+        }
+        crate::index::name_conflicts(&mut nodes);
+        nodes
+    }
+
     /// Count admitted nodes and report missing providers for a list view.
     pub fn summarize(
         &self,
@@ -133,7 +168,7 @@ impl Collection {
             };
 
             for entry in index.entries_for(name) {
-                if provider.admits(&entry.source.name) && filter.admits(&entry.source.name) {
+                if admits_entry(entry, provider, filter) {
                     admit(entry);
                 } else {
                     passed_over += 1;
@@ -143,6 +178,10 @@ impl Collection {
 
         (passed_over, unresolved)
     }
+}
+
+fn admits_entry(entry: &IndexEntry, provider: &NodeFilter, collection: &NodeFilter) -> bool {
+    provider.admits(&entry.source.name) && collection.admits(&entry.source.name)
 }
 
 /// Owned output names cannot change the provider's original spelling.
@@ -451,6 +490,35 @@ mod tests {
         assert_eq!(names(&narrowed), ["Alias"]);
         assert_eq!(narrowed.passed_over, 3);
         assert_eq!(narrowed.nodes[0].source.provider, "beta");
+    }
+
+    #[test]
+    fn owned_resolution_moves_filtered_entries_in_collection_order() {
+        let shared = link(ALPHA, "Shared");
+        let alpha = observed(&format!(
+            "{shared}{}{}",
+            link("a.example.com", "Provider drop"),
+            link("b.example.com", "Tail")
+        ));
+        let beta = observed(&format!("{shared}{}", link(BETA, "Collection drop")));
+        let index = index(&[("alpha", &alpha), ("beta", &beta)]);
+        let collection = collection(&["beta", "ghost", "alpha", "beta"]);
+        let filters = providers(vec![
+            ("alpha", filter(&[], &["Provider drop"])),
+            ("beta", unfiltered()),
+        ]);
+        let filter = filter(&[], &["Collection drop"]);
+        let beta_name = index.entries_for("beta")[0].source.name.as_ptr();
+
+        let borrowed = collection.resolve(&index, &filters, &filter);
+        let owned = collection.resolve_owned(index, &filters, &filter);
+
+        assert_eq!(
+            names(&borrowed),
+            ["[beta] Shared", "[alpha] Shared", "Tail"]
+        );
+        assert_eq!(owned, borrowed.nodes);
+        assert_eq!(owned[0].source.name.as_ptr(), beta_name);
     }
 
     #[test]

@@ -81,6 +81,10 @@ impl NodeIndex {
         &self.entries
     }
 
+    pub(crate) fn into_entries(self) -> Vec<IndexEntry> {
+        self.entries
+    }
+
     /// The contiguous entries for a provider, in payload order.
     pub(crate) fn entries_for(&self, provider: &str) -> &[IndexEntry] {
         let start = self
