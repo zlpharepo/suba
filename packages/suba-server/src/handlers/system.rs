@@ -18,7 +18,7 @@ pub struct SystemStatus {
     administrator_configured: bool,
 }
 
-/// Omitted fields preserve their values. A null token clears the credential.
+/// Omitted fields preserve their values. Null clears an optional GitHub setting.
 #[derive(Deserialize, Validate)]
 pub struct SystemSettingsChange {
     #[garde(length(min = 1, max = 64))]
@@ -26,6 +26,9 @@ pub struct SystemSettingsChange {
     #[serde(default, deserialize_with = "spoken_or_kept")]
     #[garde(skip)]
     github_token: Option<Option<String>>,
+    #[serde(default, deserialize_with = "spoken_or_kept")]
+    #[garde(skip)]
+    github_mirror: Option<Option<String>>,
 }
 
 /// Read the local instance settings, independent of the selected environment.
@@ -36,17 +39,21 @@ pub(crate) async fn settings(
     Ok(Json(state.settings().instance_settings().await?))
 }
 
-/// Reset release lookups after committing new credentials so retries can use them immediately.
+/// Apply GitHub settings before refreshing release lookups.
 pub(crate) async fn save_settings(
     _auth: Authenticated,
     State(state): State<AppState>,
     ValidatedJson(payload): ValidatedJson<SystemSettingsChange>,
 ) -> ResponseResult<Json<InstanceSettings>> {
-    let (settings, token_changed) = state
+    let (settings, github_changed) = state
         .settings()
-        .update_instance_settings(payload.subscription_prefix.as_deref(), payload.github_token)
+        .update_instance_settings(
+            payload.subscription_prefix.as_deref(),
+            payload.github_token,
+            payload.github_mirror,
+        )
         .await?;
-    if token_changed {
+    if github_changed {
         state.web_release().lock().await.take();
         #[cfg(feature = "singbox-core")]
         state.singbox().expire_release_cache().await;

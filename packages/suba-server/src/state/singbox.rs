@@ -40,7 +40,7 @@ use suba_singbox::run::{self, Runner, Status};
 use suba_singbox::schema::{Schema, Skipped, Verdict};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::settings::SettingsStore;
+use super::settings::{GitHubReleaseSettings, SettingsStore};
 use super::{
     metrics::{ProcessSampler, ProcessUsage},
     observation::Run as ObservedRun,
@@ -212,10 +212,13 @@ const RELEASES_FILE: &str = "releases.json";
 struct ReleaseFile<T> {
     fetched_at: SystemTime,
     platform: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mirror: Option<String>,
     values: T,
 }
 
 struct ReleasesCache {
+    mirror: Option<String>,
     next_fetch: Instant,
     values: Arc<[Release]>,
 }
@@ -988,9 +991,14 @@ impl SingboxStore {
     }
 
     /// What the release server lists.
-    pub(crate) async fn releases(&self, settings: &SettingsStore) -> Result<Arc<[Release]>, Error> {
-        self.releases_from(settings.github_request(&self.http, RELEASES))
-            .await
+    pub(crate) async fn releases(
+        &self,
+        github: &GitHubReleaseSettings,
+    ) -> Result<Arc<[Release]>, Error> {
+        self.releases_from(github.mirror(), async {
+            github.metadata_request(&self.http, RELEASES)
+        })
+        .await
     }
 
     /// Pick up new GitHub credentials while retaining the last good listing.
@@ -1006,12 +1014,21 @@ impl SingboxStore {
 
     async fn releases_from(
         &self,
+        mirror: Option<&str>,
         request: impl Future<Output = reqwest::RequestBuilder>,
     ) -> Result<Arc<[Release]>, Error> {
         let mut cached = self.releases.lock().await;
         let platform = core::platform().ok();
         if cached.is_none() {
             *cached = self.read_release_cache(platform).await;
+        }
+        // Listings belong to the source that served them, including after
+        // a restart with a different mirror in the instance configuration.
+        if cached
+            .as_ref()
+            .is_some_and(|cache| cache.mirror.as_deref() != mirror)
+        {
+            *cached = None;
         }
         if let Some(cache) = cached.as_ref() {
             if Instant::now() < cache.next_fetch {
@@ -1023,10 +1040,11 @@ impl SingboxStore {
             Ok(releases) => {
                 let values: Arc<[Release]> = releases.into();
                 *cached = Some(ReleasesCache {
+                    mirror: mirror.map(str::to_owned),
                     next_fetch: Instant::now() + RELEASES_TTL,
                     values: Arc::clone(&values),
                 });
-                self.write_release_cache(platform, Arc::clone(&values))
+                self.write_release_cache(platform, mirror.map(str::to_owned), Arc::clone(&values))
                     .await;
                 Ok(values)
             }
@@ -1050,6 +1068,7 @@ impl SingboxStore {
             }
             let age = saved.fetched_at.elapsed().unwrap_or(RELEASES_TTL);
             Some(ReleasesCache {
+                mirror: saved.mirror,
                 next_fetch: Instant::now() + RELEASES_TTL.saturating_sub(age),
                 values: saved.values.into(),
             })
@@ -1058,12 +1077,18 @@ impl SingboxStore {
         .ok()?
     }
 
-    async fn write_release_cache(&self, platform: Option<&'static str>, values: Arc<[Release]>) {
+    async fn write_release_cache(
+        &self,
+        platform: Option<&'static str>,
+        mirror: Option<String>,
+        values: Arc<[Release]>,
+    ) {
         let root = self.dirs.root.clone();
         let saved = tokio::task::spawn_blocking(move || -> Result<(), Error> {
             let body = serde_json::to_vec(&ReleaseFile {
                 fetched_at: SystemTime::now(),
                 platform: platform.map(str::to_owned),
+                mirror,
                 values: values.as_ref(),
             })?;
             fs::ensure_dir(&root)?;
@@ -1090,8 +1115,13 @@ impl SingboxStore {
             .into());
         }
         let platform = core::platform()?;
-        let releases = self.releases(settings).await?;
-        Ok(Self::asset_in(&releases, version, platform)?)
+        let github = settings.github().await;
+        let releases = self.releases(&github).await?;
+        let (mut asset, platform) = Self::asset_in(&releases, version, platform)?;
+        if let std::borrow::Cow::Owned(url) = github.url(&asset.url) {
+            asset.url = url;
+        }
+        Ok((asset, platform))
     }
 
     /// Find an asset before creating a task; an absent release is not queued.
@@ -1696,7 +1726,7 @@ mod tests {
             identity(),
         );
         let (url, calls) = release_server(2).await;
-        let fetch = || store.releases_from(async { store.http.get(&url) });
+        let fetch = || store.releases_from(None, async { store.http.get(&url) });
 
         let (first, second) = tokio::join!(fetch(), fetch());
         let first = first.unwrap();
@@ -1757,7 +1787,7 @@ mod tests {
         let (url, calls) = release_server(1).await;
         let store = open();
         let listed = store
-            .releases_from(async { store.http.get(&url) })
+            .releases_from(None, async { store.http.get(&url) })
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
@@ -1772,7 +1802,7 @@ mod tests {
 
         let restarted = open();
         let restored = restarted
-            .releases_from(async { restarted.http.get(&url) })
+            .releases_from(None, async { restarted.http.get(&url) })
             .await
             .unwrap();
         assert_eq!(restored, listed);
@@ -1786,7 +1816,7 @@ mod tests {
 
         let offline = open();
         let restored = offline
-            .releases_from(async { offline.http.get(&url) })
+            .releases_from(None, async { offline.http.get(&url) })
             .await
             .unwrap();
         assert_eq!(restored, listed);
@@ -1794,11 +1824,25 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), old_contents);
         offline.expire_release_cache().await;
         offline
-            .releases_from(async { offline.http.get(&url) })
+            .releases_from(None, async { offline.http.get(&url) })
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_ne!(std::fs::read(&file).unwrap(), old_contents);
+
+        let mirror = Some("https://mirror.example.invalid/");
+        let reconfigured = open();
+        reconfigured
+            .releases_from(mirror, async { reconfigured.http.get(&url) })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "a new source is fetched");
+        let restarted = open();
+        restarted
+            .releases_from(mirror, async { restarted.http.get(&url) })
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "the same source is reused");
     }
 
     #[tokio::test]
@@ -1813,7 +1857,7 @@ mod tests {
             identity(),
         );
         let (url, calls) = release_server(0).await;
-        let fetch = || store.releases_from(async { store.http.get(&url) });
+        let fetch = || store.releases_from(None, async { store.http.get(&url) });
         assert!(fetch().await.is_err());
         assert!(store.releases.lock().await.is_none());
         assert!(!store.dirs.root.join(RELEASES_FILE).exists());

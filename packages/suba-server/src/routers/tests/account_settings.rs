@@ -213,7 +213,7 @@ async fn github_token_is_write_only_and_preserves_other_instance_settings() {
     assert_eq!(set.status(), 200);
     assert_eq!(
         body(set).await,
-        json!({"subscription_prefix": "s", "github_token_configured": true})
+        json!({"subscription_prefix": "s", "github_token_configured": true, "github_mirror": null})
     );
     assert_eq!(persisted()["github-token"], fixture);
     let read = server
@@ -223,7 +223,7 @@ async fn github_token_is_write_only_and_preserves_other_instance_settings() {
         .unwrap();
     assert_eq!(
         body(read).await,
-        json!({"subscription_prefix": "s", "github_token_configured": true})
+        json!({"subscription_prefix": "s", "github_token_configured": true, "github_mirror": null})
     );
 
     let changed = server
@@ -232,7 +232,7 @@ async fn github_token_is_write_only_and_preserves_other_instance_settings() {
     assert_eq!(changed.status(), 200);
     assert_eq!(
         body(changed).await,
-        json!({"subscription_prefix": "feed", "github_token_configured": true})
+        json!({"subscription_prefix": "feed", "github_token_configured": true, "github_mirror": null})
     );
     assert_eq!(persisted()["github-token"], fixture);
     let invalid = "private-fixture\r\ninvalid";
@@ -256,7 +256,7 @@ async fn github_token_is_write_only_and_preserves_other_instance_settings() {
     assert_eq!(replaced.status(), 200);
     assert_eq!(
         body(replaced).await,
-        json!({"subscription_prefix": "feed", "github_token_configured": true})
+        json!({"subscription_prefix": "feed", "github_token_configured": true, "github_mirror": null})
     );
     assert_eq!(persisted()["github-token"], "replacement-token");
 
@@ -264,7 +264,7 @@ async fn github_token_is_write_only_and_preserves_other_instance_settings() {
     assert_eq!(cleared.status(), 200);
     assert_eq!(
         body(cleared).await,
-        json!({"subscription_prefix": "feed", "github_token_configured": false})
+        json!({"subscription_prefix": "feed", "github_token_configured": false, "github_mirror": null})
     );
     assert!(persisted().get("github-token").is_none());
     let read = server
@@ -274,8 +274,58 @@ async fn github_token_is_write_only_and_preserves_other_instance_settings() {
         .unwrap();
     assert_eq!(
         body(read).await,
-        json!({"subscription_prefix": "feed", "github_token_configured": false})
+        json!({"subscription_prefix": "feed", "github_token_configured": false, "github_mirror": null})
     );
+}
+
+#[tokio::test]
+async fn github_mirror_can_be_saved_and_cleared_without_changing_other_settings() {
+    let server = Server::start().await;
+    let path = "/api/system/settings";
+    let mirror = "https://mirror.example.invalid/github/";
+    let token = "fixture-token";
+    let saved = server
+        .put_json(
+            path,
+            json!({"github_mirror": mirror, "github_token": token, "subscription_prefix": "feed"}),
+        )
+        .await;
+    assert_eq!(saved.status(), 200);
+    assert_eq!(
+        body(saved).await,
+        json!({
+            "subscription_prefix": "feed",
+            "github_token_configured": true,
+            "github_mirror": mirror,
+        })
+    );
+    let persisted = || -> Value {
+        crate::config::read_config(
+            server.root.join("config").to_str().unwrap(),
+            crate::config::APP_CONFIG_BASENAME,
+        )
+        .unwrap()
+    };
+    assert_eq!(persisted()["github-mirror"], mirror);
+    let refused = server
+        .put_json(
+            path,
+            json!({"github_mirror": "https://private-fixture@mirror.example.invalid/", "subscription_prefix": "other"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 422);
+    assert_eq!(
+        body(refused).await["message"],
+        "github_mirror: use an HTTP or HTTPS URL without credentials, a query, or a fragment"
+    );
+    assert_eq!(persisted()["subscription"]["prefix"], "feed");
+    assert_eq!(persisted()["github-mirror"], mirror);
+
+    let saved = server.put_json(path, json!({"github_mirror": null})).await;
+    assert_eq!(saved.status(), 200);
+    assert_eq!(body(saved).await["github_mirror"], Value::Null);
+    assert!(persisted().get("github-mirror").is_none());
+    assert_eq!(persisted()["github-token"], token);
 }
 
 #[tokio::test]
@@ -290,7 +340,7 @@ async fn changing_the_subscription_prefix_replaces_delivery_paths_without_changi
     assert_eq!(settings.status(), 200);
     assert_eq!(
         body(settings).await,
-        json!({"subscription_prefix": "s", "github_token_configured": false})
+        json!({"subscription_prefix": "s", "github_token_configured": false, "github_mirror": null})
     );
 
     let invalid = server
@@ -309,7 +359,7 @@ async fn changing_the_subscription_prefix_replaces_delivery_paths_without_changi
     assert_eq!(changed.status(), 200);
     assert_eq!(
         body(changed).await,
-        json!({"subscription_prefix": "feed", "github_token_configured": false})
+        json!({"subscription_prefix": "feed", "github_token_configured": false, "github_mirror": null})
     );
 
     let old = server

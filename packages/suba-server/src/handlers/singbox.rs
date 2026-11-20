@@ -1152,7 +1152,7 @@ pub async fn releases(
     _auth: Operator,
 ) -> ResponseResult<Json<Releases>> {
     let store = state.singbox();
-    let listed = store.releases(state.settings()).await?;
+    let listed = store.releases(&state.settings().github().await).await?;
     let installable = Release::installable(&listed);
 
     Ok(Json(offered(&installable)))

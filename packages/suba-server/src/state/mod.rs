@@ -19,7 +19,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use reqwest::Client;
 
-pub(crate) use settings::InstanceSettings;
+pub(crate) use settings::{GitHubReleaseSettings, InstanceSettings};
 
 use crate::{config::ServerConfig, error::Error, identity::Identity};
 

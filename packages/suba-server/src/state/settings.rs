@@ -1,10 +1,13 @@
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 use reqwest::{Client, RequestBuilder, Url};
 use serde::Serialize;
 
 use crate::{
-    config::{Administrator, AppConfig, ConfigError, GitHubToken, KeyPair, APP_CONFIG_BASENAME},
+    config::{
+        Administrator, AppConfig, ConfigError, GitHubMirror, GitHubToken, KeyPair,
+        APP_CONFIG_BASENAME,
+    },
     error::Error,
     tracing,
 };
@@ -27,6 +30,7 @@ pub(crate) struct SettingsStore {
 pub(crate) struct InstanceSettings {
     subscription_prefix: String,
     github_token_configured: bool,
+    github_mirror: Option<String>,
 }
 
 impl InstanceSettings {
@@ -34,7 +38,49 @@ impl InstanceSettings {
         Ok(Self {
             subscription_prefix: subscription_prefix(config)?,
             github_token_configured: config.github_token.is_some(),
+            github_mirror: config
+                .github_mirror
+                .as_ref()
+                .map(|mirror| mirror.as_str().to_owned()),
         })
+    }
+}
+
+/// Keep the release source consistent throughout an installation.
+pub(crate) struct GitHubReleaseSettings {
+    token: Option<GitHubToken>,
+    mirror: Option<GitHubMirror>,
+}
+
+impl GitHubReleaseSettings {
+    pub(crate) fn mirror(&self) -> Option<&str> {
+        self.mirror.as_ref().map(GitHubMirror::as_str)
+    }
+
+    pub(crate) fn url<'a>(&self, original: &'a str) -> Cow<'a, str> {
+        match self.mirror() {
+            Some(mirror) => Cow::Owned(format!("{mirror}{original}")),
+            None => Cow::Borrowed(original),
+        }
+    }
+
+    /// The mirror receives release URLs, never the GitHub API credential.
+    pub(crate) fn metadata_request(&self, client: &Client, original: &str) -> RequestBuilder {
+        let request = client
+            .get(self.url(original).as_ref())
+            .timeout(std::time::Duration::from_secs(10));
+        if self.mirror.is_none()
+            && Url::parse(original).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && url.host_str() == Some("api.github.com")
+                    && url.port_or_known_default() == Some(443)
+            })
+        {
+            if let Some(token) = &self.token {
+                return request.bearer_auth(token.as_str());
+            }
+        }
+        request
     }
 }
 
@@ -66,11 +112,12 @@ impl SettingsStore {
         self.file.read(InstanceSettings::from_config).await
     }
 
-    /// Validate both changes before making either visible to callers.
+    /// Validate all changes before making any visible to callers.
     pub(crate) async fn update_instance_settings(
         &self,
         prefix: Option<&str>,
         github_token: Option<Option<String>>,
+        github_mirror: Option<Option<String>>,
     ) -> Result<(InstanceSettings, bool), Error> {
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
@@ -82,27 +129,25 @@ impl SettingsStore {
         if let Some(token) = github_token {
             config.github_token = token.map(GitHubToken::try_from).transpose()?;
         }
-        let token_changed = config.github_token != locked.get().github_token;
+        if let Some(mirror) = github_mirror {
+            config.github_mirror = mirror.map(GitHubMirror::try_from).transpose()?;
+        }
+        let github_changed = config.github_token != locked.get().github_token
+            || config.github_mirror != locked.get().github_mirror;
         let settings = InstanceSettings::from_config(&config)?;
-        if prefix.is_some() || token_changed {
+        if prefix.is_some() || github_changed {
             locked.commit(config).await?;
         }
-        Ok((settings, token_changed))
+        Ok((settings, github_changed))
     }
 
-    /// Attach credentials to release metadata requests without changing the shared client.
-    pub(crate) async fn github_request(&self, client: &Client, url: &str) -> RequestBuilder {
-        let request = client.get(url).timeout(std::time::Duration::from_secs(10));
-        if Url::parse(url).is_ok_and(|url| {
-            url.scheme() == "https"
-                && url.host_str() == Some("api.github.com")
-                && url.port_or_known_default() == Some(443)
-        }) {
-            if let Some(token) = self.file.read(|config| config.github_token.clone()).await {
-                return request.bearer_auth(token.as_str());
-            }
-        }
-        request
+    pub(crate) async fn github(&self) -> GitHubReleaseSettings {
+        self.file
+            .read(|config| GitHubReleaseSettings {
+                token: config.github_token.clone(),
+                mirror: config.github_mirror.clone(),
+            })
+            .await
     }
 
     /// Sessions are revoked before the new hash is adopted, so a failed write
@@ -303,14 +348,15 @@ mod tests {
         let dir = test_dir();
         let store = SettingsStore::load(&dir).unwrap();
         store
-            .update_instance_settings(None, Some(Some("fixture-token".to_owned())))
+            .update_instance_settings(None, Some(Some("fixture-token".to_owned())), None)
             .await
             .unwrap();
         let store = SettingsStore::load(&dir).unwrap();
         tokio::fs::remove_dir_all(dir).await.unwrap();
         let client = Client::new();
         let api = "https://api.github.com/repos/example/project/releases";
-        let authenticated = store.github_request(&client, api).await.build().unwrap();
+        let github = store.github().await;
+        let authenticated = github.metadata_request(&client, api).build().unwrap();
         let bearer = &authenticated.headers()[reqwest::header::AUTHORIZATION];
         assert!(bearer.is_sensitive());
         assert_eq!(bearer, "Bearer fixture-token");
@@ -321,7 +367,7 @@ mod tests {
             "https://api.github.com:8443/releases",
             "http://api.github.com/releases",
         ] {
-            let request = store.github_request(&client, url).await.build().unwrap();
+            let request = github.metadata_request(&client, url).build().unwrap();
             assert!(!request
                 .headers()
                 .contains_key(reqwest::header::AUTHORIZATION));

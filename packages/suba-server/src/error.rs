@@ -136,6 +136,9 @@ pub enum Error {
     #[error("github_token: {reason}")]
     GitHubToken { reason: &'static str },
 
+    #[error("github_mirror: use an HTTP or HTTPS URL without credentials, a query, or a fragment")]
+    GitHubMirror,
+
     /// A proxy user this instance does not have.
     #[cfg(feature = "singbox-core")]
     #[error("there is no user named '{0}'")]
@@ -395,6 +398,10 @@ impl IntoHttpError for Error {
             Error::GitHubToken { reason } => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
                 message: format!("github_token: {reason}"),
+            },
+            error @ Error::GitHubMirror => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: error.to_string(),
             },
             #[cfg(feature = "singbox-core")]
             Error::UserNotFound(name) => HttpError {

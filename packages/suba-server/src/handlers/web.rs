@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     dto::{Authenticated, ResponseResult},
+    state::GitHubReleaseSettings,
     AppState, Error,
 };
 
@@ -29,12 +30,10 @@ fn release_error(reason: &'static str) -> Error {
     Error::WebRelease { reason }
 }
 
-async fn latest(state: &AppState) -> ResponseResult<String> {
+async fn latest(state: &AppState, github: &GitHubReleaseSettings) -> ResponseResult<String> {
     let fetch = async {
-        let response = state
-            .settings()
-            .github_request(state.http(), RELEASE)
-            .await
+        let response = github
+            .metadata_request(state.http(), RELEASE)
             .send()
             .await
             .map_err(|_| release_error("release lookup failed"))?;
@@ -202,7 +201,7 @@ pub async fn status(State(state): State<AppState>) -> Json<WebStatus> {
             value.clone()
         }
         _ => {
-            let value = latest(&state).await.ok();
+            let value = latest(&state, &state.settings().github().await).await.ok();
             *cached = Some((std::time::Instant::now(), value.clone()));
             value
         }
@@ -223,10 +222,11 @@ pub async fn install(
         let (mut parts, _) = request.into_parts();
         Authenticated::from_request_parts(&mut parts, &state).await?;
     }
-    let version = latest(&state).await?;
+    let github = state.settings().github().await;
+    let version = latest(&state, &github).await?;
     let release = format!("{ASSETS}/v{version}/suba-web.tar.gz");
-    let archive = download(&state, &release, MAX_ARCHIVE).await?;
-    let checksum = download(&state, &format!("{release}.sha256"), 256).await?;
+    let archive = download(&state, &github.url(&release), MAX_ARCHIVE).await?;
+    let checksum = download(&state, &github.url(&format!("{release}.sha256")), 256).await?;
     verify_archive(&archive, &checksum)?;
     let web = state.web_dir();
     let parent = web

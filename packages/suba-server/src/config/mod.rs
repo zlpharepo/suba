@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub subscription: Option<SubscriptionConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) github_token: Option<GitHubToken>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) github_mirror: Option<GitHubMirror>,
     /// The address clients reach this machine at: where every node exported
     /// from its inbounds points. Belongs to the machine, not to the sing-box
     /// module, because a host is more than the core it runs.
@@ -69,6 +71,38 @@ impl std::fmt::Debug for GitHubToken {
 }
 
 impl GitHubToken {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A proxy prefix to which a complete GitHub release URL is appended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub(crate) struct GitHubMirror(String);
+
+impl TryFrom<String> for GitHubMirror {
+    type Error = crate::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let valid = |url: &reqwest::Url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.query().is_none()
+                && url.fragment().is_none()
+        };
+        let url = reqwest::Url::parse(value.trim())
+            .ok()
+            .filter(valid)
+            .filter(|url| url.as_str().trim_end_matches('/').len() < 4096)
+            .ok_or(crate::Error::GitHubMirror)?;
+        Ok(Self(format!("{}/", url.as_str().trim_end_matches('/'))))
+    }
+}
+
+impl GitHubMirror {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
