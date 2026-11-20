@@ -1,7 +1,10 @@
 use std::path::Path;
 
+use reqwest::{Client, RequestBuilder, Url};
+use serde::Serialize;
+
 use crate::{
-    config::{Administrator, AppConfig, ConfigError, KeyPair, APP_CONFIG_BASENAME},
+    config::{Administrator, AppConfig, ConfigError, GitHubToken, KeyPair, APP_CONFIG_BASENAME},
     error::Error,
     tracing,
 };
@@ -19,10 +22,31 @@ pub(crate) struct SettingsStore {
     file: Persisted<AppConfig>,
 }
 
+/// The settings a client may read back after saving.
+#[derive(Serialize)]
+pub(crate) struct InstanceSettings {
+    subscription_prefix: String,
+    github_token_configured: bool,
+}
+
+impl InstanceSettings {
+    fn from_config(config: &AppConfig) -> Result<Self, Error> {
+        Ok(Self {
+            subscription_prefix: subscription_prefix(config)?,
+            github_token_configured: config.github_token.is_some(),
+        })
+    }
+}
+
 impl SettingsStore {
     pub(crate) fn load(config_dir: &Path) -> Result<Self, ConfigError> {
         Ok(Self {
-            file: Persisted::load(config_dir, APP_CONFIG_BASENAME)?,
+            file: Persisted::load(config_dir, APP_CONFIG_BASENAME).map_err(
+                |error| match error {
+                    ConfigError::Decode { path, .. } => ConfigError::InstanceDecode(path),
+                    error => error,
+                },
+            )?,
         })
     }
 
@@ -35,25 +59,50 @@ impl SettingsStore {
     /// refused where it is configured rather than answered with a 404 nobody can
     /// explain.
     pub(crate) async fn subscription_prefix(&self) -> Result<String, Error> {
-        let written = self
-            .file
-            .read(|config| config.subscription.clone())
-            .await
-            .and_then(|subscription| subscription.prefix)
-            .unwrap_or_else(|| DEFAULT_PREFIX.to_string());
-        validate_prefix(&written)
+        self.file.read(subscription_prefix).await
     }
 
-    /// Persist the instance's delivery segment without replacing unrelated settings.
-    pub(crate) async fn set_subscription_prefix(&self, written: &str) -> Result<String, Error> {
-        let prefix = validate_prefix(written)?;
+    pub(crate) async fn instance_settings(&self) -> Result<InstanceSettings, Error> {
+        self.file.read(InstanceSettings::from_config).await
+    }
+
+    /// Validate both changes before making either visible to callers.
+    pub(crate) async fn update_instance_settings(
+        &self,
+        prefix: Option<&str>,
+        github_token: Option<Option<String>>,
+    ) -> Result<(InstanceSettings, bool), Error> {
         let locked = self.file.lock().await;
         let mut config = locked.get().clone();
-        config.subscription = Some(crate::config::SubscriptionConfig {
-            prefix: Some(prefix.clone()),
-        });
-        locked.commit(config).await?;
-        Ok(prefix)
+        if let Some(prefix) = prefix {
+            config.subscription = Some(crate::config::SubscriptionConfig {
+                prefix: Some(validate_prefix(prefix)?),
+            });
+        }
+        if let Some(token) = github_token {
+            config.github_token = token.map(GitHubToken::try_from).transpose()?;
+        }
+        let token_changed = config.github_token != locked.get().github_token;
+        let settings = InstanceSettings::from_config(&config)?;
+        if prefix.is_some() || token_changed {
+            locked.commit(config).await?;
+        }
+        Ok((settings, token_changed))
+    }
+
+    /// Attach credentials to release metadata requests without changing the shared client.
+    pub(crate) async fn github_request(&self, client: &Client, url: &str) -> RequestBuilder {
+        let request = client.get(url).timeout(std::time::Duration::from_secs(10));
+        if Url::parse(url).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.host_str() == Some("api.github.com")
+                && url.port_or_known_default() == Some(443)
+        }) {
+            if let Some(token) = self.file.read(|config| config.github_token.clone()).await {
+                return request.bearer_auth(token.as_str());
+            }
+        }
+        request
     }
 
     /// Sessions are revoked before the new hash is adopted, so a failed write
@@ -210,6 +259,15 @@ async fn verify_current(
     }
 }
 
+fn subscription_prefix(config: &AppConfig) -> Result<String, Error> {
+    let written = config
+        .subscription
+        .as_ref()
+        .and_then(|subscription| subscription.prefix.as_deref())
+        .unwrap_or(DEFAULT_PREFIX);
+    validate_prefix(written)
+}
+
 fn validate_prefix(written: &str) -> Result<String, Error> {
     let prefix = written.trim_matches('/');
     if prefix.is_empty()
@@ -238,6 +296,43 @@ mod tests {
 
     fn test_dir() -> PathBuf {
         std::env::temp_dir().join(format!("suba-settings-{}", uuid::Uuid::now_v7()))
+    }
+
+    #[tokio::test]
+    async fn github_credentials_only_authorize_the_https_api_origin() {
+        let dir = test_dir();
+        let store = SettingsStore::load(&dir).unwrap();
+        store
+            .update_instance_settings(None, Some(Some("fixture-token".to_owned())))
+            .await
+            .unwrap();
+        let store = SettingsStore::load(&dir).unwrap();
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+        let client = Client::new();
+        let api = "https://api.github.com/repos/example/project/releases";
+        let authenticated = store.github_request(&client, api).await.build().unwrap();
+        let bearer = &authenticated.headers()[reqwest::header::AUTHORIZATION];
+        assert!(bearer.is_sensitive());
+        assert_eq!(bearer, "Bearer fixture-token");
+
+        for url in [
+            "https://github.com/example/project/releases/download/v1/fixture",
+            "https://api.github.com.example.com/releases",
+            "https://api.github.com:8443/releases",
+            "http://api.github.com/releases",
+        ] {
+            let request = store.github_request(&client, url).await.build().unwrap();
+            assert!(!request
+                .headers()
+                .contains_key(reqwest::header::AUTHORIZATION));
+        }
+        let subscription = client
+            .get("https://example.com/subscription")
+            .build()
+            .unwrap();
+        assert!(!subscription
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION));
     }
 
     #[tokio::test]

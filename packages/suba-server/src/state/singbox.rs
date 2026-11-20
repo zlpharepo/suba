@@ -29,7 +29,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
-use std::{borrow::Borrow, collections::HashMap};
+use std::{borrow::Borrow, collections::HashMap, future::Future};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -40,6 +40,7 @@ use suba_singbox::run::{self, Runner, Status};
 use suba_singbox::schema::{Schema, Skipped, Verdict};
 use tokio::sync::Mutex as AsyncMutex;
 
+use super::settings::SettingsStore;
 use super::{
     metrics::{ProcessSampler, ProcessUsage},
     observation::Run as ObservedRun,
@@ -979,11 +980,19 @@ impl SingboxStore {
     }
 
     /// What the release server lists.
-    pub(crate) async fn releases(&self) -> Result<Vec<Release>, Error> {
-        self.releases_from(RELEASES).await
+    pub(crate) async fn releases(&self, settings: &SettingsStore) -> Result<Vec<Release>, Error> {
+        self.releases_from(settings.github_request(&self.http, RELEASES))
+            .await
     }
 
-    async fn releases_from(&self, url: &str) -> Result<Vec<Release>, Error> {
+    pub(crate) async fn clear_release_cache(&self) {
+        self.releases.lock().await.take();
+    }
+
+    async fn releases_from(
+        &self,
+        request: impl Future<Output = reqwest::RequestBuilder>,
+    ) -> Result<Vec<Release>, Error> {
         let mut cached = self.releases.lock().await;
         if let Some(cache) = cached.as_ref() {
             if cache.fetched_at.elapsed() < RELEASES_TTL || Instant::now() < cache.retry_after {
@@ -991,7 +1000,7 @@ impl SingboxStore {
             }
         }
 
-        match install::releases(&self.http, url).await {
+        match install::releases(request.await).await {
             Ok(releases) => {
                 *cached = Some(ReleasesCache {
                     fetched_at: Instant::now(),
@@ -1011,7 +1020,11 @@ impl SingboxStore {
     }
 
     /// Resolve an installable asset before claiming an installation task.
-    pub(crate) async fn install_asset(&self, version: &Version) -> Result<(Asset, String), Error> {
+    pub(crate) async fn install_asset(
+        &self,
+        version: &Version,
+        settings: &SettingsStore,
+    ) -> Result<(Asset, String), Error> {
         if version < &Version::from_tag(core::MIN_VERSION) {
             return Err(suba_singbox::core::Error::TooOld {
                 version: version.clone(),
@@ -1020,7 +1033,7 @@ impl SingboxStore {
             .into());
         }
         let platform = core::platform()?;
-        let releases = self.releases().await?;
+        let releases = self.releases(settings).await?;
         Ok(Self::asset_in(&releases, version, platform)?)
     }
 
@@ -1601,8 +1614,9 @@ mod tests {
             identity(),
         );
         let (url, calls) = release_server().await;
+        let fetch = || store.releases_from(async { store.http.get(&url) });
 
-        let (first, second) = tokio::join!(store.releases_from(&url), store.releases_from(&url));
+        let (first, second) = tokio::join!(fetch(), fetch());
         assert_eq!(first.unwrap()[0].version.as_str(), "1.14.2");
         assert_eq!(second.unwrap()[0].version.as_str(), "1.14.2");
         assert_eq!(
@@ -1610,7 +1624,7 @@ mod tests {
             1,
             "one fetch for concurrent callers"
         );
-        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -1618,24 +1632,24 @@ mod tests {
         );
 
         store.releases.lock().await.as_mut().unwrap().fetched_at = Instant::now() - RELEASES_TTL;
-        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2, "expiry fetches again");
 
         store.releases.lock().await.as_mut().unwrap().fetched_at = Instant::now() - RELEASES_TTL;
-        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
             "a failed refresh is retried"
         );
-        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             3,
             "a failed refresh backs off"
         );
         store.releases.lock().await.as_mut().unwrap().retry_after = Instant::now();
-        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             4,
@@ -1655,18 +1669,22 @@ mod tests {
             identity(),
         );
         let (url, calls) = release_server().await;
+        let fetch = || store.releases_from(async { store.http.get(&url) });
         let failed = format!("{url}/missing");
 
         // A malformed path is still answered by this local server, so explicitly
         // test a fresh upstream refusal by letting its third response be the
         // first response for another store.
-        store.releases_from(&url).await.unwrap();
+        fetch().await.unwrap();
         store.releases.lock().await.take();
-        store.releases_from(&url).await.unwrap();
+        fetch().await.unwrap();
         assert!(store.releases.lock().await.take().is_some());
-        assert!(store.releases_from(&failed).await.is_err());
+        assert!(store
+            .releases_from(async { store.http.get(&failed) })
+            .await
+            .is_err());
         assert!(store.releases.lock().await.is_none());
-        assert_eq!(store.releases_from(&url).await.unwrap().len(), 1);
+        assert_eq!(fetch().await.unwrap().len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
@@ -2333,7 +2351,12 @@ mod tests {
         let (_scratch, store) = store();
 
         assert!(matches!(
-            store.install_asset(&Version::from_tag("1.13.0")).await,
+            store
+                .install_asset(
+                    &Version::from_tag("1.13.0"),
+                    &SettingsStore::load(&store.config_dir).unwrap()
+                )
+                .await,
             Err(Error::Singbox(suba_singbox::core::Error::TooOld { .. }))
         ));
     }

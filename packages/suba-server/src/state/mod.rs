@@ -19,6 +19,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use reqwest::Client;
 
+pub(crate) use settings::InstanceSettings;
+
 use crate::{config::ServerConfig, error::Error, identity::Identity};
 
 #[cfg(feature = "singbox-core")]

@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub instance_id: Option<uuid::Uuid>,
     /// Where subscriptions are handed out from, when the operator says.
     pub subscription: Option<SubscriptionConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) github_token: Option<GitHubToken>,
     /// The address clients reach this machine at: where every node exported
     /// from its inbounds points. Belongs to the machine, not to the sing-box
     /// module, because a host is more than the core it runs.
@@ -36,6 +38,40 @@ pub struct AppConfig {
 #[serde(rename_all = "kebab-case")]
 pub struct SubscriptionConfig {
     pub prefix: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub(crate) struct GitHubToken(String);
+
+impl TryFrom<String> for GitHubToken {
+    type Error = crate::Error;
+
+    fn try_from(token: String) -> Result<Self, Self::Error> {
+        if token.is_empty() || token.len() > 4096 {
+            return Err(crate::Error::GitHubToken {
+                reason: "use a token between 1 and 4096 characters",
+            });
+        }
+        if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(crate::Error::GitHubToken {
+                reason: "use a token without whitespace or control characters",
+            });
+        }
+        Ok(Self(token))
+    }
+}
+
+impl std::fmt::Debug for GitHubToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl GitHubToken {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Read a configuration file, falling back to [`Default`] when it is missing or

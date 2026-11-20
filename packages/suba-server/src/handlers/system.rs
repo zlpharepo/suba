@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use suba_core::{ProtocolSupport, Target};
 
 use crate::{
-    dto::{Authenticated, Operator, ResponseResult, ValidatedJson},
+    dto::{spoken_or_kept, Authenticated, Operator, ResponseResult, ValidatedJson},
+    state::InstanceSettings,
     AppState,
 };
 
@@ -17,41 +18,40 @@ pub struct SystemStatus {
     administrator_configured: bool,
 }
 
-/// The operator-editable settings of this instance.
-#[derive(Serialize)]
-pub struct SystemSettings {
-    subscription_prefix: String,
-}
-
-/// Only the delivery prefix can be changed through this resource.
+/// Omitted fields preserve their values. A null token clears the credential.
 #[derive(Deserialize, Validate)]
 pub struct SystemSettingsChange {
     #[garde(length(min = 1, max = 64))]
-    subscription_prefix: String,
+    subscription_prefix: Option<String>,
+    #[serde(default, deserialize_with = "spoken_or_kept")]
+    #[garde(skip)]
+    github_token: Option<Option<String>>,
 }
 
 /// Read the local instance settings, independent of the selected environment.
-pub async fn settings(
+pub(crate) async fn settings(
     _auth: Authenticated,
     State(state): State<AppState>,
-) -> ResponseResult<Json<SystemSettings>> {
-    Ok(Json(SystemSettings {
-        subscription_prefix: state.settings().subscription_prefix().await?,
-    }))
+) -> ResponseResult<Json<InstanceSettings>> {
+    Ok(Json(state.settings().instance_settings().await?))
 }
 
-/// Change the delivery segment; existing tokens remain valid at the new path.
-pub async fn save_settings(
+/// Reset release lookups after committing new credentials so retries can use them immediately.
+pub(crate) async fn save_settings(
     _auth: Authenticated,
     State(state): State<AppState>,
     ValidatedJson(payload): ValidatedJson<SystemSettingsChange>,
-) -> ResponseResult<Json<SystemSettings>> {
-    Ok(Json(SystemSettings {
-        subscription_prefix: state
-            .settings()
-            .set_subscription_prefix(&payload.subscription_prefix)
-            .await?,
-    }))
+) -> ResponseResult<Json<InstanceSettings>> {
+    let (settings, token_changed) = state
+        .settings()
+        .update_instance_settings(payload.subscription_prefix.as_deref(), payload.github_token)
+        .await?;
+    if token_changed {
+        state.web_release().lock().await.take();
+        #[cfg(feature = "singbox-core")]
+        state.singbox().clear_release_cache().await;
+    }
+    Ok(Json(settings))
 }
 
 /// Operator status: what this instance is, and what it can serve.

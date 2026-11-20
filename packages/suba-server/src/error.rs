@@ -130,6 +130,9 @@ pub enum Error {
     #[error("subscription.prefix: {reason}")]
     Prefix { reason: &'static str },
 
+    #[error("github_token: {reason}")]
+    GitHubToken { reason: &'static str },
+
     /// A proxy user this instance does not have.
     #[cfg(feature = "singbox-core")]
     #[error("there is no user named '{0}'")]
@@ -383,6 +386,10 @@ impl IntoHttpError for Error {
             Error::Prefix { reason } => HttpError {
                 status_code: StatusCode::UNPROCESSABLE_ENTITY,
                 message: format!("subscription.prefix: {reason}"),
+            },
+            Error::GitHubToken { reason } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("github_token: {reason}"),
             },
             #[cfg(feature = "singbox-core")]
             Error::UserNotFound(name) => HttpError {

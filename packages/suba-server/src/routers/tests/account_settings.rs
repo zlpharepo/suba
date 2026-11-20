@@ -1,5 +1,5 @@
 use http::header;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{body, Server};
 
@@ -197,6 +197,88 @@ async fn a_username_change_preserves_the_password_and_revokes_existing_sessions(
 }
 
 #[tokio::test]
+async fn github_token_is_write_only_and_preserves_other_instance_settings() {
+    let server = Server::start().await;
+    let path = "/api/system/settings";
+    let fixture = "fixture-token";
+    let config = server.root.join("config");
+    let persisted = || -> Value {
+        crate::config::read_config(config.to_str().unwrap(), crate::config::APP_CONFIG_BASENAME)
+            .unwrap()
+    };
+
+    let set = server
+        .put_json(path, json!({"github_token": fixture}))
+        .await;
+    assert_eq!(set.status(), 200);
+    assert_eq!(
+        body(set).await,
+        json!({"subscription_prefix": "s", "github_token_configured": true})
+    );
+    assert_eq!(persisted()["github-token"], fixture);
+    let read = server
+        .authed(reqwest::Method::GET, path)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        body(read).await,
+        json!({"subscription_prefix": "s", "github_token_configured": true})
+    );
+
+    let changed = server
+        .put_json(path, json!({"subscription_prefix": "feed"}))
+        .await;
+    assert_eq!(changed.status(), 200);
+    assert_eq!(
+        body(changed).await,
+        json!({"subscription_prefix": "feed", "github_token_configured": true})
+    );
+    assert_eq!(persisted()["github-token"], fixture);
+    let invalid = "private-fixture\r\ninvalid";
+    let refused = server
+        .put_json(
+            path,
+            json!({"github_token": invalid, "subscription_prefix": "test"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 422);
+    assert_eq!(
+        body(refused).await["message"],
+        "github_token: use a token without whitespace or control characters"
+    );
+    assert_eq!(persisted()["subscription"]["prefix"], "feed");
+    assert_eq!(persisted()["github-token"], fixture);
+
+    let replaced = server
+        .put_json(path, json!({"github_token": "replacement-token"}))
+        .await;
+    assert_eq!(replaced.status(), 200);
+    assert_eq!(
+        body(replaced).await,
+        json!({"subscription_prefix": "feed", "github_token_configured": true})
+    );
+    assert_eq!(persisted()["github-token"], "replacement-token");
+
+    let cleared = server.put_json(path, json!({"github_token": null})).await;
+    assert_eq!(cleared.status(), 200);
+    assert_eq!(
+        body(cleared).await,
+        json!({"subscription_prefix": "feed", "github_token_configured": false})
+    );
+    assert!(persisted().get("github-token").is_none());
+    let read = server
+        .authed(reqwest::Method::GET, path)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        body(read).await,
+        json!({"subscription_prefix": "feed", "github_token_configured": false})
+    );
+}
+
+#[tokio::test]
 async fn changing_the_subscription_prefix_replaces_delivery_paths_without_changing_tokens() {
     let server = Server::start().await;
     let token = server.delivery().await;
@@ -206,7 +288,10 @@ async fn changing_the_subscription_prefix_replaces_delivery_paths_without_changi
         .await
         .unwrap();
     assert_eq!(settings.status(), 200);
-    assert_eq!(body(settings).await, json!({"subscription_prefix": "s"}));
+    assert_eq!(
+        body(settings).await,
+        json!({"subscription_prefix": "s", "github_token_configured": false})
+    );
 
     let invalid = server
         .put_json(
@@ -222,7 +307,10 @@ async fn changing_the_subscription_prefix_replaces_delivery_paths_without_changi
         )
         .await;
     assert_eq!(changed.status(), 200);
-    assert_eq!(body(changed).await, json!({"subscription_prefix": "feed"}));
+    assert_eq!(
+        body(changed).await,
+        json!({"subscription_prefix": "feed", "github_token_configured": false})
+    );
 
     let old = server
         .get(&format!("/s/phone/{token}"))

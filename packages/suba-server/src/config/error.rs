@@ -18,6 +18,10 @@ pub enum ConfigError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The decoder's source excerpt can contain credentials.
+    #[error("invalid instance configuration in `{}`", .0.display())]
+    InstanceDecode(PathBuf),
+
     /// The value cannot be represented in the enabled format.
     #[error("cannot serialize configuration for `{}`: {source}", path.display())]
     Encode {

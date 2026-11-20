@@ -238,10 +238,9 @@ pub fn uninstall(dirs: &Dirs, version: &Version, current: Option<&Version>) -> R
 
 /// What a release server lists.
 ///
-/// The URL is the caller's: this crate knows the shape of what GitHub's release
-/// API answers, not where to find it.
-pub async fn releases(client: &reqwest::Client, url: &str) -> Result<Vec<Release>, Error> {
-    let answer = client.get(url).send().await.map_err(|_| Error::Network {
+/// The caller owns the request so release credentials stay outside this crate.
+pub async fn releases(request: reqwest::RequestBuilder) -> Result<Vec<Release>, Error> {
+    let answer = request.send().await.map_err(|_| Error::Network {
         reason: "the release server could not be reached",
     })?;
 

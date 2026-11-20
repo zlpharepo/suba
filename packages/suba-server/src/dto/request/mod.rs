@@ -3,7 +3,14 @@ use axum::{
     Json,
 };
 use garde::Validate;
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize, Deserializer};
+
+/// Preserve a missing field separately from an explicit null in a change request.
+pub(crate) fn spoken_or_kept<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ValidatedJson<T>(pub T);

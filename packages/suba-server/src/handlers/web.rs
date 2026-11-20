@@ -32,8 +32,9 @@ fn release_error(reason: &'static str) -> Error {
 async fn latest(state: &AppState) -> ResponseResult<String> {
     let fetch = async {
         let response = state
-            .http()
-            .get(RELEASE)
+            .settings()
+            .github_request(state.http(), RELEASE)
+            .await
             .send()
             .await
             .map_err(|_| release_error("release lookup failed"))?;

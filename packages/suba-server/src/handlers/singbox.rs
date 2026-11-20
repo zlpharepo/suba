@@ -22,7 +22,7 @@ use suba_singbox::install::{Generate, Needs};
 use suba_singbox::run::{self, Exit};
 
 use crate::{
-    dto::{Operator, ResponseResult},
+    dto::{spoken_or_kept, Operator, ResponseResult},
     error::Error,
     handlers::collections::outbounds_of,
     state::metrics::ProcessUsage,
@@ -81,18 +81,6 @@ pub struct Choose {
     /// Whether the core starts with this instance. Omitted keeps it.
     #[serde(default, deserialize_with = "spoken_or_kept")]
     pub autostart: Option<bool>,
-}
-
-/// Tell an omitted field from one that was spoken about.
-///
-/// `Option<T>` alone collapses the two: serde gives `None` for both, so a
-/// caller that never mentioned the field would be read as having cleared it.
-fn spoken_or_kept<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    T: Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    T::deserialize(deserializer).map(Some)
 }
 
 /// One configuration this instance has.
@@ -1073,7 +1061,7 @@ pub async fn install_version(
     }
 
     // An unknown release is a failed request, never a successfully queued job.
-    let (asset, platform) = store.install_asset(&version).await?;
+    let (asset, platform) = store.install_asset(&version, state.settings()).await?;
     let preparing = store.clone();
     let requested = version.clone();
     let (created, response) = tokio::task::spawn_blocking(move || -> Result<_, Error> {
@@ -1164,7 +1152,7 @@ pub async fn releases(
     _auth: Operator,
 ) -> ResponseResult<Json<Releases>> {
     let store = state.singbox();
-    let listed = store.releases().await?;
+    let listed = store.releases(state.settings()).await?;
     let installable = Release::installable(&listed);
 
     Ok(Json(offered(&installable)))
