@@ -2535,7 +2535,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "suba"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "suba-server",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "suba-clash"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "saphyr",
  "suba-proto",
@@ -2552,7 +2552,7 @@ dependencies = [
 
 [[package]]
 name = "suba-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "regex",
  "saphyr",
@@ -2568,7 +2568,7 @@ dependencies = [
 
 [[package]]
 name = "suba-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.23.1",
  "criterion",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "suba-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "argon2",
  "axum",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "suba-singbox"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "flate2",
  "regex",
