@@ -1,6 +1,6 @@
 //! The collections of the instance, as HTTP resources.
 
-use std::{collections::BTreeMap, path::Path as StdPath};
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     extract::{Path, Query, State},
@@ -10,7 +10,7 @@ use axum::{
 use http::{header, HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use suba_core::target::{RenderIntent, Target};
-use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Observation, Source};
+use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Source};
 
 #[cfg(feature = "singbox-core")]
 use crate::state::singbox::{ConversionSkip, GeneratedOutbound};
@@ -18,7 +18,8 @@ use crate::state::singbox::{ConversionSkip, GeneratedOutbound};
 use crate::{
     dto::{Operator, ResponseResult},
     error::Error,
-    state::render::Artifact,
+    state::{providers::RenderSettings, render::Artifact},
+    store::ObservationMetadata,
     tracing, AppState,
 };
 
@@ -109,12 +110,21 @@ pub async fn index(
     let prefix = state.settings().subscription_prefix().await?;
 
     // One index for the whole list, the same one a delivery is resolved from.
-    let observations = state.providers().observations().await?;
+    let _permit = state.rendered().admit().await;
+    let observations = state
+        .providers()
+        .observations(
+            collections
+                .values()
+                .flat_map(|collection| &collection.providers),
+        )
+        .await?;
     let index = NodeIndex::from_observations(
         observations
             .iter()
             .map(|(name, observation)| (name.as_str(), observation)),
     );
+    drop(observations);
 
     let mut summaries = BTreeMap::new();
     for (name, collection) in collections {
@@ -292,7 +302,7 @@ pub(crate) async fn artifact_of(
     state: &AppState,
     name: &str,
     target: Target,
-) -> Result<(std::sync::Arc<Artifact>, bool), Error> {
+) -> Result<(Arc<Artifact>, bool), Error> {
     let mut collection = state
         .collections()
         .get(name)
@@ -302,105 +312,111 @@ pub(crate) async fn artifact_of(
     // Tokens do not change the document, so they do not change its address.
     collection.tokens.clear();
 
-    let observations = state.providers().observations().await?;
+    let providers = state
+        .providers()
+        .render_settings(&collection.providers)
+        .await;
+    let metadata = state
+        .providers()
+        .observation_metadata(providers.keys().cloned())
+        .await?;
+    let key = address(&collection, &providers, &metadata, target)?;
+    let job = render_collection(state.clone(), collection, providers, metadata, target);
 
-    let key = address(state, &collection, &observations, target).await?;
-
-    if let Some(artifact) = state.rendered().get(&key) {
-        return Ok((artifact, true));
+    match key {
+        Some(key) => state.rendered().get_or_render(key, job).await,
+        None => {
+            let (artifact, _) = tokio::spawn(job).await??;
+            Ok((Arc::new(artifact), false))
+        }
     }
-
-    // The same index the node view is built from, so a preview and a delivery
-    // agree about identity down to the node's name.
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
-
-    let resolved = collection.resolve(
-        &index,
-        &provider_filters(state, &collection).await?,
-        &collection.filter()?,
-    );
-
-    let nodes = resolved.nodes;
-
-    // The direction is asked for explicitly, and today every compiled target
-    // writes the client one; a target that grew a server direction would have to
-    // say so in its descriptor first.
-    let rendered = target.render(&nodes.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
-    let artifact = std::sync::Arc::new(Artifact {
-        body: rendered.body.into(),
-        target,
-        nodes: nodes.len().saturating_sub(rendered.skipped.len()),
-        skipped: rendered.skipped.len(),
-        update_hours: update_hours(state, &collection).await,
-    });
-
-    state.rendered().put(key, std::sync::Arc::clone(&artifact));
-
-    Ok((artifact, false))
 }
 
-/// Everything that can change an artifact's bytes, as one address.
-///
-/// The collection's own bytes, each definition it names, the hash each payload
-/// was fetched at, and the target. A key built by hand out of the fields that
-/// «should» matter is the kind that goes stale without anyone noticing; these
-/// are the bytes the answer is a function of.
-async fn address(
-    state: &AppState,
-    collection: &Collection,
-    observations: &BTreeMap<String, Observation>,
+async fn render_collection(
+    state: AppState,
+    collection: Collection,
+    providers: BTreeMap<String, RenderSettings>,
+    metadata: BTreeMap<String, ObservationMetadata>,
     target: Target,
-) -> Result<String, Error> {
-    let mut key = String::new();
+) -> Result<(Artifact, bool), Error> {
+    let _permit = state.rendered().admit().await;
+    let observations = state.providers().observations(providers.keys()).await?;
 
-    key.push_str(target.as_str());
-    key.push('\n');
-    key.push_str(&encode(collection)?);
+    tokio::task::spawn_blocking(move || {
+        // A refresh can replace an observation between address lookup and the
+        // full read. The result can be served, but only the matching revision
+        // can be remembered under the original address.
+        let unchanged = observations.len() == metadata.len()
+            && observations.iter().all(|(name, held)| {
+                metadata
+                    .get(name)
+                    .is_some_and(|previous| previous.content_hash == held.content_hash)
+            });
+        let index = NodeIndex::from_observations(
+            observations
+                .iter()
+                .map(|(name, held)| (name.as_str(), held)),
+        );
+        drop(observations);
 
-    for name in &collection.providers {
-        if let Some(provider) = state.providers().get(name).await {
-            key.push_str(name);
-            key.push_str(&encode(&provider)?);
-        }
+        let filters = providers
+            .iter()
+            .map(|(name, settings)| Ok((name.clone(), settings.filter.filter()?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()?;
+        let nodes = collection
+            .resolve(&index, &filters, &collection.filter()?)
+            .nodes;
+        drop(index);
 
-        if let Some(observation) = observations.get(name) {
-            key.push_str(observation.content_hash.as_deref().unwrap_or_default());
-        }
-    }
+        let rendered = target.render(&nodes.iter().collect::<Vec<_>>(), RenderIntent::Client)?;
+        let artifact = Artifact {
+            body: rendered.body.into(),
+            target,
+            nodes: nodes.len().saturating_sub(rendered.skipped.len()),
+            skipped: rendered.skipped.len(),
+            update_hours: shortest_hours(&providers),
+        };
+        Ok((artifact, unchanged))
+    })
+    .await?
+}
 
-    Ok(suba_core::checksum::sha256_hex(key.as_bytes()))
+fn address(
+    collection: &Collection,
+    providers: &BTreeMap<String, RenderSettings>,
+    metadata: &BTreeMap<String, ObservationMetadata>,
+    target: Target,
+) -> Result<Option<String>, Error> {
+    let hashes = metadata
+        .iter()
+        .map(|(name, held)| Some((name, held.content_hash.as_deref()?)))
+        .collect::<Option<BTreeMap<_, _>>>();
+    // Older or failure-only observations may not have a content hash.
+    let Some(hashes) = hashes else {
+        return Ok(None);
+    };
+    let key = serde_json::to_vec(&(target.as_str(), collection, providers, hashes))
+        .map_err(std::io::Error::other)?;
+    Ok(Some(suba_core::checksum::sha256_hex(&key)))
 }
 
 /// How often a subscriber should ask again, in whole hours, rounded up.
-///
-/// The shortest interval among the member providers: asking more often than
-/// the fastest one changes gets nothing new, and asking less often misses it.
-pub(crate) async fn update_hours(state: &AppState, collection: &Collection) -> Option<u64> {
-    let mut shortest: Option<u64> = None;
-
-    for name in &collection.providers {
-        let seconds = state
-            .providers()
-            .get(name)
-            .await
-            .and_then(|provider| provider.interval())
-            .map(|interval| interval.as_secs());
-
-        if let Some(seconds) = seconds {
-            shortest = Some(shortest.map_or(seconds, |known| known.min(seconds)));
-        }
-    }
-
-    shortest.map(|seconds| seconds.div_ceil(3600))
+fn shortest_hours(providers: &BTreeMap<String, RenderSettings>) -> Option<u64> {
+    providers
+        .values()
+        .filter_map(|provider| provider.interval_seconds)
+        .min()
+        .map(|seconds| seconds.div_ceil(3600))
 }
 
-/// A document as the instance's codec writes it, for the address above.
-fn encode<T: Serialize>(value: &T) -> Result<String, Error> {
-    crate::config::codec::encode(value, StdPath::new("render")).map_err(Error::Config)
+#[cfg(feature = "singbox-core")]
+pub(crate) async fn update_hours(state: &AppState, collection: &Collection) -> Option<u64> {
+    shortest_hours(
+        &state
+            .providers()
+            .render_settings(&collection.providers)
+            .await,
+    )
 }
 
 /// Serve what this collection hands to a subscriber, for the operator.
@@ -420,7 +436,7 @@ pub async fn content(
     headers.insert("x-suba-nodes", HeaderValue::from(artifact.nodes));
     headers.insert("x-suba-skipped", HeaderValue::from(artifact.skipped));
 
-    Ok((headers, artifact.body.to_string()))
+    Ok((headers, artifact.body.clone()))
 }
 
 /// The headers a subscription client reads, on every artifact.
@@ -539,11 +555,8 @@ mod artifact_tests {
 
         assert_eq!(artifact.nodes, 1);
         assert_eq!(artifact.skipped, 0);
-        assert!(
-            artifact.body.contains("#US-01"),
-            "a link list carries the node: {}",
-            artifact.body
-        );
+        let body = std::str::from_utf8(&artifact.body).unwrap();
+        assert!(body.contains("#US-01"), "a link list carries the node");
     }
 
     #[tokio::test]
@@ -560,8 +573,8 @@ mod artifact_tests {
         collection(&state, "main", &["beta", "alpha"]).await;
 
         let artifact = artifact_of(&state, "main", Target::Links).await.unwrap().0;
-        let names: Vec<_> = artifact
-            .body
+        let names: Vec<_> = std::str::from_utf8(&artifact.body)
+            .unwrap()
             .lines()
             .map(|line| {
                 suba_core::proto::parse_link(line)
@@ -587,13 +600,11 @@ mod artifact_tests {
         let clash = artifact_of(&state, "main", Target::Clash).await.unwrap().0;
         let links = artifact_of(&state, "main", Target::Links).await.unwrap().0;
 
-        assert!(
-            clash.body.contains("proxies:"),
-            "a clash document: {}",
-            clash.body
-        );
-        assert!(!clash.body.contains("#US-01"), "and not a link list");
-        assert!(links.body.contains("#US-01"), "{}", links.body);
+        let clash = std::str::from_utf8(&clash.body).unwrap();
+        let links = std::str::from_utf8(&links.body).unwrap();
+        assert!(clash.contains("proxies:"), "a clash document");
+        assert!(!clash.contains("#US-01"), "and not a link list");
+        assert!(links.contains("#US-01"));
     }
 
     /// A second request for the same thing is the artifact rendered the first
@@ -800,12 +811,17 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
         .await
         .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
 
-    let observations = state.providers().observations().await?;
+    let _permit = state.rendered().admit().await;
+    let observations = state
+        .providers()
+        .observations(&collection.providers)
+        .await?;
     let index = NodeIndex::from_observations(
         observations
             .iter()
             .map(|(name, observation)| (name.as_str(), observation)),
     );
+    drop(observations);
 
     let filter = collection.filter()?;
     let resolved = collection.resolve(
@@ -832,21 +848,34 @@ pub(crate) async fn outbounds_of(
     state: &AppState,
     names: &[String],
 ) -> Result<(Vec<GeneratedOutbound>, Vec<ConversionSkip>), Error> {
-    let observations = state.providers().observations().await?;
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
-
-    let mut nodes: Vec<IndexEntry> = Vec::new();
-    let mut collections = BTreeMap::<_, Vec<String>>::new();
+    let _permit = state.rendered().admit().await;
+    let mut selected = Vec::with_capacity(names.len());
     for name in names {
         let collection = state
             .collections()
             .get(name)
             .await
             .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
+        selected.push((name, collection));
+    }
+    let observations = state
+        .providers()
+        .observations(
+            selected
+                .iter()
+                .flat_map(|(_, collection)| &collection.providers),
+        )
+        .await?;
+    let index = NodeIndex::from_observations(
+        observations
+            .iter()
+            .map(|(name, observation)| (name.as_str(), observation)),
+    );
+    drop(observations);
+
+    let mut nodes: Vec<IndexEntry> = Vec::new();
+    let mut collections = BTreeMap::<_, Vec<String>>::new();
+    for (name, collection) in selected {
         let resolved = collection.resolve(
             &index,
             &provider_filters(state, &collection).await?,
@@ -942,8 +971,8 @@ pub(crate) async fn provider_filters(
             continue;
         }
 
-        if let Some(provider) = state.providers().get(name).await {
-            filters.insert(name.clone(), provider.filter()?);
+        if let Some(filter) = state.providers().filter(name).await? {
+            filters.insert(name.clone(), filter);
         }
     }
 
@@ -1012,6 +1041,24 @@ mod tests {
             .iter()
             .find(|node| node.name == name)
             .unwrap_or_else(|| panic!("no node named {name}"))
+    }
+
+    #[tokio::test]
+    async fn a_collection_does_not_read_an_unrelated_observation() {
+        let state = state().await;
+        inline(&state, "alpha", &link("alpha.example.com", "Alpha")).await;
+        inline(&state, "beta", &link("beta.example.com", "Beta")).await;
+        collection(&state, "main", &["alpha"]).await;
+        std::fs::write(state.data_dir().join("providers/beta.json"), "{").unwrap();
+
+        let nodes = nodes_of(&state, "main").await;
+        let artifact = artifact_of(&state, "main", Target::Links).await;
+        let root = state.data_dir().parent().unwrap().to_path_buf();
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert_eq!(nodes.unwrap().nodes.len(), 1);
+        assert_eq!(artifact.unwrap().0.nodes, 1);
     }
 
     #[tokio::test]

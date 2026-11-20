@@ -94,6 +94,9 @@ pub enum Error {
     #[error(transparent)]
     Render(#[from] suba_core::RenderError),
 
+    #[error("{}", .0.message)]
+    SharedRender(HttpError),
+
     /// The operating system would not give random bytes.
     ///
     /// Its own problem: a token or a key pair cannot be made without entropy, and
@@ -246,6 +249,7 @@ pub enum Error {
     Operator { reason: &'static str },
 }
 
+#[derive(Debug, Clone)]
 pub struct HttpError {
     pub status_code: StatusCode,
     pub message: String,
@@ -375,6 +379,7 @@ impl IntoHttpError for Error {
                     message: message.to_string(),
                 }
             }
+            Error::SharedRender(error) => error,
             Error::Render(error) => {
                 tracing::error!("render error: {error}");
 

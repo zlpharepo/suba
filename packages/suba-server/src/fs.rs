@@ -168,6 +168,17 @@ pub fn write_atomic(dir: &Path, name: &str, contents: impl AsRef<[u8]>) -> io::R
 /// which is the answer the caller wants rather than an error to handle. A file
 /// that is not a regular file, or that is a symlink, is refused.
 pub fn read_to_string(dir: &Path, name: &str) -> io::Result<Option<String>> {
+    let Some(mut file) = open_regular(dir, name)? else {
+        return Ok(None);
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    Ok(Some(contents))
+}
+
+/// Open a regular file with the same path checks as [`read_to_string`].
+pub(crate) fn open_regular(dir: &Path, name: &str) -> io::Result<Option<File>> {
     let name = plain_name(dir, name)?;
 
     let directory = match open_private(dir, false) {
@@ -183,7 +194,7 @@ pub fn read_to_string(dir: &Path, name: &str) -> io::Result<Option<String>> {
         Mode::empty(),
     );
 
-    let mut file = match opened {
+    let file = match opened {
         Ok(fd) => File::from(fd),
         Err(Errno::NOENT) => return Ok(None),
         // `NOFOLLOW` refusing the final component. Reported as a refusal with a
@@ -201,10 +212,7 @@ pub fn read_to_string(dir: &Path, name: &str) -> io::Result<Option<String>> {
         return Err(refused(dir, name, "is not a regular file"));
     }
 
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-
-    Ok(Some(contents))
+    Ok(Some(file))
 }
 
 /// The names of the regular files directly inside `dir`, sorted; a directory

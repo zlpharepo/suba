@@ -136,10 +136,14 @@ impl Provider {
 
     /// The node filter this definition asks for.
     pub fn filter(&self) -> Result<NodeFilter, FilterError> {
+        self.shared().filter()
+    }
+
+    pub(crate) fn shared(&self) -> &SharedFields {
         match self {
-            Self::Remote(remote) => remote.shared.filter(),
-            Self::Local(local) => local.shared.filter(),
-            Self::Inline(inline) => inline.shared.filter(),
+            Self::Remote(remote) => &remote.shared,
+            Self::Local(local) => &local.shared,
+            Self::Inline(inline) => &inline.shared,
         }
     }
 

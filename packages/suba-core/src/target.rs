@@ -309,8 +309,11 @@ impl Target {
 
         // The values are built here, so a failure would be this crate's bug
         // rather than something a caller could act on.
-        serde_json::to_string(&serde_json::json!({ "outbounds": outbounds }))
-            .expect("the document this crate built")
+        #[derive(Serialize)]
+        struct Document {
+            outbounds: Vec<serde_json::Value>,
+        }
+        serde_json::to_string(&Document { outbounds }).expect("the document this crate built")
     }
 
     /// A clash document, as the dialect writes it.

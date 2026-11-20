@@ -14,21 +14,22 @@
 //! socket and a disk.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
+use serde::Serialize;
 use suba_core::subscription::Unreadable;
-use suba_core::{decide, record_failure, Observation, RefreshPlan, RefreshStatus};
+use suba_core::{decide, record_failure, NodeFilter, Observation, RefreshPlan, RefreshStatus};
 use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::{
     error::Error,
-    provider::{Provider, ProvidersConfig, PROVIDERS_BASENAME},
-    store::{FileStore, ObservationStore, StoreError},
+    provider::{Provider, ProvidersConfig, SharedFields, PROVIDERS_BASENAME},
+    store::{FileStore, ObservationMetadata, ObservationStore, StoreError},
 };
 
 use super::persisted::Persisted;
@@ -88,6 +89,13 @@ impl std::fmt::Display for Refreshed {
 
         Ok(())
     }
+}
+
+/// Provider settings that affect rendered artifacts, without inline payloads.
+#[derive(Serialize)]
+pub(crate) struct RenderSettings {
+    pub(crate) filter: SharedFields,
+    pub(crate) interval_seconds: Option<u64>,
 }
 
 /// The providers of the instance.
@@ -156,6 +164,14 @@ impl ProviderStore {
         self.file
             .read(|config| config.providers.get(name).cloned())
             .await
+    }
+
+    pub(crate) async fn filter(&self, name: &str) -> Result<Option<NodeFilter>, Error> {
+        Ok(self
+            .file
+            .read(|config| config.providers.get(name).map(Provider::filter))
+            .await
+            .transpose()?)
     }
 
     /// Every provider that takes part in automatic refreshing.
@@ -322,30 +338,78 @@ impl ProviderStore {
         writer.lock_owned().await
     }
 
-    /// Everything this hub holds, by provider name.
-    ///
-    /// One blocking call for all of them rather than a round trip per provider:
-    /// a caller that needs the whole picture — assembling a collection's node
-    /// view — would otherwise pay the pool's latency once per provider, for the
-    /// same kind of work each time.
-    pub(crate) async fn observations(&self) -> Result<BTreeMap<String, Observation>, Error> {
-        let names: Vec<String> = self.list().await.into_keys().collect();
+    /// Snapshot the render inputs for configured members in one read.
+    pub(crate) async fn render_settings(
+        &self,
+        members: &[String],
+    ) -> BTreeMap<String, RenderSettings> {
+        self.file
+            .read(|config| {
+                members
+                    .iter()
+                    .filter_map(|name| {
+                        let provider = config.providers.get(name)?;
+                        Some((
+                            name.clone(),
+                            RenderSettings {
+                                filter: provider.shared().clone(),
+                                interval_seconds: provider.interval().map(|value| value.as_secs()),
+                            },
+                        ))
+                    })
+                    .collect()
+            })
+            .await
+    }
+
+    /// Read only observations for the configured members of the requested views.
+    pub(crate) async fn observations<'a>(
+        &self,
+        members: impl IntoIterator<Item = &'a String>,
+    ) -> Result<BTreeMap<String, Observation>, Error> {
+        let names = self
+            .file
+            .read(|config| {
+                members
+                    .into_iter()
+                    .filter(|name| config.providers.contains_key(*name))
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            })
+            .await;
+        self.read_observations(names, |store, name| store.read(name))
+            .await
+    }
+
+    pub(crate) async fn observation_metadata(
+        &self,
+        names: impl IntoIterator<Item = String>,
+    ) -> Result<BTreeMap<String, ObservationMetadata>, Error> {
+        self.read_observations(names, |store, name| store.metadata(name))
+            .await
+    }
+
+    async fn read_observations<T: Send + 'static>(
+        &self,
+        names: impl IntoIterator<Item = String>,
+        read: fn(&dyn ObservationStore, &str) -> Result<Option<T>, StoreError>,
+    ) -> Result<BTreeMap<String, T>, Error> {
+        let names: Vec<_> = names.into_iter().collect();
+        if names.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let store = Arc::clone(&self.observations);
 
-        Ok(
-            tokio::task::spawn_blocking(move || -> Result<_, StoreError> {
-                let mut held = BTreeMap::new();
-
-                for name in names {
-                    if let Some(observation) = store.read(&name)? {
-                        held.insert(name, observation);
-                    }
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut held = BTreeMap::new();
+            for name in names {
+                if let Some(observation) = read(store.as_ref(), &name)? {
+                    held.insert(name, observation);
                 }
-
-                Ok(held)
-            })
-            .await??,
-        )
+            }
+            Ok::<_, StoreError>(held)
+        })
+        .await??)
     }
 
     /// The observation held for `name`, read off the blocking pool.

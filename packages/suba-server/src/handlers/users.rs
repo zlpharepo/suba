@@ -536,7 +536,7 @@ pub async fn content(
     headers.insert("x-suba-nodes", HeaderValue::from(artifact.nodes));
     headers.insert("x-suba-skipped", HeaderValue::from(artifact.skipped));
 
-    Ok((headers, artifact.body.to_string()))
+    Ok((headers, artifact.body))
 }
 
 /// A user's subscription: exportable managed nodes from the selected core
@@ -555,6 +555,7 @@ pub(crate) async fn user_artifact(
         .get(name)
         .cloned()
         .ok_or_else(|| Error::UserNotFound(name.to_owned()))?;
+    let _permit = state.rendered().admit().await;
     let host = public_host(state).await;
 
     let store = state.singbox();
@@ -638,17 +639,28 @@ pub(crate) async fn user_artifact(
         }
     }
 
-    let observations = state.providers().observations().await?;
+    let mut collections = Vec::new();
+    for name in &user.collections {
+        if let Some(collection) = state.collections().get(name).await {
+            collections.push(collection);
+        }
+    }
+    let observations = state
+        .providers()
+        .observations(
+            collections
+                .iter()
+                .flat_map(|collection| &collection.providers),
+        )
+        .await?;
     let index = NodeIndex::from_observations(
         observations
             .iter()
             .map(|(name, observation)| (name.as_str(), observation)),
     );
+    drop(observations);
     let mut hours: Option<u64> = None;
-    for name in &user.collections {
-        let Some(collection) = state.collections().get(name).await else {
-            continue;
-        };
+    for collection in collections {
         let resolved = collection.resolve(
             &index,
             &provider_filters(state, &collection).await?,
@@ -659,6 +671,8 @@ pub(crate) async fn user_artifact(
             hours = Some(hours.map_or(every, |known| known.min(every)));
         }
     }
+
+    drop(index);
 
     // Own servers and provider nodes share one list, so a name both use is
     // told apart the way two providers' are.

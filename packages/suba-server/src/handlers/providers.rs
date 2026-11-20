@@ -7,7 +7,7 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use suba_core::subscription::{self, Unreadable};
+use suba_core::subscription::Unreadable;
 use suba_core::NodeIndex;
 use suba_core::RefreshStatus;
 
@@ -70,7 +70,10 @@ pub async fn index(
 
 async fn summaries(state: &AppState) -> Result<BTreeMap<String, ProviderSummary>, Error> {
     let providers = state.providers().list().await;
-    let observations = state.providers().observations().await?;
+    let observations = state
+        .providers()
+        .observation_metadata(providers.keys().cloned())
+        .await?;
 
     Ok(providers
         .into_iter()
@@ -166,25 +169,22 @@ pub async fn nodes(
 
 /// Read one provider's payload the way the rest of the instance reads it.
 async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
-    let provider = state
+    let filter = state
         .providers()
-        .get(name)
-        .await
+        .filter(name)
+        .await?
         .ok_or_else(|| Error::ProviderNotFound(name.to_owned()))?;
+    let _permit = state.rendered().admit().await;
 
     // Other providers cannot rename this provider's entries or make its view fail.
     let observation = state.providers().observation(name).await?;
-    let index = NodeIndex::from_observations(observation.iter().map(|held| (name, held)));
-    let filter = provider.filter()?;
+    let (index, unreadable) = NodeIndex::from_observation(name, observation.as_ref());
     let nodes: Vec<_> = index
         .entries()
         .iter()
         .filter(|entry| filter.admits(entry.name()))
         .map(NodeView::from)
         .collect();
-    let unreadable = observation
-        .as_ref()
-        .and_then(|held| subscription::parse(held.payload.as_bytes(), name).unreadable);
 
     Ok(Nodes {
         name: name.to_owned(),

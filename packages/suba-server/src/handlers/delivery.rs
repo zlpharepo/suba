@@ -13,6 +13,7 @@
 //! operator's business, and this route answers anyone holding a token.
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, Request, State},
     response::{IntoResponse, Response},
 };
@@ -105,7 +106,7 @@ async fn addresses_deliveries(state: &AppState, prefix: &str) -> bool {
     }
 }
 
-fn respond(delivered: Result<(HeaderMap, String), Error>) -> Response {
+fn respond(delivered: Result<(HeaderMap, Bytes), Error>) -> Response {
     match delivered {
         Ok((headers, body)) => (StatusCode::OK, headers, body).into_response(),
         Err(Error::TooManyRequests { retry_after }) => {
@@ -129,7 +130,7 @@ async fn deliver(
     choice: &TargetChoice,
     request: &HeaderMap,
     download: bool,
-) -> Result<(HeaderMap, String), Error> {
+) -> Result<(HeaderMap, Bytes), Error> {
     // A prefix this instance cannot use makes every delivery address nothing,
     // which is exactly what a wrong prefix means from outside — but the operator
     // is told, once per request, in the log.
@@ -207,7 +208,7 @@ async fn deliver(
         }
     }
 
-    Ok((headers, artifact.body.to_string()))
+    Ok((headers, artifact.body.clone()))
 }
 
 /// Who a token was minted for.
@@ -312,7 +313,7 @@ mod tests {
         prefix: &str,
         token: &str,
     ) -> Result<(HeaderMap, String), Error> {
-        deliver(
+        let (headers, body) = deliver(
             state,
             prefix,
             None,
@@ -321,7 +322,8 @@ mod tests {
             &HeaderMap::new(),
             false,
         )
-        .await
+        .await?;
+        Ok((headers, std::str::from_utf8(&body).unwrap().to_owned()))
     }
 
     /// A delivery as a client that names itself.
@@ -337,7 +339,8 @@ mod tests {
             target: target.map(str::to_owned),
         };
 
-        deliver(state, "s", None, token, &choice, &request, false).await
+        let (headers, body) = deliver(state, "s", None, token, &choice, &request, false).await?;
+        Ok((headers, std::str::from_utf8(&body).unwrap().to_owned()))
     }
 
     async fn served(state: &AppState) {

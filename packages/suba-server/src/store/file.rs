@@ -11,15 +11,18 @@
 //! can debug afterwards — and it is cheap to prevent.
 
 use std::{
-    fs::File,
-    io::{self, Read as _, Seek as _, SeekFrom, Write as _},
+    collections::HashMap,
+    fs::{File, Metadata},
+    io::{self, BufReader, Read as _, Seek as _, SeekFrom, Write as _},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use rustix::fs::FlockOperation;
 use suba_core::Observation;
 
-use super::{ObservationStore, StoreError};
+use super::{ObservationMetadata, ObservationStore, StoreError};
 use crate::{
     fs as disk,
     provider::{provider_name, PROVIDERS_BASENAME},
@@ -33,9 +36,33 @@ const OBSERVATIONS: &str = PROVIDERS_BASENAME;
 /// The store as a directory of files.
 pub(crate) struct FileStore {
     root: PathBuf,
+    metadata: Mutex<HashMap<String, (Revision, ObservationMetadata)>>,
     /// Held open for as long as the store is: dropping it releases the lock.
     /// Never read, which is the point — holding it is the whole behaviour.
     _lock: File,
+}
+
+// Compare the opened file, so a replacement cannot pair old data with a new
+// revision. Change time also catches edits to the existing inode.
+#[derive(PartialEq, Eq)]
+struct Revision {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    changed: (i64, i64),
+    modified: (i64, i64),
+}
+
+impl From<Metadata> for Revision {
+    fn from(file: Metadata) -> Self {
+        Self {
+            device: file.dev(),
+            inode: file.ino(),
+            bytes: file.len(),
+            changed: (file.ctime(), file.ctime_nsec()),
+            modified: (file.mtime(), file.mtime_nsec()),
+        }
+    }
 }
 
 impl FileStore {
@@ -50,7 +77,11 @@ impl FileStore {
         let lock = lock_data(&root)?;
         disk::ensure_dir(root.join(OBSERVATIONS))?;
 
-        Ok(Self { root, _lock: lock })
+        Ok(Self {
+            root,
+            metadata: Mutex::default(),
+            _lock: lock,
+        })
     }
 
     /// The file one provider's observation lives in.
@@ -85,6 +116,40 @@ impl ObservationStore for FileStore {
         })
     }
 
+    fn metadata(&self, provider: &str) -> Result<Option<ObservationMetadata>, StoreError> {
+        provider_name(provider)?;
+        let dir = self.root.join(OBSERVATIONS);
+        let name = Self::name(provider);
+        let Some(file) = disk::open_regular(&dir, &name)? else {
+            return Ok(None);
+        };
+        let revision = Revision::from(file.metadata()?);
+        if let Some((_, metadata)) = self
+            .metadata
+            .lock()
+            .expect("observation metadata")
+            .get(provider)
+            .filter(|(cached, _)| *cached == revision)
+        {
+            return Ok(Some(metadata.clone()));
+        }
+
+        // A cold read skips payload allocation and leaves the observation
+        // format and its atomic replacement intact.
+        let metadata: ObservationMetadata =
+            serde_json::from_reader(BufReader::new(file)).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: {error}", dir.join(&name).display()),
+                )
+            })?;
+        self.metadata
+            .lock()
+            .expect("observation metadata")
+            .insert(provider.to_owned(), (revision, metadata.clone()));
+        Ok(Some(metadata))
+    }
+
     fn write(&self, provider: &str, observation: &Observation) -> Result<(), StoreError> {
         provider_name(provider)?;
 
@@ -104,6 +169,10 @@ impl ObservationStore for FileStore {
         provider_name(provider)?;
 
         disk::remove(&self.root.join(OBSERVATIONS), &Self::name(provider))?;
+        self.metadata
+            .lock()
+            .expect("observation metadata")
+            .remove(provider);
 
         Ok(())
     }

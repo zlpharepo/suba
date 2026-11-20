@@ -49,6 +49,22 @@ pub enum StoreError {
     Locked { pid: Option<u32> },
 }
 
+/// Observation fields needed without the upstream document.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct ObservationMetadata {
+    pub(crate) updated_at: Option<i64>,
+    pub(crate) content_hash: Option<String>,
+}
+
+impl From<&Observation> for ObservationMetadata {
+    fn from(observation: &Observation) -> Self {
+        Self {
+            updated_at: observation.updated_at,
+            content_hash: observation.content_hash.clone(),
+        }
+    }
+}
+
 /// What the instance keeps between requests.
 ///
 /// Synchronous on purpose: the work is file I/O and it blocks. The caller that
@@ -61,6 +77,11 @@ pub(crate) trait ObservationStore: Send + Sync + 'static {
     /// A provider that has never been fetched is not an error: it has nothing to
     /// say yet, which is different from failing to say it.
     fn read(&self, provider: &str) -> Result<Option<Observation>, StoreError>;
+
+    /// Project the current observation without retaining its payload.
+    fn metadata(&self, provider: &str) -> Result<Option<ObservationMetadata>, StoreError> {
+        Ok(self.read(provider)?.as_ref().map(ObservationMetadata::from))
+    }
 
     /// Replace the observation held for `provider`.
     fn write(&self, provider: &str, observation: &Observation) -> Result<(), StoreError>;

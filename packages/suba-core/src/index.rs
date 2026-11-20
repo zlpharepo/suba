@@ -26,23 +26,41 @@ impl NodeIndex {
         let mut entries = Vec::new();
 
         for (provider, observation) in observations {
-            let parsed = subscription::parse(observation.payload.as_bytes(), provider);
-
-            for record in parsed.nodes {
-                let source = Source {
-                    provider: provider.to_string(),
-                    name: record.name().to_string(),
-                    position: record.provenance[0].position,
-                };
-                entries.push(IndexEntry {
-                    id: record.id(),
-                    node: record.node,
-                    source,
-                });
-            }
+            Self::append(&mut entries, provider, observation);
         }
 
         Self { entries }
+    }
+
+    /// Index one provider and report an unreadable payload from the same parse.
+    pub fn from_observation(
+        provider: &str,
+        observation: Option<&Observation>,
+    ) -> (Self, Option<subscription::Unreadable>) {
+        let mut entries = Vec::new();
+        let unreadable = observation.and_then(|held| Self::append(&mut entries, provider, held));
+        (Self { entries }, unreadable)
+    }
+
+    fn append(
+        entries: &mut Vec<IndexEntry>,
+        provider: &str,
+        observation: &Observation,
+    ) -> Option<subscription::Unreadable> {
+        let parsed = subscription::parse(observation.payload.as_bytes(), provider);
+        entries.extend(parsed.nodes.into_iter().map(|record| {
+            let source = Source {
+                provider: provider.to_string(),
+                name: record.name().to_string(),
+                position: record.provenance[0].position,
+            };
+            IndexEntry {
+                id: record.id(),
+                node: record.node,
+                source,
+            }
+        }));
+        parsed.unreadable
     }
 
     /// Stable provider-name order, then first occurrence in each payload.
