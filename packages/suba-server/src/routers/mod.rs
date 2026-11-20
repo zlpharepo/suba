@@ -101,6 +101,8 @@ impl AppRouter {
             .merge(account::route())
             .merge(system::local_route())
             .merge(environment_routes);
+        #[cfg(feature = "singbox-core")]
+        let api_router = api_router.merge(singbox::local_route());
 
         let not_found_service = not_found.into_service();
         let web_service = web_files(web_path).not_found_service(not_found_service);

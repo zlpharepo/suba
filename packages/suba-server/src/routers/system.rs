@@ -1,4 +1,4 @@
-use axum::{routing::get, Router};
+use axum::{extract::DefaultBodyLimit, routing::get, Router};
 
 use crate::{handlers::system, AppState};
 
@@ -20,6 +20,9 @@ pub fn local_route() -> Router<AppState> {
         )
         .route(
             "/system/web",
-            get(crate::handlers::web::status).post(crate::handlers::web::install),
+            get(crate::handlers::web::status)
+                .post(crate::handlers::web::install)
+                .put(crate::handlers::web::upload)
+                .layer(DefaultBodyLimit::max(crate::handlers::web::MAX_ARCHIVE)),
         )
 }

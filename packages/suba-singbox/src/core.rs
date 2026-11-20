@@ -83,6 +83,9 @@ pub enum Error {
     /// The archive could not be read as one.
     #[error("the archive could not be read: {reason}")]
     Archive { reason: &'static str },
+
+    #[error("the binary version does not match the archive name")]
+    ArchiveVersion,
     /// The archive holds a member this installer will not take.
     #[error("the archive member {member} is not one this installer takes")]
     Member { member: String },
@@ -173,6 +176,34 @@ impl Version {
     /// The version a release tag names.
     pub fn from_tag(tag: &str) -> Self {
         Self(tag.trim_start_matches('v').into())
+    }
+
+    /// Read the version from a release archive for the given platform.
+    pub fn from_asset_name(name: &str, platform: &str) -> Option<Self> {
+        let version = name
+            .strip_prefix("sing-box-")?
+            .strip_suffix(&format!("-{platform}.tar.gz"))?;
+        let (numeric, suffix) = version
+            .split_once('-')
+            .map_or((version, None), |(numeric, suffix)| (numeric, Some(suffix)));
+        if version.len() > 128
+            || !numeric
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            || suffix.is_some_and(|suffix| {
+                suffix.split('.').any(|part| {
+                    part.is_empty()
+                        || !part
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+            })
+        {
+            return None;
+        }
+        let version = Self(version.into());
+        version.numbers()?;
+        Some(version)
     }
 
     /// The version as it is spelled in a directory name or a document.

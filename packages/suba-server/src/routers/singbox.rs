@@ -5,6 +5,7 @@
 //! capability this build does not have is answered — absent, not "unsupported".
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post, put},
     Router,
 };
@@ -40,6 +41,15 @@ pub fn route() -> Router<AppState> {
                 .put(singbox::write_entry)
                 .delete(singbox::delete_entry),
         )
+}
+
+pub fn local_route() -> Router<AppState> {
+    Router::new().route(
+        "/cores/sing-box/versions",
+        post(singbox::upload_version).layer(DefaultBodyLimit::max(
+            suba_singbox::install::MAX_ASSET_BYTES as usize,
+        )),
+    )
 }
 
 pub fn agent_route() -> Router<AppState> {

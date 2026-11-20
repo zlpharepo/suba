@@ -84,6 +84,12 @@ pub enum Error {
     #[error(transparent)]
     Request(#[from] reqwest::Error),
 
+    #[error("{field}: {reason}")]
+    Upload {
+        field: &'static str,
+        reason: &'static str,
+    },
+
     #[error("web.release: {reason}")]
     WebRelease { reason: &'static str },
 
@@ -445,6 +451,10 @@ impl IntoHttpError for Error {
             Error::Request(_) => HttpError {
                 status_code: StatusCode::BAD_GATEWAY,
                 message: "Upstream request failed".to_string(),
+            },
+            error @ Error::Upload { .. } => HttpError {
+                status_code: StatusCode::UNPROCESSABLE_ENTITY,
+                message: error.to_string(),
             },
             Error::WebRelease { reason } => HttpError {
                 status_code: StatusCode::BAD_GATEWAY,

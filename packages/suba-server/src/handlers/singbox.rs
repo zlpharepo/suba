@@ -5,9 +5,10 @@
 //! do is hold a running core hostage to a request — a stop waits for the process
 //! to close what it opened, and that wait belongs on the blocking pool.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
+    body::Bytes,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue},
     response::{IntoResponse, Response},
@@ -17,12 +18,12 @@ use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use suba_singbox::assemble;
-use suba_singbox::core::{Release, Version};
+use suba_singbox::core::{self, Release, Version};
 use suba_singbox::install::{Generate, Needs};
 use suba_singbox::run::{self, Exit};
 
 use crate::{
-    dto::{spoken_or_kept, Operator, ResponseResult},
+    dto::{spoken_or_kept, Authenticated, Operator, ResponseResult},
     error::Error,
     handlers::collections::outbounds_of,
     state::metrics::ProcessUsage,
@@ -642,6 +643,7 @@ pub enum RuntimeView {
 }
 
 fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, Error> {
+    let task = store.installation_task(version);
     let metadata = store.installed_record(version)?;
     let current = store.current()?.as_ref() == Some(version);
     let running = store.running_version().as_ref() == Some(version);
@@ -691,26 +693,25 @@ fn version_view(store: &SingboxStore, version: &Version) -> Result<VersionView, 
         RuntimeView::Stopped
     };
 
-    let installation = if let Some(ref metadata) = metadata {
-        InstallationView::Installed {
-            installed_at: metadata.installed_at,
-        }
-    } else {
-        match store.installation_task(version) {
-            Some(InstallationTask::Downloading { downloaded, total }) => {
-                InstallationView::Downloading {
-                    progress: ProgressView {
-                        downloaded,
-                        total,
-                        percentage: total
-                            .filter(|total| *total > 0)
-                            .map(|total| ((downloaded.saturating_mul(100) / total).min(100)) as u8),
-                    },
-                }
+    let installation = match (task, &metadata) {
+        // The executable can be published before the first-version selection
+        // completes. Keep polling until that installation task is finished.
+        (Some(InstallationTask::Downloading { downloaded, total }), _) => {
+            InstallationView::Downloading {
+                progress: ProgressView {
+                    downloaded,
+                    total,
+                    percentage: total
+                        .filter(|total| *total > 0)
+                        .map(|total| ((downloaded.saturating_mul(100) / total).min(100)) as u8),
+                },
             }
-            Some(InstallationTask::Failed { error }) => InstallationView::Failed { error },
-            None => InstallationView::NotInstalled,
         }
+        (_, Some(metadata)) => InstallationView::Installed {
+            installed_at: metadata.installed_at,
+        },
+        (Some(InstallationTask::Failed { error }), None) => InstallationView::Failed { error },
+        (None, None) => InstallationView::NotInstalled,
     };
 
     Ok(VersionView {
@@ -1062,14 +1063,7 @@ pub async fn install_version(
 
     // An unknown release is a failed request, never a successfully queued job.
     let (asset, platform) = store.install_asset(&version, state.settings()).await?;
-    let preparing = store.clone();
-    let requested = version.clone();
-    let (created, response) = tokio::task::spawn_blocking(move || -> Result<_, Error> {
-        let created = preparing.begin_install(&requested)?;
-        let response = version_view(&preparing, &requested)?;
-        Ok((created, response))
-    })
-    .await??;
+    let (created, response) = reserve_install(&store, &version).await?;
     if !created {
         return Ok((StatusCode::OK, Json(response)));
     }
@@ -1082,6 +1076,61 @@ pub async fn install_version(
     });
 
     Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+#[derive(Deserialize)]
+pub struct CoreUpload {
+    filename: String,
+}
+
+/// Install a local archive for the running instance's platform.
+pub async fn upload_version(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+    Query(upload): Query<CoreUpload>,
+    archive: Bytes,
+) -> ResponseResult<(StatusCode, Json<VersionView>)> {
+    let platform = core::platform()?;
+    let version = Version::from_asset_name(&upload.filename, platform).ok_or(Error::Upload {
+        field: "filename",
+        reason: "use the original sing-box archive for this platform",
+    })?;
+    let store = state.singbox();
+    // Keep the reservation and worker together if the connection closes.
+    tokio::spawn(async move {
+        let (created, response) = reserve_install(&store, &version).await?;
+        if !created {
+            return Ok((StatusCode::OK, Json(response)));
+        }
+
+        tokio::spawn(async move {
+            let worker = store.clone();
+            let requested = version.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                worker.install_uploaded(&requested, platform, &upload.filename, &archive)
+            })
+            .await
+            .map_err(Error::from)
+            .and_then(|result| result);
+            store.finish_install(&version, &result);
+        });
+        Ok((StatusCode::ACCEPTED, Json(response)))
+    })
+    .await?
+}
+
+async fn reserve_install(
+    store: &Arc<SingboxStore>,
+    version: &Version,
+) -> Result<(bool, VersionView), Error> {
+    let store = Arc::clone(store);
+    let version = version.clone();
+    tokio::task::spawn_blocking(move || {
+        let created = store.begin_install(&version)?;
+        let response = version_view(&store, &version)?;
+        Ok((created, response))
+    })
+    .await?
 }
 
 /// Remove an installed version.

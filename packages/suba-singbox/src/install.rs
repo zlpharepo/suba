@@ -57,6 +57,43 @@ pub fn install(
     expected: Option<&str>,
     now: i64,
 ) -> Result<Metadata, Error> {
+    install_archive(
+        dirs,
+        version,
+        platform,
+        asset,
+        archive,
+        Source::Release(expected),
+        now,
+    )
+}
+
+/// Install a locally supplied release archive and check the executable's version.
+pub fn install_uploaded(
+    dirs: &Dirs,
+    version: &Version,
+    platform: &str,
+    asset: &str,
+    archive: &[u8],
+    now: i64,
+) -> Result<Metadata, Error> {
+    install_archive(dirs, version, platform, asset, archive, Source::Upload, now)
+}
+
+enum Source<'a> {
+    Release(Option<&'a str>),
+    Upload,
+}
+
+fn install_archive(
+    dirs: &Dirs,
+    version: &Version,
+    platform: &str,
+    asset: &str,
+    archive: &[u8],
+    source: Source<'_>,
+    now: i64,
+) -> Result<Metadata, Error> {
     if dirs.metadata(version).exists() {
         return Err(Error::Installed {
             version: version.clone(),
@@ -64,7 +101,7 @@ pub fn install(
     }
 
     let asset_sha256 = sha256_hex(archive);
-    if let Some(expected) = expected {
+    if let Source::Release(Some(expected)) = source {
         if expected != asset_sha256 {
             return Err(Error::Hash {
                 expected: expected.to_string(),
@@ -91,6 +128,19 @@ pub fn install(
         // a version that cannot do what the release can.
         for library in &extracted.libraries {
             write(&bin.join(&library.name), &library.bytes, false)?;
+        }
+
+        if matches!(source, Source::Upload) {
+            let mut command = Command::new(bin.join(BINARY));
+            command.args(["version", "--name"]);
+            let output = spawn::output(command).map_err(|_| Error::Run {
+                reason: "the binary could not be started",
+            })?;
+            if !output.status.success()
+                || std::str::from_utf8(&output.stdout).ok().map(str::trim) != Some(version.as_str())
+            {
+                return Err(Error::ArchiveVersion);
+            }
         }
 
         let schema = staging.join("schema.json");

@@ -250,6 +250,9 @@ fn installation_failure(error: &Error) -> &'static str {
         Error::Singbox(core::Error::Refused { .. }) => "the release server refused the download",
         Error::Singbox(core::Error::Network { .. }) => "the download could not be completed",
         Error::Singbox(core::Error::Hash { .. }) => "the downloaded asset failed its checksum",
+        Error::Singbox(core::Error::ArchiveVersion) => {
+            "the binary version does not match the archive name"
+        }
         Error::Singbox(core::Error::Archive { .. })
         | Error::Singbox(core::Error::Member { .. })
         | Error::Singbox(core::Error::MemberMissing { .. })
@@ -523,11 +526,11 @@ impl SingboxStore {
             }
             .into());
         }
+        let mut installs = self.installs.lock().expect("install tasks");
         if self.installed_record(version)?.is_some() {
             self.select_if_empty(version)?;
             return Ok(false);
         }
-        let mut installs = self.installs.lock().expect("install tasks");
         if matches!(
             installs.get(version),
             Some(InstallationTask::Downloading { .. })
@@ -1183,6 +1186,26 @@ impl SingboxStore {
         // serialize, otherwise a late download could overwrite the user's pick.
         self.select_if_empty(&metadata.version)?;
 
+        Ok(metadata)
+    }
+
+    /// Publish an uploaded release using the same staged installer as downloads.
+    pub(crate) fn install_uploaded(
+        &self,
+        version: &Version,
+        platform: &str,
+        filename: &str,
+        archive: &[u8],
+    ) -> Result<Metadata, Error> {
+        let metadata = install::install_uploaded(
+            &self.dirs,
+            version,
+            platform,
+            filename,
+            archive,
+            chrono::Utc::now().timestamp(),
+        )?;
+        self.select_if_empty(&metadata.version)?;
         Ok(metadata)
     }
 

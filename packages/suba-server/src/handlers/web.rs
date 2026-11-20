@@ -1,12 +1,16 @@
 //! Installation of the separately released Web build into the instance data directory.
 
-use std::{io::Cursor, path::Component, time::Duration};
+use std::{
+    path::{Component, Path},
+    time::Duration,
+};
 
 use axum::{
-    extract::{FromRequestParts, Request, State},
+    body::Bytes,
+    extract::{FromRequestParts, Query, Request, State},
     Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -17,7 +21,7 @@ use crate::{
 
 const RELEASE: &str = "https://api.github.com/repos/zlpharepo/suba-web/releases/latest";
 const ASSETS: &str = "https://github.com/zlpharepo/suba-web/releases/download";
-const MAX_ARCHIVE: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE: usize = 32 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 64 * 1024 * 1024;
 
 #[derive(Serialize)]
@@ -56,12 +60,7 @@ async fn latest(state: &AppState, github: &GitHubReleaseSettings) -> ResponseRes
     let version = tag
         .strip_prefix('v')
         .ok_or_else(|| release_error("invalid release tag"))?;
-    let parts: Vec<_> = version.split('.').collect();
-    if parts.len() != 3
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
-    {
+    if !valid_version(version) {
         return Err(release_error("invalid release tag"));
     }
     let assets = metadata["assets"]
@@ -73,6 +72,14 @@ async fn latest(state: &AppState, github: &GitHubReleaseSettings) -> ResponseRes
         }
     }
     Ok(version.to_string())
+}
+
+fn valid_version(version: &str) -> bool {
+    version.len() <= 64
+        && version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 async fn download(state: &AppState, url: &str, limit: usize) -> ResponseResult<Vec<u8>> {
@@ -127,10 +134,10 @@ fn verify_archive(bytes: &[u8], checksum: &[u8]) -> ResponseResult<()> {
     Ok(())
 }
 
-fn unpack(bytes: Vec<u8>, stage: &std::path::Path, version: &str) -> ResponseResult<()> {
+fn unpack(bytes: &[u8], stage: &Path, version: Option<&str>) -> ResponseResult<()> {
     std::fs::create_dir_all(stage)?;
     let result = (|| {
-        let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+        let decoder = flate2::read::GzDecoder::new(bytes);
         let mut archive = tar::Archive::new(decoder);
         let mut total = 0_u64;
         let mut count = 0;
@@ -175,7 +182,12 @@ fn unpack(bytes: Vec<u8>, stage: &std::path::Path, version: &str) -> ResponseRes
         if !stage.join("index.html").is_file() {
             return Err(release_error("archive has no index page"));
         }
-        std::fs::write(stage.join(".suba-version"), version)?;
+        let marker = stage.join(".suba-version");
+        if let Some(version) = version {
+            std::fs::write(marker, version)?;
+        } else if marker.exists() {
+            std::fs::remove_file(marker)?;
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -217,7 +229,7 @@ pub async fn install(
     State(state): State<AppState>,
     request: Request,
 ) -> ResponseResult<Json<WebStatus>> {
-    let _guard = state.web_lock().lock().await;
+    let guard = state.web_lock().lock_owned().await;
     if state.web_dir().join("index.html").is_file() {
         let (mut parts, _) = request.into_parts();
         Authenticated::from_request_parts(&mut parts, &state).await?;
@@ -229,24 +241,79 @@ pub async fn install(
     let checksum = download(&state, &github.url(&format!("{release}.sha256")), 256).await?;
     verify_archive(&archive, &checksum)?;
     let web = state.web_dir();
+    let installed = version.clone();
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        replace_web(&web, &archive, Some(&installed))
+    })
+    .await??;
+    Ok(Json(WebStatus {
+        installed_version: Some(version.clone()),
+        latest_version: Some(version),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct WebUpload {
+    version: Option<String>,
+}
+
+/// Install a local release archive without a network lookup.
+pub async fn upload(
+    _auth: Authenticated,
+    State(state): State<AppState>,
+    Query(upload): Query<WebUpload>,
+    archive: Bytes,
+) -> ResponseResult<Json<WebStatus>> {
+    let version = upload
+        .version
+        .as_deref()
+        .map(|version| version.strip_prefix('v').unwrap_or(version));
+    if version.is_some_and(|version| !valid_version(version)) {
+        return Err(Error::Upload {
+            field: "version",
+            reason: "use a version such as 1.2.3",
+        });
+    }
+    let version = version.map(str::to_owned);
+    let installed = version.clone();
+    let web = state.web_dir();
+    let guard = state.web_lock().lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        replace_web(&web, &archive, installed.as_deref())
+    })
+    .await?
+    .map_err(|error| match error {
+        Error::WebRelease { reason } => Error::Upload {
+            field: "archive",
+            reason,
+        },
+        other => other,
+    })?;
+    Ok(Json(WebStatus {
+        installed_version: version,
+        latest_version: None,
+    }))
+}
+
+fn replace_web(web: &Path, archive: &[u8], version: Option<&str>) -> ResponseResult {
     let parent = web
         .parent()
         .ok_or_else(|| release_error("invalid data directory"))?;
     let nonce = uuid::Uuid::now_v7();
     let stage = parent.join(format!("web-stage-{nonce}"));
     let backup = parent.join(format!("web-backup-{nonce}"));
-    tokio::task::spawn_blocking({
-        let stage = stage.clone();
-        let version = version.clone();
-        move || unpack(archive, &stage, &version)
-    })
-    .await??;
+    unpack(archive, &stage, version)?;
     if web.exists() {
-        std::fs::rename(&web, &backup)?;
+        if let Err(error) = std::fs::rename(web, &backup) {
+            let _ = std::fs::remove_dir_all(&stage);
+            return Err(error.into());
+        }
     }
-    if let Err(error) = std::fs::rename(&stage, &web) {
+    if let Err(error) = std::fs::rename(&stage, web) {
         if backup.exists() {
-            if let Err(restore) = std::fs::rename(&backup, &web) {
+            if let Err(restore) = std::fs::rename(&backup, web) {
                 crate::tracing::error!(kind = ?restore.kind(), "previous web directory could not be restored");
             }
         }
@@ -258,15 +325,13 @@ pub async fn install(
             crate::tracing::warn!(kind = ?error.kind(), "previous web directory could not be removed");
         }
     }
-    Ok(Json(WebStatus {
-        installed_version: Some(version.clone()),
-        latest_version: Some(version),
-    }))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn release_archive_installs_a_root_page_and_version() {
@@ -286,7 +351,7 @@ mod tests {
         let encoder = archive.into_inner().unwrap();
         let bytes = encoder.finish().unwrap();
         let root = std::env::temp_dir().join(format!("suba-web-test-{}", uuid::Uuid::now_v7()));
-        unpack(bytes.clone(), &root, "0.1.0").unwrap();
+        unpack(&bytes, &root, Some("0.1.0")).unwrap();
         assert_eq!(std::fs::read(root.join("index.html")).unwrap(), b"hello");
         assert_eq!(
             std::fs::read_to_string(root.join(".suba-version")).unwrap(),

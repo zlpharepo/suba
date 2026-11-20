@@ -72,7 +72,7 @@ struct Inner {
     sessions: Option<SessionStore>,
     /// Serializes login issuance with password rotation across both stores.
     auth_lock: tokio::sync::Mutex<()>,
-    web_lock: tokio::sync::Mutex<()>,
+    web_lock: Arc<tokio::sync::Mutex<()>>,
     web_release: tokio::sync::Mutex<Option<(std::time::Instant, Option<String>)>>,
     metrics: Arc<MetricsStore>,
     #[cfg(feature = "singbox-core")]
@@ -153,7 +153,7 @@ impl AppState {
                     Some(SessionStore::load(&config.data_dir)?)
                 },
                 auth_lock: tokio::sync::Mutex::new(()),
-                web_lock: tokio::sync::Mutex::new(()),
+                web_lock: Arc::default(),
                 web_release: tokio::sync::Mutex::new(None),
                 metrics: Arc::new(MetricsStore::new(&config.data_dir)),
                 #[cfg(feature = "singbox-core")]
@@ -212,8 +212,8 @@ impl AppState {
         &self.inner.http
     }
 
-    pub(crate) fn web_lock(&self) -> &tokio::sync::Mutex<()> {
-        &self.inner.web_lock
+    pub(crate) fn web_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.inner.web_lock)
     }
 
     pub(crate) fn web_release(

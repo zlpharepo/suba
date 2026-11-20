@@ -6,34 +6,132 @@
 <style>
   :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
   body { min-height: 100vh; display: grid; place-items: center; margin: 0; }
-  main { width: min(22rem, calc(100vw - 3rem)); }
+  main { width: min(22rem, calc(100vw - 3rem)); padding-block: 1.5rem; }
   h1 { font-size: 1.25rem; font-weight: 600; }
   button { padding: .6rem 1rem; border: 0; border-radius: .5rem; background: #6b5cff; color: white; font: inherit; cursor: pointer; }
   button:disabled { opacity: .55; cursor: wait; }
+  details { margin-block: 1rem; }
+  summary { cursor: pointer; }
+  form, fieldset { display: grid; gap: .75rem; }
+  form { margin-top: .75rem; }
+  fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+  fieldset[hidden] { display: none; }
+  legend { margin-bottom: .5rem; padding: 0; }
+  label { display: grid; gap: .25rem; font-size: .875rem; }
+  input { min-width: 0; font: inherit; }
+  input:not([type=file]) { box-sizing: border-box; width: 100%; padding: .4rem; }
   p { font-size: .875rem; }
 </style>
 <main>
   <h1>SubA Web</h1>
   <button id="install" type="button">Install Web</button>
+  <details id="manual">
+    <summary>Upload Web</summary>
+    <form id="upload">
+      <label>Web Archive <input name="archive" type="file" accept=".gz,.tgz" required></label>
+      <label>Version (optional) <input name="version" maxlength="64" placeholder="1.2.3"></label>
+      <fieldset id="credentials" hidden disabled>
+        <legend id="auth-title">Administrator</legend>
+        <label>Username <input name="username" autocomplete="username" minlength="3" maxlength="64" required></label>
+        <label>Password <input name="password" type="password" autocomplete="current-password" minlength="6" maxlength="128" required></label>
+      </fieldset>
+      <button type="submit">Upload Web</button>
+    </form>
+  </details>
   <p id="status" role="status"></p>
 </main>
 <script>
-  const button = document.getElementById("install");
+  const install = document.getElementById("install");
+  const form = document.getElementById("upload");
+  const submit = form.querySelector("button");
+  const credentials = document.getElementById("credentials");
+  const fields = form.elements;
   const status = document.getElementById("status");
-  button.addEventListener("click", async () => {
-    button.disabled = true;
-    status.textContent = "Downloading Web…";
+  const sessionKey = "suba.token";
+
+  function showCredentials() {
+    const needed = !localStorage.getItem(sessionKey);
+    credentials.hidden = !needed;
+    credentials.disabled = !needed;
+  }
+
+  showCredentials();
+  document.getElementById("manual").addEventListener("toggle", async (event) => {
+    if (!event.target.open || credentials.hidden) return;
     try {
-      const response = await fetch("/api/system/web", { method: "POST" });
-      if (!response.ok) {
-        const error = await response.json();
-        throw new Error(error.message || "Installation failed");
-      }
+      const response = await fetch("/api/system/status");
+      if (!response.ok) return;
+      const { administrator_configured } = await response.json();
+      document.getElementById("auth-title").textContent =
+        administrator_configured ? "Sign In as Administrator" : "Create Administrator";
+      fields.password.autocomplete = administrator_configured ? "current-password" : "new-password";
+    } catch {
+      // The upload can still use the existing login endpoint if status is unavailable.
+    }
+  });
+
+  async function expectSuccess(response) {
+    if (response.ok) return response;
+    const text = await response.text();
+    let reason = text;
+    try {
+      reason = JSON.parse(text).message;
+    } catch {
+      // A body size rejection can be plain text.
+    }
+    throw new Error(reason || "Installation failed");
+  }
+
+  async function run(message, action) {
+    if (install.disabled) return;
+    install.disabled = true;
+    submit.disabled = true;
+    status.textContent = message;
+    try {
+      await action();
       location.reload();
     } catch (error) {
       status.textContent = error.message;
-      button.disabled = false;
+    } finally {
+      install.disabled = false;
+      submit.disabled = false;
     }
+  }
+
+  install.addEventListener("click", () => run("Downloading Web…", async () => {
+    await expectSuccess(await fetch("/api/system/web", { method: "POST" }));
+  }));
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const archive = fields.archive.files[0];
+    const version = fields.version.value.trim();
+    if (!archive) return;
+    void run("Uploading Web…", async () => {
+      let token = localStorage.getItem(sessionKey);
+      if (!token) {
+        const response = await expectSuccess(await fetch("/api/auth/password", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: fields.username.value, password: fields.password.value }),
+        }));
+        ({ access_token: token } = await response.json());
+        localStorage.setItem(sessionKey, token);
+        fields.password.value = "";
+        showCredentials();
+      }
+      const query = version ? "?" + new URLSearchParams({ version }) : "";
+      const response = await fetch("/api/system/web" + query, {
+        method: "PUT",
+        headers: { Authorization: "Bearer " + token, "Content-Type": "application/gzip" },
+        body: archive,
+      });
+      if (response.status === 401) {
+        localStorage.removeItem(sessionKey);
+        showCredentials();
+      }
+      await expectSuccess(response);
+    });
   });
 </script>
 </html>
