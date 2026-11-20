@@ -21,7 +21,7 @@ use std::{
 use axum::body::Bytes;
 use futures_util::future::{FutureExt, Shared};
 use suba_core::Target;
-use tokio::sync::{oneshot, Semaphore, SemaphorePermit};
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use crate::error::{Error, HttpError, IntoHttpError};
 
@@ -40,7 +40,7 @@ type Flight = Shared<oneshot::Receiver<RenderResult>>;
 /// The artifacts rendered so far, most recent last.
 pub(crate) struct RenderMemo {
     entries: Arc<Mutex<Entries>>,
-    jobs: Semaphore,
+    jobs: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -71,13 +71,16 @@ impl RenderMemo {
     pub(crate) fn new() -> Self {
         Self {
             entries: Arc::default(),
-            jobs: Semaphore::new(CONCURRENT_JOBS),
+            jobs: Arc::new(Semaphore::new(CONCURRENT_JOBS)),
         }
     }
 
     /// Admit expensive subscription work before loading its payloads.
-    pub(crate) async fn admit(&self) -> SemaphorePermit<'_> {
-        self.jobs.acquire().await.expect("subscription job queue")
+    pub(crate) async fn admit(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.jobs)
+            .acquire_owned()
+            .await
+            .expect("subscription job queue")
     }
 
     /// Share the result with current callers even if it exceeds the cache

@@ -88,9 +88,39 @@ impl Collection {
         providers: &BTreeMap<String, NodeFilter>,
         filter: &NodeFilter,
     ) -> Resolved {
+        let mut nodes = Vec::new();
+        let (passed_over, unresolved) = self.visit_admitted(index, providers, filter, |entry| {
+            nodes.push(entry.clone());
+        });
+        crate::index::name_conflicts(&mut nodes);
+        Resolved {
+            nodes,
+            passed_over,
+            unresolved,
+        }
+    }
+
+    /// Count admitted nodes and report missing providers for a list view.
+    pub fn summarize(
+        &self,
+        index: &NodeIndex,
+        providers: &BTreeMap<String, NodeFilter>,
+        filter: &NodeFilter,
+    ) -> (usize, Vec<String>) {
+        let mut nodes = 0;
+        let (_, unresolved) = self.visit_admitted(index, providers, filter, |_| nodes += 1);
+        (nodes, unresolved)
+    }
+
+    fn visit_admitted(
+        &self,
+        index: &NodeIndex,
+        providers: &BTreeMap<String, NodeFilter>,
+        filter: &NodeFilter,
+        mut admit: impl FnMut(&IndexEntry),
+    ) -> (usize, Vec<String>) {
         let mut visited = BTreeSet::new();
         let mut unresolved = Vec::new();
-        let mut nodes = Vec::new();
         let mut passed_over = 0;
 
         for name in &self.providers {
@@ -102,25 +132,16 @@ impl Collection {
                 continue;
             };
 
-            for entry in index
-                .entries()
-                .iter()
-                .filter(|entry| entry.source.provider == *name)
-            {
+            for entry in index.entries_for(name) {
                 if provider.admits(&entry.source.name) && filter.admits(&entry.source.name) {
-                    nodes.push(entry.clone());
+                    admit(entry);
                 } else {
                     passed_over += 1;
                 }
             }
         }
 
-        crate::index::name_conflicts(&mut nodes);
-        Resolved {
-            nodes,
-            passed_over,
-            unresolved,
-        }
+        (passed_over, unresolved)
     }
 }
 
@@ -324,17 +345,17 @@ mod tests {
 
     #[test]
     fn a_name_listed_twice_contributes_once() {
-        let alpha = observed(&link(ALPHA, "US-01"));
+        let alpha = observed(&format!("{}{}", link(ALPHA, "US-01"), link(BETA, "JP-01")));
         let index = index(&[("alpha", &alpha)]);
+        let collection = collection(&["alpha", "alpha", "ghost", "ghost"]);
+        let filters = providers(vec![("alpha", filter(&["US-01"], &[]))]);
 
-        let resolved = collection(&["alpha", "alpha", "ghost", "ghost"]).resolve(
-            &index,
-            &providers(vec![("alpha", filter(&["US-01"], &[]))]),
-            &unfiltered(),
-        );
+        let resolved = collection.resolve(&index, &filters, &unfiltered());
+        let summary = collection.summarize(&index, &filters, &unfiltered());
 
         assert_eq!(names(&resolved), ["US-01"]);
         assert_eq!(resolved.unresolved, ["ghost"]);
+        assert_eq!(summary, (1, vec!["ghost".to_owned()]));
     }
 
     #[test]

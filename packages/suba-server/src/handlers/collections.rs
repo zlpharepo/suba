@@ -10,7 +10,7 @@ use axum::{
 use http::{header, HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use suba_core::target::{RenderIntent, Target};
-use suba_core::{Collection, IndexEntry, NodeFilter, NodeIndex, Source};
+use suba_core::{Collection, IndexEntry, NodeFilter, Source};
 
 #[cfg(feature = "singbox-core")]
 use crate::state::singbox::{ConversionSkip, GeneratedOutbound};
@@ -110,31 +110,24 @@ pub async fn index(
     let prefix = state.settings().subscription_prefix().await?;
 
     // One index for the whole list, the same one a delivery is resolved from.
-    let _permit = state.rendered().admit().await;
-    let observations = state
+    let permit = state.rendered().admit().await;
+    let (index, _, _permit) = state
         .providers()
-        .observations(
+        .node_index(
             collections
                 .values()
                 .flat_map(|collection| &collection.providers),
+            permit,
         )
         .await?;
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
-    drop(observations);
 
     let mut summaries = BTreeMap::new();
     for (name, collection) in collections {
-        let resolved = collection.resolve(
+        let (nodes, unresolved) = collection.summarize(
             &index,
             &provider_filters(&state, &collection).await?,
             &collection.filter()?,
         );
-        let nodes = resolved.nodes.len();
-        let unresolved = resolved.unresolved;
         let links = collection
             .tokens
             .iter()
@@ -339,26 +332,23 @@ async fn render_collection(
     metadata: BTreeMap<String, ObservationMetadata>,
     target: Target,
 ) -> Result<(Artifact, bool), Error> {
-    let _permit = state.rendered().admit().await;
-    let observations = state.providers().observations(providers.keys()).await?;
+    let permit = state.rendered().admit().await;
+    let (index, observed, permit) = state
+        .providers()
+        .node_index(providers.keys(), permit)
+        .await?;
 
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         // A refresh can replace an observation between address lookup and the
         // full read. The result can be served, but only the matching revision
         // can be remembered under the original address.
-        let unchanged = observations.len() == metadata.len()
-            && observations.iter().all(|(name, held)| {
+        let unchanged = observed.len() == metadata.len()
+            && observed.iter().all(|(name, held)| {
                 metadata
                     .get(name)
                     .is_some_and(|previous| previous.content_hash == held.content_hash)
             });
-        let index = NodeIndex::from_observations(
-            observations
-                .iter()
-                .map(|(name, held)| (name.as_str(), held)),
-        );
-        drop(observations);
-
         let filters = providers
             .iter()
             .map(|(name, settings)| Ok((name.clone(), settings.filter.filter()?)))
@@ -811,17 +801,11 @@ async fn nodes_of(state: &AppState, name: &str) -> Result<Nodes, Error> {
         .await
         .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
 
-    let _permit = state.rendered().admit().await;
-    let observations = state
+    let permit = state.rendered().admit().await;
+    let (index, _, _permit) = state
         .providers()
-        .observations(&collection.providers)
+        .node_index(&collection.providers, permit)
         .await?;
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
-    drop(observations);
 
     let filter = collection.filter()?;
     let resolved = collection.resolve(
@@ -848,7 +832,7 @@ pub(crate) async fn outbounds_of(
     state: &AppState,
     names: &[String],
 ) -> Result<(Vec<GeneratedOutbound>, Vec<ConversionSkip>), Error> {
-    let _permit = state.rendered().admit().await;
+    let permit = state.rendered().admit().await;
     let mut selected = Vec::with_capacity(names.len());
     for name in names {
         let collection = state
@@ -858,20 +842,15 @@ pub(crate) async fn outbounds_of(
             .ok_or_else(|| Error::CollectionNotFound(name.to_owned()))?;
         selected.push((name, collection));
     }
-    let observations = state
+    let (index, _, _permit) = state
         .providers()
-        .observations(
+        .node_index(
             selected
                 .iter()
                 .flat_map(|(_, collection)| &collection.providers),
+            permit,
         )
         .await?;
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
-    drop(observations);
 
     let mut nodes: Vec<IndexEntry> = Vec::new();
     let mut collections = BTreeMap::<_, Vec<String>>::new();

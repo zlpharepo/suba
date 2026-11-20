@@ -32,6 +32,19 @@ impl NodeIndex {
         Self { entries }
     }
 
+    /// Consume one observation at a time. The caller supplies unique providers
+    /// in name order, allowing raw payloads to be released after each parse.
+    pub fn try_from_ordered_observations<E>(
+        observations: impl IntoIterator<Item = Result<(String, Observation), E>>,
+    ) -> Result<Self, E> {
+        let mut entries = Vec::new();
+        for observation in observations {
+            let (provider, held) = observation?;
+            Self::append(&mut entries, &provider, &held);
+        }
+        Ok(Self { entries })
+    }
+
     /// Index one provider and report an unreadable payload from the same parse.
     pub fn from_observation(
         provider: &str,
@@ -66,6 +79,16 @@ impl NodeIndex {
     /// Stable provider-name order, then first occurrence in each payload.
     pub fn entries(&self) -> &[IndexEntry] {
         &self.entries
+    }
+
+    /// The contiguous entries for a provider, in payload order.
+    pub(crate) fn entries_for(&self, provider: &str) -> &[IndexEntry] {
+        let start = self
+            .entries
+            .partition_point(|entry| entry.source.provider.as_str() < provider);
+        let matches =
+            self.entries[start..].partition_point(|entry| entry.source.provider == provider);
+        &self.entries[start..start + matches]
     }
 
     pub fn len(&self) -> usize {

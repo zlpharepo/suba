@@ -23,8 +23,10 @@ use std::{
 use reqwest::Client;
 use serde::Serialize;
 use suba_core::subscription::Unreadable;
-use suba_core::{decide, record_failure, NodeFilter, Observation, RefreshPlan, RefreshStatus};
-use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard};
+use suba_core::{
+    decide, record_failure, NodeFilter, NodeIndex, Observation, RefreshPlan, RefreshStatus,
+};
+use tokio::sync::{watch, Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit};
 
 use crate::{
     error::Error,
@@ -362,11 +364,20 @@ impl ProviderStore {
             .await
     }
 
-    /// Read only observations for the configured members of the requested views.
-    pub(crate) async fn observations<'a>(
+    /// Build the index one provider at a time and keep the metadata that
+    /// accompanied the parsed payloads for render cache validation.
+    pub(crate) async fn node_index<'a>(
         &self,
         members: impl IntoIterator<Item = &'a String>,
-    ) -> Result<BTreeMap<String, Observation>, Error> {
+        permit: OwnedSemaphorePermit,
+    ) -> Result<
+        (
+            NodeIndex,
+            BTreeMap<String, ObservationMetadata>,
+            OwnedSemaphorePermit,
+        ),
+        Error,
+    > {
         let names = self
             .file
             .read(|config| {
@@ -377,23 +388,28 @@ impl ProviderStore {
                     .collect::<BTreeSet<_>>()
             })
             .await;
-        self.read_observations(names, |store, name| store.read(name))
-            .await
+        let store = Arc::clone(&self.observations);
+
+        // A disconnected request can drop its await while this worker is active.
+        Ok(tokio::task::spawn_blocking(move || {
+            let mut metadata = BTreeMap::new();
+            let observations = names.into_iter().filter_map(|name| {
+                let held = store.read(&name).transpose()?;
+                Some(held.map(|held| {
+                    metadata.insert(name.clone(), ObservationMetadata::from(&held));
+                    (name, held)
+                }))
+            });
+            let index = NodeIndex::try_from_ordered_observations(observations)?;
+            Ok::<_, StoreError>((index, metadata, permit))
+        })
+        .await??)
     }
 
     pub(crate) async fn observation_metadata(
         &self,
         names: impl IntoIterator<Item = String>,
     ) -> Result<BTreeMap<String, ObservationMetadata>, Error> {
-        self.read_observations(names, |store, name| store.metadata(name))
-            .await
-    }
-
-    async fn read_observations<T: Send + 'static>(
-        &self,
-        names: impl IntoIterator<Item = String>,
-        read: fn(&dyn ObservationStore, &str) -> Result<Option<T>, StoreError>,
-    ) -> Result<BTreeMap<String, T>, Error> {
         let names: Vec<_> = names.into_iter().collect();
         if names.is_empty() {
             return Ok(BTreeMap::new());
@@ -403,7 +419,7 @@ impl ProviderStore {
         Ok(tokio::task::spawn_blocking(move || {
             let mut held = BTreeMap::new();
             for name in names {
-                if let Some(observation) = read(store.as_ref(), &name)? {
+                if let Some(observation) = store.metadata(&name)? {
                     held.insert(name, observation);
                 }
             }

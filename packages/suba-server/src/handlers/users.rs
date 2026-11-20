@@ -15,7 +15,7 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use suba_core::proto::Host;
 use suba_core::target::{RenderIntent, Target};
-use suba_core::{IndexEntry, NodeIndex, Source};
+use suba_core::{IndexEntry, Source};
 
 use crate::{
     dto::{Operator, ResponseResult},
@@ -555,7 +555,7 @@ pub(crate) async fn user_artifact(
         .get(name)
         .cloned()
         .ok_or_else(|| Error::UserNotFound(name.to_owned()))?;
-    let _permit = state.rendered().admit().await;
+    let permit = state.rendered().admit().await;
     let host = public_host(state).await;
 
     let store = state.singbox();
@@ -645,20 +645,15 @@ pub(crate) async fn user_artifact(
             collections.push(collection);
         }
     }
-    let observations = state
+    let (index, _, _permit) = state
         .providers()
-        .observations(
+        .node_index(
             collections
                 .iter()
                 .flat_map(|collection| &collection.providers),
+            permit,
         )
         .await?;
-    let index = NodeIndex::from_observations(
-        observations
-            .iter()
-            .map(|(name, observation)| (name.as_str(), observation)),
-    );
-    drop(observations);
     let mut hours: Option<u64> = None;
     for collection in collections {
         let resolved = collection.resolve(
