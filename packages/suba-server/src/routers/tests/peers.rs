@@ -526,7 +526,16 @@ async fn remote_config_writes_preserve_etags_and_do_not_touch_local_documents() 
         serde_json::to_vec(&metadata).unwrap(),
     )
     .unwrap();
-    assert_eq!(remote.put_json("/api/cores/sing-box",json!({"version":"1.14.3","config":"default","privilege":"operator","collections":[]})).await.status(),200);
+    assert_eq!(
+        remote
+            .put_json(
+                "/api/cores/sing-box",
+                json!({"version":"1.14.3","config":"default","privilege":"operator"})
+            )
+            .await
+            .status(),
+        200
+    );
     let host = pair(&local, &remote).await;
     let path = format!("/api/environments/{host}/cores/sing-box/configs/default");
     let response = local.authed(Method::GET, &path).send().await.unwrap();

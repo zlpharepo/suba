@@ -28,7 +28,7 @@ use crate::{
     state::metrics::ProcessUsage,
     state::singbox::{
         Changes, Contributions, ConversionSkip, Document, InstallationTask, Privilege,
-        RuntimePhase, Saved, SingboxStore, Tag,
+        RuntimePhase, Saved, SingboxStore, Tag, COLLECTIONS_FIELD,
     },
     AppState,
 };
@@ -48,8 +48,6 @@ pub struct Core {
     pub config: String,
     /// Whether the core runs with this instance's privileges.
     pub privilege: Privilege,
-    /// The collections whose nodes become outbounds, in order.
-    pub collections: Vec<String>,
     /// Whether the core is started when this instance starts.
     pub autostart: bool,
     /// Whether the chosen version's binary is where it should be.
@@ -67,7 +65,7 @@ pub struct Core {
 ///
 /// `version` and `autostart` are optional both ways: a request that does not
 /// speak about them keeps what is stored. The form always names them, but a
-/// caller whose concern is a privilege or a collection does not have to.
+/// caller whose concern is a privilege does not have to.
 #[derive(Debug, Deserialize)]
 pub struct Choose {
     /// `Some(tag)` picks a version, `Some(null)` clears it, omitted keeps it.
@@ -80,8 +78,6 @@ pub struct Choose {
     /// because neither can be inferred: `tun` needs a privilege, and whether
     /// this instance has one to give is the operator's to say.
     pub privilege: Privilege,
-    #[serde(default)]
-    pub collections: Vec<String>,
     /// Whether the core starts with this instance. Omitted keeps it.
     #[serde(default, deserialize_with = "spoken_or_kept")]
     pub autostart: Option<bool>,
@@ -123,7 +119,6 @@ fn core_view(store: &SingboxStore, note: Option<String>) -> Result<Core, Error> 
         version: settings.version.map(|version| version.as_str().to_string()),
         config: store.config()?,
         privilege: settings.privilege,
-        collections: settings.collections,
         autostart: settings.autostart,
         installed: store.binary_in_place()?,
         assembled: store.assembled(),
@@ -180,8 +175,7 @@ pub enum Command {
     Restart,
 }
 
-/// Replace the module's settings: the version in use, the configuration in use
-/// and the collections that contribute outbounds.
+/// Replace the module's settings.
 ///
 /// None of them touches a running process — it keeps the version and
 /// configuration it started with — so the answer says so instead of pretending
@@ -191,17 +185,11 @@ pub async fn choose(
     _auth: Operator,
     Json(choose): Json<Choose>,
 ) -> ResponseResult<Json<Core>> {
-    if (state.is_agent() || state.target_host().is_some()) && !choose.collections.is_empty() {
-        return Err(Error::Document(
-            "collections: an Agent has no collection bindings".to_string(),
-        ));
-    }
     let store = state.singbox();
     let changes = Changes {
         version: choose.version,
         config: Some(choose.config),
         privilege: Some(choose.privilege),
-        collections: Some(choose.collections),
         autostart: choose.autostart,
     };
 
@@ -233,29 +221,62 @@ pub async fn index(State(state): State<AppState>, _auth: Operator) -> ResponseRe
     ))
 }
 
-/// Resolve once without refreshing; unavailable collections remain save warnings
-/// so a draft can be repaired, but cannot become a runtime product or preview.
-/// The users are read here too, so one run sees one picture of them.
-pub(crate) async fn generated(state: &AppState) -> Result<Contributions, Error> {
+pub(crate) async fn config_contributions(
+    state: &AppState,
+    name: Option<String>,
+) -> Result<Contributions, Error> {
     if state.is_agent() {
         return Ok(Contributions::default());
     }
     let store = state.singbox();
-    let selected = tokio::task::spawn_blocking(move || store.settings())
-        .await??
-        .collections;
-    let (outbounds, skipped, unavailable) = match outbounds_of(state, &selected).await {
-        Ok((outbounds, skipped)) => (outbounds, skipped, false),
-        Err(Error::CollectionNotFound(_)) => (Vec::new(), Vec::new(), true),
-        Err(error) => return Err(error),
-    };
-    Ok(Contributions {
-        selected,
-        outbounds,
-        skipped,
-        unavailable,
-        access: state.access_snapshot().await,
+    let selected = tokio::task::spawn_blocking(move || {
+        let name = match name {
+            Some(name) => name,
+            None => store.config()?,
+        };
+        let document = store.config_document(&name)?;
+        store.collection_selection(document.value.get(COLLECTIONS_FIELD))
     })
+    .await??;
+    resolve_contributions(state, selected).await
+}
+
+/// Resolve without refreshing so the editor and runtime use the same provider snapshots.
+/// An unavailable selection can be saved for repair but cannot be previewed or run.
+async fn resolve_contributions(
+    state: &AppState,
+    selected: Vec<String>,
+) -> Result<Contributions, Error> {
+    let mut generated = Contributions {
+        selected,
+        access: state.access_snapshot().await,
+        ..Default::default()
+    };
+    if !generated.selected.is_empty() {
+        match outbounds_of(state, &generated.selected).await {
+            Ok((outbounds, skipped)) => {
+                generated.outbounds = outbounds;
+                generated.skipped = skipped;
+            }
+            Err(Error::CollectionNotFound(_)) => generated.unavailable = true,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(generated)
+}
+
+async fn section_contributions(
+    state: &AppState,
+    name: &str,
+    section: &str,
+    replacement: Option<&Value>,
+) -> Result<Contributions, Error> {
+    if section == COLLECTIONS_FIELD {
+        let selected = state.singbox().collection_selection(replacement)?;
+        resolve_contributions(state, selected).await
+    } else {
+        config_contributions(state, Some(name.to_owned())).await
+    }
 }
 
 /// Start the core at boot, when the module is set to.
@@ -288,16 +309,9 @@ pub(crate) async fn autostart(state: AppState) {
         }
     }
 
-    let generated = match generated(&state).await {
-        Ok(generated) => generated,
-        Err(error) => {
-            tracing::warn!("the core was not started: {error}");
-            return;
-        }
-    };
-
+    let generated = config_contributions(&state, None).await;
     let store = state.singbox();
-    match tokio::task::spawn_blocking(move || store.start(&generated)).await {
+    match tokio::task::spawn_blocking(move || store.start_or_restart(generated, None)).await {
         Ok(Ok(pid)) => tracing::info!("the core started with this instance, as pid {pid}"),
         Ok(Err(error)) => tracing::warn!("the core was not started: {error}"),
         Err(error) => tracing::warn!("the core was not started: {error}"),
@@ -337,9 +351,9 @@ pub async fn act(
     let store = state.singbox();
     let tail = query.tail.unwrap_or(run::LOG_LINES).min(run::LOG_LINES);
     let generated = match action.action {
-        _ if action.deployment.is_some() => Contributions::default(),
-        Command::Stop => Contributions::default(),
-        Command::Start | Command::Restart => generated(&state).await?,
+        _ if action.deployment.is_some() => Ok(Contributions::default()),
+        Command::Stop => Ok(Contributions::default()),
+        Command::Start | Command::Restart => config_contributions(&state, None).await,
     };
 
     Ok(Json(
@@ -351,12 +365,12 @@ pub async fn act(
                 )?;
             } else {
                 match action.action {
-                    Command::Start => {
-                        store.start(&generated)?;
-                    }
                     Command::Stop => store.stop(PATIENCE)?,
-                    Command::Restart => {
-                        store.restart(&generated, PATIENCE)?;
+                    Command::Start | Command::Restart => {
+                        store.start_or_restart(
+                            generated,
+                            (action.action == Command::Restart).then_some(PATIENCE),
+                        )?;
                     }
                 }
             }
@@ -469,8 +483,9 @@ pub async fn write_config(
     request: HeaderMap,
     Json(value): Json<Value>,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
-    let generated = generated(&state).await?;
     let store = state.singbox();
+    let selected = store.collection_selection(value.get(COLLECTIONS_FIELD))?;
+    let generated = resolve_contributions(&state, selected).await?;
     let expected = if_match(&request);
 
     Ok(saved(
@@ -502,7 +517,7 @@ pub async fn write_section(
     request: HeaderMap,
     Json(value): Json<Value>,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
-    let generated = generated(&state).await?;
+    let generated = section_contributions(&state, &name, &section, Some(&value)).await?;
     let store = state.singbox();
     let expected = if_match(&request);
 
@@ -521,7 +536,7 @@ pub async fn delete_section(
     Path((name, section)): Path<(String, String)>,
     request: HeaderMap,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
-    let generated = generated(&state).await?;
+    let generated = section_contributions(&state, &name, &section, None).await?;
     let store = state.singbox();
     let expected = if_match(&request);
 
@@ -554,7 +569,7 @@ pub async fn write_entry(
     request: HeaderMap,
     Json(value): Json<Value>,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
-    let generated = generated(&state).await?;
+    let generated = config_contributions(&state, Some(name.clone())).await?;
     let store = state.singbox();
     let expected = if_match(&request);
 
@@ -580,7 +595,7 @@ pub async fn delete_entry(
     Path((name, section, tag)): Path<(String, String, String)>,
     request: HeaderMap,
 ) -> ResponseResult<(HeaderMap, Json<Saved>)> {
-    let generated = generated(&state).await?;
+    let generated = config_contributions(&state, Some(name.clone())).await?;
     let store = state.singbox();
     let expected = if_match(&request);
 
@@ -734,7 +749,6 @@ mod settings_tests {
             version: Some(Version::from_tag("1.14.3")),
             config: Some("server".to_string()),
             privilege: Privilege::Root,
-            collections: vec!["family".to_string()],
             autostart: true,
         }
     }
@@ -752,7 +766,6 @@ mod settings_tests {
         assert_eq!(kept.config.as_deref(), Some("other"), "what it did name");
         assert_eq!(kept.version, stored().version, "what it did not");
         assert_eq!(kept.privilege, Privilege::Root);
-        assert_eq!(kept.collections, ["family"]);
         assert!(kept.autostart, "the flag survives an unrelated save");
     }
 
@@ -762,14 +775,12 @@ mod settings_tests {
         let changed = stored().with_changes(Changes {
             version: Some(None),
             privilege: Some(Privilege::Operator),
-            collections: Some(Vec::new()),
             autostart: Some(false),
             ..Default::default()
         });
 
         assert_eq!(changed.version, None, "cleared, not kept");
         assert_eq!(changed.privilege, Privilege::Operator);
-        assert!(changed.collections.is_empty());
         assert!(!changed.autostart);
         assert_eq!(changed.config.as_deref(), Some("server"), "untouched");
     }
@@ -963,7 +974,6 @@ mod version_view_tests {
                 version: Some(version.clone()),
                 privilege: Default::default(),
                 config: Some("default".to_string()),
-                collections: Vec::new(),
                 ..Default::default()
             })
             .unwrap();
@@ -1358,12 +1368,14 @@ pub async fn references(
     _auth: Operator,
     Path(name): Path<String>,
 ) -> ResponseResult<Json<References>> {
-    let generated = generated(&state).await?;
-    generated.ensure_available()?;
-    let skipped = generated.skipped;
+    let generated = config_contributions(&state, Some(name.clone())).await?;
     let store = state.singbox();
-    let tags = tokio::task::spawn_blocking(move || store.references(&name, &generated.outbounds))
-        .await??;
+    let (tags, skipped) = tokio::task::spawn_blocking(move || {
+        store
+            .references(&name, &generated)
+            .map(|tags| (tags, generated.skipped))
+    })
+    .await??;
 
     Ok(Json(References {
         tags,

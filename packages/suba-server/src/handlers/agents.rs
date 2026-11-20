@@ -67,7 +67,7 @@ async fn ensure_schema(
 }
 
 pub(crate) async fn deployment(scoped: &AppState) -> Result<Deployment, Error> {
-    let generated = super::singbox::generated(scoped).await?;
+    let generated = super::singbox::config_contributions(scoped, None).await?;
     let store = scoped.singbox();
     tokio::task::spawn_blocking(move || store.runtime_snapshot(&generated)).await?
 }
@@ -111,7 +111,6 @@ pub(crate) async fn forward(
                 .as_deref()
                 .unwrap_or(crate::state::singbox::DEFAULT_CONFIG));
             runtime["privilege"] = json!(desired.privilege);
-            runtime["collections"] = json!(desired.collections);
             runtime["autostart"] = json!(desired.autostart);
             runtime["installed"] = json!(desired.version.is_some());
             if runtime["running"] == true

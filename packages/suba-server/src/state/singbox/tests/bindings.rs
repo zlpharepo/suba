@@ -33,7 +33,6 @@ fn collection_bindings_reject_wrong_shapes_owners_and_locations() {
         );
     }
     for document in [
-        json!({"x-suba-collections": []}),
         json!({"outbounds": {"x-suba-collections": []}}),
         json!({"inbounds": [{"type": "selector", "x-suba-collections": []}]}),
         json!({"outbounds": [{"type": "selector", "nested": {"x-suba-collections": []}}]}),
@@ -41,7 +40,7 @@ fn collection_bindings_reject_wrong_shapes_owners_and_locations() {
     ] {
         assert_eq!(
             reason(project(&document)),
-            "x-suba-collections: is only allowed on top-level selector or urltest outbounds"
+            "x-suba-collections: is only allowed at the document root or on top-level selector or urltest outbounds"
         );
     }
     let (_scratch, store) = store();
@@ -61,10 +60,7 @@ fn collection_bindings_require_rendering_even_with_manual_members() {
         selected: vec!["selected".to_owned()],
         ..Default::default()
     };
-    let mut settings = store.settings().unwrap();
-    settings.collections = snapshot.selected.clone();
-    store.set_settings(&settings).unwrap();
-    let authored = json!({"outbounds": [
+    let authored = json!({(COLLECTIONS_FIELD): snapshot.selected, "outbounds": [
         {"type": "direct", "tag": "manual"},
         {"type": "selector", "tag": "group", "outbounds": ["manual"], "x-suba-collections": ["selected"]}
     ]});
@@ -102,15 +98,8 @@ fn snapshot(tags: &[(&str, &[&str])]) -> Contributions {
 }
 
 #[cfg(feature = "singbox")]
-fn select(store: &SingboxStore, snapshot: &Contributions) {
-    let mut settings = store.settings().unwrap();
-    settings.collections = snapshot.selected.clone();
-    store.set_settings(&settings).unwrap();
-}
-
-#[cfg(feature = "singbox")]
 fn document(kind: &str, manual: &[&str], names: &[&str]) -> Value {
-    json!({"outbounds": [
+    json!({(COLLECTIONS_FIELD): ["first", "second", "empty"], "outbounds": [
         {"type": "direct", "tag": "manual"},
         {"type": kind, "tag": "group", "outbounds": manual, "x-suba-collections": names}
     ]})
@@ -175,7 +164,6 @@ fn collection_bindings_expand_manual_and_shared_generated_tags_once_in_order() {
 fn collection_bindings_persist_only_authored_values_across_all_writes() {
     let (_scratch, store) = store();
     let snapshot = snapshot(&[("derived", &["first", "second"])]);
-    select(&store, &snapshot);
     let authored = document("selector", &["manual"], &["first", "second"]);
     let (schema, _) = store.parsed_schema().unwrap();
     assert!(
@@ -192,8 +180,7 @@ fn collection_bindings_persist_only_authored_values_across_all_writes() {
     assert!(saved.warnings.is_empty());
     assert_eq!(store.config_document(NAME).unwrap().value, authored);
     assert_eq!(store.config_document(NAME).unwrap().etag, saved.etag);
-    let catalog =
-        serde_json::to_value(store.references(NAME, &snapshot.outbounds).unwrap()).unwrap();
+    let catalog = serde_json::to_value(store.references(NAME, &snapshot).unwrap()).unwrap();
     assert_eq!(
         catalog.as_array().unwrap().last().unwrap()["value"],
         authored["outbounds"][1]
@@ -251,7 +238,10 @@ fn collection_bindings_persist_only_authored_values_across_all_writes() {
     store
         .remove_section(NAME, "outbounds", None, &snapshot)
         .unwrap();
-    assert_eq!(store.config_document(NAME).unwrap().value, json!({}));
+    assert_eq!(
+        store.config_document(NAME).unwrap().value,
+        json!({(COLLECTIONS_FIELD): snapshot.selected})
+    );
 }
 
 #[cfg(feature = "singbox")]
@@ -259,7 +249,6 @@ fn collection_bindings_persist_only_authored_values_across_all_writes() {
 fn collection_bindings_save_unavailable_drafts_but_refuse_start_without_fallback() {
     let (_scratch, store) = store();
     let mut snapshot = snapshot(&[]);
-    select(&store, &snapshot);
     let empty = document("selector", &[], &["empty"]);
     let saved = store
         .write_document(NAME, empty.clone(), None, &snapshot)
@@ -278,7 +267,7 @@ fn collection_bindings_save_unavailable_drafts_but_refuse_start_without_fallback
         .warnings
         .is_empty());
     assert_eq!(
-        store.assemble(&snapshot).unwrap().config["outbounds"][1]["outbounds"],
+        store.assemble(NAME, &snapshot).unwrap().config["outbounds"][1]["outbounds"],
         json!(["manual"])
     );
 
@@ -312,7 +301,7 @@ fn collection_bindings_save_unavailable_drafts_but_refuse_start_without_fallback
         .unwrap();
     assert_eq!(
         saved.warnings,
-        ["outbounds.x-suba-collections: a selected collection is unavailable"]
+        ["x-suba-collections: a selected collection is unavailable"]
     );
     assert_eq!(reason(store.start(&snapshot)), saved.warnings[0]);
     assert_eq!(store.config_document(NAME).unwrap().value, manual);
@@ -324,7 +313,6 @@ fn collection_bindings_save_unavailable_drafts_but_refuse_start_without_fallback
 fn collection_bindings_do_not_repair_stale_manual_members_or_defaults() {
     let (_scratch, store) = store();
     let snapshot = snapshot(&[("derived", &["first"])]);
-    select(&store, &snapshot);
     let mut authored = document("selector", &["manual", "private-stale-tag"], &["first"]);
     let saved = store
         .write_document(NAME, authored.clone(), None, &snapshot)
@@ -361,7 +349,6 @@ fn collection_bindings_restart_preflight_leaves_running_core_and_product_untouch
     let (_scratch, store) = store();
     let _core = CoreGuard(&store);
     let mut snapshot = snapshot(&[("derived", &["first"])]);
-    select(&store, &snapshot);
     let valid = document("selector", &["manual"], &["first"]);
     store
         .write_document(NAME, valid.clone(), None, &snapshot)
@@ -392,24 +379,24 @@ fn collection_bindings_restart_preflight_leaves_running_core_and_product_untouch
     snapshot.unavailable = true;
     assert_eq!(
         reason(store.restart(&snapshot, Duration::from_secs(2))),
-        "outbounds.x-suba-collections: a selected collection is unavailable"
+        "x-suba-collections: a selected collection is unavailable"
     );
     snapshot.unavailable = false;
-    let mut settings = store.settings().unwrap();
-    settings.collections.clear();
-    store.set_settings(&settings).unwrap();
+    let empty = Contributions::default();
+    store
+        .remove_section(NAME, COLLECTIONS_FIELD, None, &empty)
+        .unwrap();
     assert_eq!(
         store.status().pid,
         Some(pid),
         "selection does not auto-restart"
     );
+    assert!(matches!(
+        store.restart(&snapshot, Duration::from_secs(2)),
+        Err(Error::Stale)
+    ));
     assert_eq!(
-        reason(store.restart(&snapshot, Duration::from_secs(2))),
-        "outbounds.x-suba-collections: collection selection changed; retry the operation"
-    );
-    snapshot.selected.clear();
-    assert_eq!(
-        reason(store.restart(&snapshot, Duration::from_secs(2))),
+        reason(store.restart(&empty, Duration::from_secs(2))),
         "outbounds[1].x-suba-collections[0]: the bound collection is not selected"
     );
     assert_eq!(store.status().pid, Some(pid));
@@ -425,7 +412,6 @@ fn collection_bindings_restart_expands_the_next_snapshot_without_persisting_tags
     let _core = CoreGuard(&store);
     let old = snapshot(&[("old", &["first"])]);
     let new = snapshot(&[("new", &["first", "second"])]);
-    select(&store, &old);
     let authored = document("urltest", &["manual"], &["first", "second"]);
     store
         .write_document(NAME, authored.clone(), None, &old)
@@ -437,7 +423,7 @@ fn collection_bindings_restart_expands_the_next_snapshot_without_persisting_tags
         json!(["manual", "old"])
     );
     assert_eq!(
-        store.assemble(&new).unwrap().config["outbounds"][1]["outbounds"],
+        store.assemble(NAME, &new).unwrap().config["outbounds"][1]["outbounds"],
         json!(["manual", "new"])
     );
     assert_eq!(

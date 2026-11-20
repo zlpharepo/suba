@@ -15,6 +15,7 @@ const CONFIG: &str = "/api/cores/sing-box/configs/bound";
 const SECTION: &str = "/api/cores/sing-box/configs/bound/sections/outbounds";
 const ENTRY: &str = "/api/cores/sing-box/configs/bound/sections/outbounds/group";
 const REFERENCES: &str = "/api/cores/sing-box/configs/bound/references";
+const SELECTION: &str = "/api/cores/sing-box/configs/bound/sections/x-suba-collections";
 const STATUS: &str = "/api/cores/sing-box/status";
 
 fn install(server: &Server) {
@@ -66,10 +67,15 @@ fn install(server: &Server) {
     .unwrap();
 }
 
-async fn choose(server: &Server, names: &[&str]) {
-    let response = server.put_json(MODULE, json!({
-        "version": "1.14.2", "config": "bound", "privilege": "operator", "collections": names
-    })).await;
+async fn choose(server: &Server) {
+    let response = server
+        .put_json(
+            MODULE,
+            json!({
+                "version": "1.14.2", "config": "bound", "privilege": "operator"
+            }),
+        )
+        .await;
     assert_eq!(response.status(), 200);
 }
 
@@ -101,6 +107,124 @@ impl Drop for CoreGuard {
 }
 
 #[tokio::test]
+async fn collection_outbounds_follow_the_edited_and_active_config_independently() {
+    let server = Server::start().await;
+    install(&server);
+    let edited = "/api/cores/sing-box/configs/edited";
+    let copy = "/api/cores/sing-box/configs/copy";
+    let selection = "x-suba-collections";
+    let edited_selection = format!("{edited}/sections/{selection}");
+    for name in ["first", "second"] {
+        assert_eq!(
+            server
+                .put_json(
+                    &format!("/api/providers/{name}"),
+                    json!({
+                        "type": "inline",
+                        "payload": format!("trojan://fixture-password@example.com:443#{name}"),
+                    }),
+                )
+                .await
+                .status(),
+            201
+        );
+        assert_eq!(
+            server
+                .put_json(
+                    &format!("/api/collections/{name}"),
+                    json!({"providers": [name]}),
+                )
+                .await
+                .status(),
+            201
+        );
+    }
+    let settings = json!({"version": "1.14.2", "config": "bound", "privilege": "operator"});
+    assert_eq!(
+        server.put_json(MODULE, settings.clone()).await.status(),
+        200
+    );
+    assert_eq!(
+        server
+            .put_json(CONFIG, json!({(selection): ["first"]}))
+            .await
+            .status(),
+        200
+    );
+
+    let original = server.authed(Method::GET, edited).send().await.unwrap();
+    let etag = original.headers()[http::header::ETAG].clone();
+    let saved = server
+        .authed(Method::PUT, &edited_selection)
+        .header(http::header::IF_MATCH, &etag)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(json!(["second"]).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200);
+    assert_ne!(saved.headers()[http::header::ETAG], etag);
+    assert_eq!(body(saved).await["warnings"], json!([]));
+    let stale = server
+        .authed(Method::PUT, &edited_selection)
+        .header(http::header::IF_MATCH, etag)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(json!(["first"]).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 412);
+    assert_eq!(get(&server, edited).await, json!({(selection): ["second"]}));
+    assert_eq!(get(&server, MODULE).await["config"], "bound");
+    assert!(get(&server, MODULE).await.get("collections").is_none());
+    assert_eq!(get(&server, REFERENCES).await["tags"][0]["tag"], "first");
+    assert_eq!(
+        get(&server, &format!("{edited}/references")).await["tags"][0]["tag"],
+        "second"
+    );
+
+    let duplicated = server
+        .authed(Method::POST, "/api/cores/sing-box/configs")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(json!({"name": "copy", "copy": "edited"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicated.status(), 201);
+    assert_eq!(get(&server, copy).await, json!({(selection): ["second"]}));
+    let cleared = server
+        .authed(Method::DELETE, &edited_selection)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), 200);
+    assert_eq!(get(&server, edited).await, json!({}));
+    assert_eq!(get(&server, copy).await, json!({(selection): ["second"]}));
+
+    let started = action(&server, "start").await;
+    assert_eq!(started.status(), 200);
+    let mut core = CoreGuard(rustix::process::Pid::from_raw(
+        body(started).await["pid"].as_i64().unwrap() as i32,
+    ));
+    let initial = product(&server);
+    assert_eq!(initial["outbounds"][0]["tag"], "first");
+    assert!(initial.get(selection).is_none());
+
+    let mut next = settings;
+    next["config"] = json!("copy");
+    assert_eq!(server.put_json(MODULE, next).await.status(), 200);
+    assert_eq!(product(&server), initial);
+    let restarted = action(&server, "restart").await;
+    assert_eq!(restarted.status(), 200);
+    core.0 = rustix::process::Pid::from_raw(body(restarted).await["pid"].as_i64().unwrap() as i32);
+    let current = product(&server);
+    assert_eq!(current["outbounds"][0]["tag"], "second");
+    assert!(current.get(selection).is_none());
+    assert_eq!(action(&server, "stop").await.status(), 200);
+    core.0 = None;
+}
+
+#[tokio::test]
 async fn collection_conversion_skips_remain_visible_without_blocking_usable_members() {
     let server = Server::start().await;
     install(&server);
@@ -115,8 +239,8 @@ async fn collection_conversion_skips_remain_visible_without_blocking_usable_memb
             .status(),
         201
     );
-    choose(&server, &["first"]).await;
-    let authored = json!({"outbounds": [{"type": "selector", "tag": "group", "x-suba-collections": ["first"]}]});
+    choose(&server).await;
+    let authored = json!({"x-suba-collections": ["first"], "outbounds": [{"type": "selector", "tag": "group", "x-suba-collections": ["first"]}]});
     assert_eq!(
         server.put_json(CONFIG, authored.clone()).await.status(),
         200
@@ -136,6 +260,10 @@ async fn collection_conversion_skips_remain_visible_without_blocking_usable_memb
     let assembled = product(&server);
     assert_eq!(assembled["outbounds"][0]["outbounds"], json!(["working"]));
     assert_eq!(assembled["outbounds"].as_array().unwrap().len(), 2);
+    assert!(assembled.get("x-suba-collections").is_none());
+    assert!(assembled["outbounds"][0]
+        .get("x-suba-collections")
+        .is_none());
     assert!(assembled.get("skipped").is_none());
     assert_eq!(get(&server, CONFIG).await, authored);
     assert_eq!(action(&server, "stop").await.status(), 200);
@@ -146,15 +274,15 @@ async fn collection_conversion_skips_remain_visible_without_blocking_usable_memb
 async fn collection_bindings_http_writes_preserve_drafts_and_static_failures() {
     let server = Server::start().await;
     install(&server);
-    choose(&server, &["private-missing"]).await;
+    choose(&server).await;
     let group = json!({"type": "selector", "tag": "group", "outbounds": [], "x-suba-collections": ["private-missing"]});
-    let authored = json!({"outbounds": [group.clone()]});
+    let authored = json!({"x-suba-collections": ["private-missing"], "outbounds": [group.clone()]});
     let saved = server.put_json(CONFIG, authored.clone()).await;
     assert_eq!(saved.status(), 200);
     let etag = saved.headers()[http::header::ETAG].clone();
     assert_eq!(
         body(saved).await["warnings"],
-        json!(["outbounds.x-suba-collections: a selected collection is unavailable"])
+        json!(["x-suba-collections: a selected collection is unavailable"])
     );
     assert_eq!(get(&server, CONFIG).await, authored);
     assert_eq!(get(&server, ENTRY).await, group);
@@ -162,7 +290,7 @@ async fn collection_bindings_http_writes_preserve_drafts_and_static_failures() {
     assert_eq!(unavailable.status(), 422);
     assert_eq!(
         body(unavailable).await["message"],
-        "outbounds.x-suba-collections: a selected collection is unavailable"
+        "x-suba-collections: a selected collection is unavailable"
     );
 
     let saved = server.put_json(SECTION, json!([group])).await;
@@ -182,10 +310,14 @@ async fn collection_bindings_http_writes_preserve_drafts_and_static_failures() {
         .await
         .unwrap();
     assert_eq!(stale.status(), 412);
-    assert_eq!(get(&server, CONFIG).await, json!({"outbounds": [changed]}));
+    assert_eq!(
+        get(&server, CONFIG).await,
+        json!({"x-suba-collections": ["private-missing"], "outbounds": [changed]})
+    );
 
     for (path, value) in [
-        (CONFIG, json!({"x-suba-collections": ["private-missing"]})),
+        (CONFIG, json!({"x-suba-collections": "private-missing"})),
+        (SELECTION, json!([false])),
         (
             SECTION,
             json!([{"type": "direct", "x-suba-collections": []}]),
@@ -229,7 +361,7 @@ async fn collection_bindings_http_writes_preserve_drafts_and_static_failures() {
     assert_eq!(copied.status(), 201);
     assert_eq!(
         get(&server, "/api/cores/sing-box/configs/copy").await,
-        json!({"outbounds": [changed]})
+        json!({"x-suba-collections": ["private-missing"], "outbounds": [changed]})
     );
     assert_eq!(
         server
@@ -259,7 +391,10 @@ async fn collection_bindings_http_writes_preserve_drafts_and_static_failures() {
             .status(),
         200
     );
-    assert_eq!(get(&server, CONFIG).await, json!({}));
+    assert_eq!(
+        get(&server, CONFIG).await,
+        json!({"x-suba-collections": ["private-missing"]})
+    );
 }
 
 #[tokio::test]
@@ -311,9 +446,9 @@ async fn collection_bindings_http_refresh_changes_only_the_next_expansion() {
             201
         );
     }
-    choose(&server, &["first", "second"]).await;
+    choose(&server).await;
     let group = json!({"type": "urltest", "tag": "group", "outbounds": ["manual"], "x-suba-collections": ["second", "first"]});
-    let authored = json!({"outbounds": [{"type": "direct", "tag": "manual"}, group.clone()]});
+    let authored = json!({"x-suba-collections": ["first", "second"], "outbounds": [{"type": "direct", "tag": "manual"}, group.clone()]});
     let saved = server.put_json(CONFIG, authored.clone()).await;
     assert_eq!(saved.status(), 200);
     assert_eq!(body(saved).await["warnings"], json!([]));
@@ -370,13 +505,19 @@ async fn collection_bindings_http_refresh_changes_only_the_next_expansion() {
         "neither preview nor start refreshes providers"
     );
 
-    choose(&server, &[]).await;
+    assert_eq!(server.put_json(SELECTION, json!([])).await.status(), 200);
     assert_eq!(get(&server, STATUS).await["pid"], pid);
     let refused = action(&server, "restart").await;
     assert_eq!(refused.status(), 422);
     assert_eq!(get(&server, STATUS).await["pid"], pid);
     assert_eq!(product(&server), current);
-    choose(&server, &["first", "second"]).await;
+    assert_eq!(
+        server
+            .put_json(SELECTION, json!(["first", "second"]))
+            .await
+            .status(),
+        200
+    );
     assert_eq!(
         server
             .authed(Method::DELETE, "/api/collections/first")

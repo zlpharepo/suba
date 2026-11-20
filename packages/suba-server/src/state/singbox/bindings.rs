@@ -1,6 +1,6 @@
 //! Collection bindings belong to authored documents, never to native sing-box.
 //!
-//! Projection validates the extension before removing only its allowed locations.
+//! Projection removes the root selection and validated group bindings.
 //! Expansion uses the same resolved batch as the generated runtime outbounds, so
 //! renamed tags and shared collection provenance cannot diverge.
 
@@ -12,7 +12,7 @@ use suba_singbox::assemble::{self, Assembled, Fault, Unfit};
 use super::{ConversionSkip, GeneratedOutbound};
 use crate::{error::Error, state::access::Access};
 
-const EXTENSION: &str = "x-suba-collections";
+pub(crate) const COLLECTIONS_FIELD: &str = "x-suba-collections";
 
 /// What one run gets beside the operator's document, resolved before any lock:
 /// the selected collections' outbounds, with their provenance, and the users
@@ -32,7 +32,7 @@ impl Contributions {
     pub(crate) fn ensure_available(&self) -> Result<(), Error> {
         if self.unavailable {
             return Err(fault(
-                "outbounds.x-suba-collections",
+                COLLECTIONS_FIELD,
                 "a selected collection is unavailable",
             ));
         }
@@ -44,14 +44,38 @@ fn fault(path: &str, reason: &'static str) -> Error {
     Error::Document(format!("{path}: {reason}"))
 }
 
-/// Only top-level group entries may carry this extension. Unknown native keys
-/// remain intact for schema validation rather than being silently stripped.
+pub(super) fn selection(value: Option<&Value>) -> Result<Vec<String>, Error> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let names = value
+        .as_array()
+        .ok_or_else(|| fault(COLLECTIONS_FIELD, "must be an array of collection names"))?;
+    names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            name.as_str().map(str::to_owned).ok_or_else(|| {
+                fault(
+                    &format!("{COLLECTIONS_FIELD}[{index}]"),
+                    "must be a collection name string",
+                )
+            })
+        })
+        .collect()
+}
+
+/// Keep unknown native keys intact for schema validation by projecting only
+/// known management fields at their declared locations.
 pub(super) fn project(document: &Value) -> Result<Value, Error> {
     let mut native = document.clone();
+    if let Some(root) = native.as_object_mut() {
+        root.remove(COLLECTIONS_FIELD);
+    }
     if let Some(entries) = native.get_mut("outbounds").and_then(Value::as_array_mut) {
         for (index, entry) in entries.iter_mut().enumerate() {
-            if let Some(names) = entry.get(EXTENSION) {
-                let path = format!("outbounds[{index}].{EXTENSION}");
+            if let Some(names) = entry.get(COLLECTIONS_FIELD) {
+                let path = format!("outbounds[{index}].{COLLECTIONS_FIELD}");
                 if !matches!(
                     entry.get("type").and_then(Value::as_str),
                     Some("selector" | "urltest")
@@ -75,14 +99,14 @@ pub(super) fn project(document: &Value) -> Result<Value, Error> {
                 entry
                     .as_object_mut()
                     .expect("an outbound object")
-                    .remove(EXTENSION);
+                    .remove(COLLECTIONS_FIELD);
             }
         }
     }
     if contains_extension(&native) {
         return Err(fault(
-            EXTENSION,
-            "is only allowed on top-level selector or urltest outbounds",
+            COLLECTIONS_FIELD,
+            "is only allowed at the document root or on top-level selector or urltest outbounds",
         ));
     }
     Ok(native)
@@ -91,7 +115,7 @@ pub(super) fn project(document: &Value) -> Result<Value, Error> {
 fn contains_extension(value: &Value) -> bool {
     match value {
         Value::Object(fields) => {
-            fields.contains_key(EXTENSION) || fields.values().any(contains_extension)
+            fields.contains_key(COLLECTIONS_FIELD) || fields.values().any(contains_extension)
         }
         Value::Array(values) => values.iter().any(contains_extension),
         _ => false,
@@ -104,7 +128,7 @@ pub(super) fn assemble(document: &Value, snapshot: &Contributions) -> Result<Ass
     let mut bound = false;
     if let Some(entries) = document.get("outbounds").and_then(Value::as_array) {
         for (index, entry) in entries.iter().enumerate() {
-            let Some(names) = entry.get(EXTENSION).and_then(Value::as_array) else {
+            let Some(names) = entry.get(COLLECTIONS_FIELD).and_then(Value::as_array) else {
                 continue;
             };
             bound = true;
@@ -116,14 +140,14 @@ pub(super) fn assemble(document: &Value, snapshot: &Contributions) -> Result<Ass
                     .any(|selected| name.as_str() == Some(selected))
                 {
                     return Err(fault(
-                        &format!("{path}.{EXTENSION}[{slot}]"),
+                        &format!("{path}.{COLLECTIONS_FIELD}[{slot}]"),
                         "the bound collection is not selected",
                     ));
                 }
             }
             if !cfg!(feature = "singbox") && !names.is_empty() {
                 return Err(fault(
-                    &format!("{path}.{EXTENSION}"),
+                    &format!("{path}.{COLLECTIONS_FIELD}"),
                     "collection rendering is unavailable",
                 ));
             }
@@ -165,7 +189,7 @@ pub(super) fn assemble(document: &Value, snapshot: &Contributions) -> Result<Ass
                     .filter(|tag| !tag.is_empty())
                 else {
                     return Err(fault(
-                        &format!("{path}.{EXTENSION}"),
+                        &format!("{path}.{COLLECTIONS_FIELD}"),
                         "a generated outbound has no usable tag",
                     ));
                 };

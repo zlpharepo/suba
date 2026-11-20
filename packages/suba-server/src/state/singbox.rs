@@ -3,14 +3,13 @@
 //! running it.
 //!
 //! Three documents, three owners. `config/sing-box.<ext>` is the module's
-//! settings (which version runs, which configuration, which collections
-//! contribute outbounds); `config/sing-box/<name>.json` is one of the
-//! configurations the operator wrote, each edited whole or a section or an
+//! settings (which version and configuration run); `config/sing-box/<name>.json`
+//! is one of the configurations the operator wrote, each edited whole or a section or an
 //! entry at a time, of which the settings name the one in use; and
 //! `data/sing-box/config/config.json` is what a start assembled from it, which
-//! is ours to overwrite. Authored selector/urltest entries may bind collection
-//! names with `x-suba-collections`; their generated members exist only in the
-//! runtime product. Provider refreshes and selection changes never reload it.
+//! is ours to overwrite. Each authored document selects its own collections;
+//! selector and urltest entries may bind their members with `x-suba-collections`.
+//! Provider refreshes and selection changes never reload the runtime product.
 //!
 //! File and process operations run on the blocking pool. Release fetching is
 //! asynchronous; one in-memory cache shared by the releases route and install
@@ -23,7 +22,6 @@
 //! during the one-second startup window stays stopped; there is no automatic
 //! rollback. Surviving that window is not a network-readiness guarantee.
 
-use std::collections::HashMap;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -31,6 +29,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
+use std::{borrow::Borrow, collections::HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -50,7 +49,7 @@ use crate::{error::Error, fs, identity::Identity};
 mod bindings;
 pub(crate) mod managed;
 mod references;
-pub(crate) use bindings::Contributions;
+pub(crate) use bindings::{Contributions, COLLECTIONS_FIELD};
 pub(crate) use references::{ConversionSkip, GeneratedOutbound, Tag};
 
 /// The directory the operator's configurations live in, under the config
@@ -108,9 +107,6 @@ pub(crate) struct Settings {
     /// Whether the core runs with the privileges this instance has.
     #[serde(default, skip_serializing_if = "is_operator")]
     pub privilege: Privilege,
-    /// The collections whose nodes become outbounds, in this order.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub collections: Vec<String>,
     /// Whether the core is started when this instance starts.
     ///
     /// Its own field on the same document. This file is written whole, so a
@@ -135,9 +131,6 @@ impl Settings {
             },
             config: change.config.or_else(|| self.config.clone()),
             privilege: change.privilege.unwrap_or(self.privilege),
-            collections: change
-                .collections
-                .unwrap_or_else(|| self.collections.clone()),
             autostart: change.autostart.unwrap_or(self.autostart),
         }
     }
@@ -150,7 +143,6 @@ pub(crate) struct Changes {
     pub version: Option<Option<String>>,
     pub config: Option<String>,
     pub privilege: Option<Privilege>,
-    pub collections: Option<Vec<String>>,
     pub autostart: Option<bool>,
 }
 
@@ -268,6 +260,7 @@ fn runtime_failure(error: &Error) -> &'static str {
             "the core exited during startup; it remains stopped"
         }
         Error::Schema(_) => "the installed schema could not be read",
+        Error::Stale => "the saved collection selection changed; retry the operation",
         Error::Singbox(core::Error::Run { .. }) => {
             "the core process could not be started or stopped"
         }
@@ -463,7 +456,7 @@ impl SingboxStore {
         *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Starting);
         let result = (|| -> Result<u32, Error> {
             self.ensure_not_shutting_down()?;
-            if self.remote || !deployment.settings.collections.is_empty() {
+            if self.remote || deployment.document.get(COLLECTIONS_FIELD).is_some() {
                 return Err(Error::Document(
                     "deployment: expected a native Agent configuration".to_string(),
                 ));
@@ -623,6 +616,28 @@ impl SingboxStore {
             value,
             etag: core::sha256_hex(text.unwrap_or_default().as_bytes()),
         })
+    }
+
+    pub(crate) fn collection_selection(&self, value: Option<&Value>) -> Result<Vec<String>, Error> {
+        let selected = bindings::selection(value)?;
+        if self.remote && !selected.is_empty() {
+            return Err(Error::Document(format!(
+                "{COLLECTIONS_FIELD}: an Agent has no collection bindings"
+            )));
+        }
+        Ok(selected)
+    }
+
+    fn ensure_collection_selection(
+        &self,
+        document: &Value,
+        generated: &Contributions,
+    ) -> Result<(), Error> {
+        // A change while the providers were being resolved invalidates the batch.
+        if self.collection_selection(document.get(COLLECTIONS_FIELD))? != generated.selected {
+            return Err(Error::Stale);
+        }
+        Ok(())
     }
 
     /// Make a configuration exist, from a copy of another or empty.
@@ -867,6 +882,7 @@ impl SingboxStore {
         change(&mut sections)?;
         let value = Value::Object(sections);
 
+        self.ensure_collection_selection(&value, generated)?;
         let native = bindings::project(&value)?;
         let (schema, _) = self.parsed_schema()?;
         let verdict = match schema.validate(&native) {
@@ -903,11 +919,8 @@ impl SingboxStore {
 
     /// Replace the module's settings.
     ///
-    /// A version that is not installed is refused; a configuration that has no
-    /// document yet and a collection that does not exist are not, because both
-    /// may be written after the settings that name them — a module that has just
-    /// been installed has an empty configuration, and the editor writes it on
-    /// the first save.
+    /// The version must be installed. The configuration can be written after
+    /// selection, so the editor can start with an empty document.
     pub(crate) fn set_settings(&self, settings: &Settings) -> Result<(), Error> {
         let _selection = self.selection.lock().expect("current selection");
 
@@ -1143,12 +1156,12 @@ impl SingboxStore {
     pub(crate) fn references(
         &self,
         name: &str,
-        generated: &[GeneratedOutbound],
+        generated: &Contributions,
     ) -> Result<Vec<Tag>, Error> {
-        Ok(references::catalog(
-            &self.config_document(name)?.value,
-            generated,
-        ))
+        let document = self.config_document(name)?.value;
+        self.ensure_collection_selection(&document, generated)?;
+        generated.ensure_available()?;
+        Ok(references::catalog(&document, &generated.outbounds))
     }
 
     /// The schema of the version in use, parsed, with the bytes it came from.
@@ -1175,22 +1188,18 @@ impl SingboxStore {
 
     /// The configuration the core would run: the operator's, and whatever the
     /// collections contributed.
-    pub(crate) fn assemble(&self, generated: &Contributions) -> Result<Assembled, Error> {
-        assemble_document(&self.current_document()?.value, &self.config()?, generated)
+    fn assemble(&self, name: &str, generated: &Contributions) -> Result<Assembled, Error> {
+        let document = self.config_document(name)?.value;
+        self.ensure_collection_selection(&document, generated)?;
+        assemble_document(&document, name, generated)
     }
 
     pub(crate) fn runtime_snapshot(&self, generated: &Contributions) -> Result<Deployment, Error> {
         let _selection = self.selection.lock().expect("current selection");
         let _writing = self.writing.lock().expect("the configuration");
         let settings = self.settings()?;
-        if !settings.collections.is_empty() {
-            return Err(Error::Document(
-                "collections: an Agent has no collection bindings".to_string(),
-            ));
-        }
         let name = settings.config.as_deref().unwrap_or(DEFAULT_CONFIG);
-        let document =
-            assemble_document(&self.config_document(name)?.value, name, generated)?.config;
+        let document = self.assemble(name, generated)?.config;
         Ok(Deployment { settings, document })
     }
 
@@ -1202,11 +1211,6 @@ impl SingboxStore {
         let body = std::fs::read(self.dirs.config().join(CONFIG)).ok()?;
 
         serde_json::from_slice(&body).ok()
-    }
-
-    /// The configuration in use.
-    fn current_document(&self) -> Result<Document, Error> {
-        self.config_document(&self.config()?)
     }
 
     /// Write the assembled configuration where the core is pointed at it.
@@ -1229,27 +1233,21 @@ impl SingboxStore {
             .is_some_and(|version| self.dirs.binary(&version).is_file()))
     }
 
-    /// Assemble the configuration, check it, write it, and run it.
-    ///
-    /// The snapshot keeps selected collection names and generated provenance
-    /// together; a changed selection requires a fresh resolution.
+    #[cfg(test)]
     pub(crate) fn start(&self, generated: &Contributions) -> Result<u32, Error> {
-        self.start_or_restart(generated, None)
+        self.start_or_restart(Ok(generated), None)
+    }
+
+    #[cfg(test)]
+    fn restart(&self, generated: &Contributions, patience: Duration) -> Result<u32, Error> {
+        self.start_or_restart(Ok(generated), Some(patience))
     }
 
     /// Binding, schema and native-check failures leave the serving core and
     /// product untouched; launch reuses the exact document that passed preflight.
-    pub(crate) fn restart(
+    pub(crate) fn start_or_restart(
         &self,
-        generated: &Contributions,
-        patience: Duration,
-    ) -> Result<u32, Error> {
-        self.start_or_restart(generated, Some(patience))
-    }
-
-    fn start_or_restart(
-        &self,
-        generated: &Contributions,
+        generated: Result<impl Borrow<Contributions>, Error>,
         restart: Option<Duration>,
     ) -> Result<u32, Error> {
         // A stop or shutdown must not finish while an earlier start can still spawn.
@@ -1261,7 +1259,8 @@ impl SingboxStore {
         let _writing = self.writing.lock().expect("the configuration");
         let attempted = self.current().ok().flatten();
         *self.phase.lock().expect("runtime phase") = Some(RuntimePhase::Starting);
-        let result = self.start_checked(generated, restart);
+        let result =
+            generated.and_then(|generated| self.start_checked(generated.borrow(), restart));
         *self.phase.lock().expect("runtime phase") = match &result {
             Ok(_) => None,
             Err(error) => Some(RuntimePhase::Failed {
@@ -1283,14 +1282,9 @@ impl SingboxStore {
             ));
         }
         let settings = self.settings()?;
-        if settings.collections != generated.selected {
-            return Err(Error::Document(
-                "outbounds.x-suba-collections: collection selection changed; retry the operation"
-                    .to_string(),
-            ));
-        }
         self.startable()?;
-        let assembled = self.assemble(generated)?;
+        let name = settings.config.as_deref().unwrap_or(DEFAULT_CONFIG);
+        let assembled = self.assemble(name, generated)?;
         let prepared = self.prepare(settings, assembled.config)?;
         self.launch_prepared(prepared, restart)
     }
@@ -1835,7 +1829,6 @@ mod tests {
                 version: Some(version),
                 privilege: Default::default(),
                 config: Some(NAME.to_string()),
-                collections: Vec::new(),
                 ..Default::default()
             })
             .expect("a current version");
@@ -2290,7 +2283,6 @@ mod tests {
                 version: Some(Version::from_tag("1.99.0")),
                 privilege: Default::default(),
                 config: Some(NAME.to_string()),
-                collections: Vec::new(),
                 ..Default::default()
             }),
             Err(Error::Singbox(
@@ -2320,7 +2312,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let assembled = store.assemble(&generated).expect("an assembly");
+        let assembled = store.assemble(NAME, &generated).expect("an assembly");
         store.write_product(&assembled.config).expect("a product");
 
         assert!(store.assembled());
@@ -2399,10 +2391,10 @@ mod tests {
             )
             .expect("a section");
         store
-            .assemble(&Contributions::default())
+            .assemble(NAME, &Contributions::default())
             .expect("an assembly");
         let assembled = store
-            .assemble(&Contributions::default())
+            .assemble(NAME, &Contributions::default())
             .expect("an assembly");
         store.write_product(&assembled.config).expect("a product");
         let before = std::fs::read(store.dirs.config().join(CONFIG)).expect("the configuration");
@@ -2887,7 +2879,6 @@ mod tests {
                 version: Some(version),
                 privilege: Default::default(),
                 config: Some(NAME.to_string()),
-                collections: Vec::new(),
                 ..Default::default()
             })
             .expect("a current version");

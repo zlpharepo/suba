@@ -38,10 +38,7 @@ async fn the_flag_is_kept_when_a_save_does_not_speak_about_it() {
     // A save whose business is something else entirely: no `autostart` key.
     let later = body(
         server
-            .put_json(
-                MODULE,
-                json!({"config": "default", "privilege": "root", "collections": []}),
-            )
+            .put_json(MODULE, json!({"config": "default", "privilege": "root"}))
             .await,
     )
     .await;

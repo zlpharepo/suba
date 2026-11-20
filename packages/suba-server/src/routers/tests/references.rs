@@ -37,7 +37,7 @@ fn write_config(server: &Server, name: &str, document: Value) {
     .unwrap();
 }
 
-async fn choose(server: &Server, collections: &[&str]) {
+async fn choose(server: &Server) {
     assert_eq!(
         server
             .put_json(
@@ -45,8 +45,7 @@ async fn choose(server: &Server, collections: &[&str]) {
                 json!({
                     "version": null,
                     "config": "active",
-                    "privilege": "operator",
-                    "collections": collections
+                    "privilege": "operator"
                 }),
             )
             .await
@@ -65,7 +64,7 @@ async fn reference_catalog_reads_the_named_config_without_writing() {
     );
     let outbound = json!({"type": "selector", "tag": "edited-only", "outbounds": ["pending"]});
     write_config(&server, "edited", json!({"outbounds": [outbound.clone()]}));
-    choose(&server, &[]).await;
+    choose(&server).await;
     let before = files(&server.root);
 
     for _ in 0..2 {
@@ -206,13 +205,17 @@ async fn reference_catalog_uses_selected_collections_without_refreshing() {
             201
         );
     }
-    choose(&server, &["first", "repeated"]).await;
+    choose(&server).await;
     let authored = json!({"type": "direct", "tag": "shared"});
-    write_config(&server, "edited", json!({"outbounds": [authored.clone()]}));
+    write_config(
+        &server,
+        "edited",
+        json!({"x-suba-collections": ["first", "repeated"], "outbounds": [authored.clone()]}),
+    );
     write_config(
         &server,
         "active",
-        json!({"outbounds": [{"type": "direct", "tag": "active-only"}]}),
+        json!({"x-suba-collections": ["unused"], "outbounds": [{"type": "direct", "tag": "active-only"}]}),
     );
     let before = files(&server.root);
 
@@ -291,11 +294,10 @@ async fn reference_catalog_reports_conversion_skips_without_losing_usable_nodes(
             201
         );
     }
-    choose(&server, &["first", "again"]).await;
     write_config(
         &server,
         "edited",
-        json!({"outbounds": [{"type": "selector", "tag": "group", "x-suba-collections": ["first"]}]}),
+        json!({"x-suba-collections": ["first", "again"], "outbounds": [{"type": "selector", "tag": "group", "x-suba-collections": ["first"]}]}),
     );
     let response = server.authed(Method::GET, REFERENCES).send().await.unwrap();
     assert_eq!(response.status(), 200);
@@ -337,7 +339,11 @@ async fn reference_catalog_reports_conversion_skips_without_losing_usable_nodes(
 async fn reference_catalog_distinguishes_unavailable_selection_from_empty_collections() {
     let server = Server::start().await;
     let outbound = json!({"type": "selector", "tag": "authored", "x-suba-collections": ["empty"]});
-    write_config(&server, "edited", json!({"outbounds": [outbound.clone()]}));
+    write_config(
+        &server,
+        "edited",
+        json!({"x-suba-collections": ["empty"], "outbounds": [outbound.clone()]}),
+    );
     assert_eq!(
         server
             .put_json("/api/collections/empty", json!({"providers": []}))
@@ -345,21 +351,25 @@ async fn reference_catalog_distinguishes_unavailable_selection_from_empty_collec
             .status(),
         201
     );
-    choose(&server, &["empty"]).await;
+
     let empty = server.authed(Method::GET, REFERENCES).send().await.unwrap();
     assert_eq!(empty.status(), 200);
     let catalog = body(empty).await;
     assert_eq!(catalog["tags"].as_array().unwrap().len(), 1);
     assert_eq!(catalog["tags"][0]["value"], outbound);
 
-    choose(&server, &["empty", "private-missing"]).await;
+    write_config(
+        &server,
+        "edited",
+        json!({"x-suba-collections": ["empty", "private-missing"], "outbounds": [outbound]}),
+    );
     let before = files(&server.root);
     let unavailable = server.authed(Method::GET, REFERENCES).send().await.unwrap();
     assert_eq!(unavailable.status(), 422);
     let error = body(unavailable).await;
     assert_eq!(
         error["message"],
-        "outbounds.x-suba-collections: a selected collection is unavailable"
+        "x-suba-collections: a selected collection is unavailable"
     );
     assert!(error.get("tags").is_none());
     assert!(!error.to_string().contains("private-missing"));
@@ -370,9 +380,12 @@ async fn reference_catalog_distinguishes_unavailable_selection_from_empty_collec
 #[tokio::test]
 async fn reference_catalog_without_rendering_keeps_only_authored_definitions() {
     let server = Server::start().await;
-    choose(&server, &["unavailable"]).await;
     let outbound = json!({"type": "direct", "tag": "authored"});
-    write_config(&server, "edited", json!({"outbounds": [outbound.clone()]}));
+    write_config(
+        &server,
+        "edited",
+        json!({"x-suba-collections": ["unavailable"], "outbounds": [outbound.clone()]}),
+    );
     let response = server.authed(Method::GET, REFERENCES).send().await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(
